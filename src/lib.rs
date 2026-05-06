@@ -7,6 +7,60 @@ use std::io::Write;
 use std::path::Path;
 use std::time::SystemTime;
 
+/// Rotation interval for `.l1.5/hooks.jsonl`: 1 hour.
+pub const HOOKS_ROTATION_INTERVAL_SECS: u64 = 3600;
+
+/// Rotate `<dir>/hooks.jsonl` to `<dir>/hooks-<created_ts>.jsonl.gz` if it has
+/// existed for at least `HOOKS_ROTATION_INTERVAL_SECS`. Tracks creation via a
+/// sidecar `.hooks-rotation-stamp` file. No-op if the stamp is missing (first
+/// run — initializes), if the elapsed window has not yet passed, or if the
+/// log is empty.
+///
+/// Rotation truncates the live log in place (preserving the inode for
+/// subsequent append-mode opens). Old archives accumulate; cleanup is
+/// out-of-scope.
+pub fn maybe_rotate_hooks_jsonl(dir: &Path) -> std::io::Result<()> {
+    let stamp_path = dir.join(".hooks-rotation-stamp");
+    let log_path = dir.join("hooks.jsonl");
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let created = match std::fs::read_to_string(&stamp_path) {
+        Ok(s) => s.trim().parse::<u64>().unwrap_or(now),
+        Err(_) => {
+            // No stamp yet — first event for this dir. Record now and skip.
+            std::fs::write(&stamp_path, now.to_string())?;
+            return Ok(());
+        }
+    };
+
+    if now < created.saturating_add(HOOKS_ROTATION_INTERVAL_SECS) {
+        return Ok(());
+    }
+
+    if log_path.exists() {
+        let metadata = std::fs::metadata(&log_path)?;
+        if metadata.len() > 0 {
+            let archive_path = dir.join(format!("hooks-{}.jsonl.gz", created));
+            let mut input = std::fs::File::open(&log_path)?;
+            let output = std::fs::File::create(&archive_path)?;
+            let mut encoder = flate2::write::GzEncoder::new(
+                output,
+                flate2::Compression::default(),
+            );
+            std::io::copy(&mut input, &mut encoder)?;
+            encoder.finish()?;
+            // Truncate (preserves inode for append-mode opens).
+            std::fs::write(&log_path, "")?;
+        }
+    }
+
+    std::fs::write(&stamp_path, now.to_string())?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AnthropicRequest {
     pub system: Option<serde_json::Value>,
@@ -482,6 +536,15 @@ impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
             return;
         }
 
+        // Rotate hooks.jsonl hourly. Errors here are non-fatal; never lose
+        // an event row over a rotation hiccup.
+        if let Err(e) = maybe_rotate_hooks_jsonl(dir) {
+            eprintln!(
+                "[DaemonAdapter] hooks.jsonl rotation failed (continuing): {}",
+                e
+            );
+        }
+
         // Append a row to .l1.5/hooks.jsonl for every event kind.
         let row = json!({
             "timestamp": timestamp,
@@ -878,5 +941,131 @@ mod tests {
             assert_eq!(HookEventKind::parse_str(kind.as_str()), Some(kind));
         }
         assert_eq!(HookEventKind::parse_str("Unknown"), None);
+    }
+
+    #[test]
+    fn rotation_initializes_stamp_on_first_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // No stamp, no log yet. First call records stamp, doesn't archive.
+        maybe_rotate_hooks_jsonl(dir.path()).unwrap();
+        let stamp = dir.path().join(".hooks-rotation-stamp");
+        assert!(stamp.exists(), "stamp file should be created on first call");
+        let archives: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("hooks-"))
+            .collect();
+        assert!(archives.is_empty(), "no archive should exist on first call");
+    }
+
+    #[test]
+    fn rotation_no_op_within_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join(".hooks-rotation-stamp");
+        let log = dir.path().join("hooks.jsonl");
+
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(&stamp, now.to_string()).unwrap();
+        std::fs::write(&log, "row1\nrow2\n").unwrap();
+
+        maybe_rotate_hooks_jsonl(dir.path()).unwrap();
+        let log_content = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(log_content, "row1\nrow2\n", "log untouched within window");
+        let archives: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl.gz"))
+            .collect();
+        assert!(archives.is_empty(), "no archive within window");
+    }
+
+    #[test]
+    fn rotation_archives_when_window_exceeded() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join(".hooks-rotation-stamp");
+        let log = dir.path().join("hooks.jsonl");
+
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let past = now - HOOKS_ROTATION_INTERVAL_SECS - 60; // > 1h ago
+        std::fs::write(&stamp, past.to_string()).unwrap();
+        std::fs::write(&log, "row1\nrow2\nrow3\n").unwrap();
+
+        maybe_rotate_hooks_jsonl(dir.path()).unwrap();
+
+        // Live log truncated.
+        let log_content = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(log_content, "", "live log truncated post-rotation");
+
+        // Archive named by the OLD stamp value.
+        let expected_archive = dir.path().join(format!("hooks-{}.jsonl.gz", past));
+        assert!(
+            expected_archive.exists(),
+            "archive should be at {}",
+            expected_archive.display()
+        );
+
+        // Archive content decompresses to original log content.
+        let gz_bytes = std::fs::read(&expected_archive).unwrap();
+        let mut decoder = flate2::read::GzDecoder::new(&gz_bytes[..]);
+        let mut decompressed = String::new();
+        std::io::Read::read_to_string(&mut decoder, &mut decompressed).unwrap();
+        assert_eq!(decompressed, "row1\nrow2\nrow3\n");
+
+        // Stamp updated to ~now.
+        let new_stamp: u64 = std::fs::read_to_string(&stamp)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(new_stamp >= now, "stamp updated forward");
+    }
+
+    #[test]
+    fn rotation_skips_empty_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join(".hooks-rotation-stamp");
+        let log = dir.path().join("hooks.jsonl");
+
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let past = now - HOOKS_ROTATION_INTERVAL_SECS - 1;
+        std::fs::write(&stamp, past.to_string()).unwrap();
+        std::fs::write(&log, "").unwrap(); // empty
+
+        maybe_rotate_hooks_jsonl(dir.path()).unwrap();
+
+        let archives: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".jsonl.gz"))
+            .collect();
+        assert!(archives.is_empty(), "empty log should not be archived");
+
+        // Stamp still updated so we don't churn.
+        let new_stamp: u64 = std::fs::read_to_string(&stamp)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(new_stamp >= now);
+    }
+
+    #[test]
+    fn rotation_tolerates_corrupted_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join(".hooks-rotation-stamp");
+        std::fs::write(&stamp, "garbage-not-a-number").unwrap();
+
+        // Should not panic. Parses as `now`, which makes the next-rotation
+        // window fresh.
+        maybe_rotate_hooks_jsonl(dir.path()).unwrap();
     }
 }
