@@ -93,3 +93,58 @@ async fn proxy_firmware_byte_stability_across_user_message_length() {
         "Firmware changed between T2 and T3"
     );
 }
+
+#[tokio::test]
+async fn proxy_forwards_authorization_and_api_key_headers() {
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let proxy_port = 8090;
+    let mut proxy_process = Command::new("cargo")
+        .arg("run")
+        .arg("--bin")
+        .arg("ostk-cache")
+        .env("PROXY_PORT", proxy_port.to_string())
+        .env("ANTHROPIC_BASE_URL", upstream_url)
+        .spawn()
+        .expect("Failed to start proxy");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+    let req_body = json!({
+        "system": "Sys",
+        "messages": [
+            {
+                "role": "user",
+                "content": "Hello"
+            }
+        ]
+    });
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+
+    let client = reqwest::Client::new();
+    let _request_task = tokio::spawn(async move {
+        let _ = client
+            .post(&proxy_url)
+            .header("x-api-key", "my-api-key")
+            .header("authorization", "Bearer test-token")
+            .header("anthropic-session-id", "test-session")
+            .json(&req_body)
+            .send()
+            .await;
+    });
+
+    let (mut stream, _) = mock_upstream.accept().await.unwrap();
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf).await.unwrap();
+    let received_str = String::from_utf8_lossy(&buf[..n]);
+
+    let _ = proxy_process.kill();
+    let _ = proxy_process.wait();
+
+    let lower = received_str.to_lowercase();
+    assert!(lower.contains("x-api-key: my-api-key"), "Missing x-api-key header");
+    assert!(lower.contains("authorization: bearer test-token"), "Missing authorization header");
+}

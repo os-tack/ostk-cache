@@ -176,11 +176,16 @@ async fn handle_anthropic_message(
     let url = format!("{}/v1/messages", base_url);
     let mut req_builder = client.post(url);
 
-    if !api_key.is_empty() {
-        req_builder = req_builder.header("x-api-key", api_key);
-    }
-    if !anthropic_version.is_empty() {
-        req_builder = req_builder.header("anthropic-version", anthropic_version);
+    let hop_by_hop = [
+        "host", "content-length", "transfer-encoding", "connection",
+        "keep-alive", "te", "trailer", "upgrade", "proxy-authorization",
+        "proxy-authenticate",
+    ];
+
+    for (k, v) in headers.iter() {
+        if !hop_by_hop.contains(&k.as_str()) {
+            req_builder = req_builder.header(k, v);
+        }
     }
     req_builder = req_builder.header("content-type", "application/json");
 
