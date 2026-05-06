@@ -1,6 +1,6 @@
 use async_stream::stream;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -9,11 +9,13 @@ use axum::{
 };
 use dashmap::DashMap;
 use ostk_cache::{
-    AnthropicRequest, ProviderUsage, SessionId, account, persist_amp_row, project_hud,
+    AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind, InMemoryPageTable,
+    ProviderUsage, SessionId, account, persist_amp_row, project_hud,
 };
+use serde::Deserialize;
 use serde_json::json;
 use sha2::Digest;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 #[derive(Default, Clone, Debug)]
@@ -25,6 +27,13 @@ struct AmpAccumulator {
 }
 
 type AmpStore = Arc<DashMap<SessionId, AmpAccumulator>>;
+type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
+
+#[derive(Clone)]
+struct AppState {
+    amp_store: AmpStore,
+    hook_adapter: HookAdapterHandle,
+}
 
 #[tokio::main]
 async fn main() {
@@ -39,21 +48,95 @@ async fn main() {
     };
     println!("Capture Proxy running on {}", bind_addr);
 
-    let amp_store: AmpStore = Arc::new(DashMap::new());
+    let state = AppState {
+        amp_store: Arc::new(DashMap::new()),
+        hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
+    };
 
     let app = Router::new()
         .route("/v1/messages", post(handle_anthropic_message))
+        .route("/hook/event", post(handle_hook_event))
         .fallback(any(|| async { (StatusCode::NOT_FOUND, "Not Found") }))
-        .with_state(amp_store);
+        .with_state(state);
 
     axum::serve(listener, app).await.unwrap();
 }
 
+#[derive(Debug, Deserialize)]
+struct HookEventRequest {
+    #[serde(rename = "type")]
+    type_: String,
+    workspace_id: String,
+    session_id: String,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
+}
+
+/// Map an inbound type string to HookEventKind.
+///
+/// Accepts both Claude Code's PascalCase event names (`SessionStart`,
+/// `UserPromptSubmit`, ...) and snake_case (`session_start`,
+/// `user_prompt_submit`, ...) for ergonomics from shell hooks.
+fn parse_hook_event_kind(s: &str) -> Option<HookEventKind> {
+    if let Some(k) = HookEventKind::parse_str(s) {
+        return Some(k);
+    }
+    match s {
+        "session_start" => Some(HookEventKind::SessionStart),
+        "user_prompt_submit" => Some(HookEventKind::UserPromptSubmit),
+        "pre_tool_use" => Some(HookEventKind::PreToolUse),
+        "post_tool_use" => Some(HookEventKind::PostToolUse),
+        "stop" => Some(HookEventKind::Stop),
+        _ => None,
+    }
+}
+
+async fn handle_hook_event(
+    State(state): State<AppState>,
+    Json(req): Json<HookEventRequest>,
+) -> Response {
+    let kind = match parse_hook_event_kind(&req.type_) {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "type": "error",
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": format!("unknown hook event type: {}", req.type_)
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut event = HookEvent::new(kind, req.workspace_id, req.session_id);
+    if let Some(p) = req.payload {
+        event = event.with_payload(p);
+    }
+
+    // Dispatch under the adapter mutex. We hold it for the duration of
+    // a single hook write; the I/O is small (one append + maybe a
+    // manifest snapshot), so contention is bounded.
+    {
+        let mut adapter = match state.hook_adapter.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        adapter.on_event(event);
+    }
+
+    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+}
+
 async fn handle_anthropic_message(
-    State(amp_store): State<AmpStore>,
+    State(state): State<AppState>,
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
+    let amp_store = state.amp_store.clone();
     println!("--- INTERCEPTED REQUEST ---");
 
     let api_key = headers

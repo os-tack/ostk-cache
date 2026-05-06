@@ -402,7 +402,7 @@ impl HookEventKind {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<HookEventKind> {
+    pub fn parse_str(s: &str) -> Option<HookEventKind> {
         match s {
             "SessionStart" => Some(HookEventKind::SessionStart),
             "UserPromptSubmit" => Some(HookEventKind::UserPromptSubmit),
@@ -875,8 +875,8 @@ mod tests {
             HookEventKind::PostToolUse,
             HookEventKind::Stop,
         ] {
-            assert_eq!(HookEventKind::from_str(kind.as_str()), Some(kind));
+            assert_eq!(HookEventKind::parse_str(kind.as_str()), Some(kind));
         }
-        assert_eq!(HookEventKind::from_str("Unknown"), None);
+        assert_eq!(HookEventKind::parse_str("Unknown"), None);
     }
 }
