@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -147,14 +148,20 @@ impl Default for InMemoryPageTable {
 
 impl PageTable for InMemoryPageTable {
     async fn store(&mut self, name: PageName, content: &[u8], ws: WorkspaceId) -> Page {
-        let file_id = materialize(content, &ws).await;
+        let content_clone = content.to_vec();
+        let ws_clone = ws.clone();
+        
+        tokio::spawn(async move {
+            let _file_id = materialize(&content_clone, &ws_clone).await;
+        });
+
         let mut hasher = sha2::Sha256::new();
         hasher.update(content);
         let content_hash = format!("{:x}", hasher.finalize());
         let page = Page {
             name: name.clone(),
             content_hash,
-            file_id: Some(file_id),
+            file_id: None,
             token_count: content.len() / 4,
             last_used: SystemTime::now(),
             state: PageState::Hot,
@@ -361,7 +368,31 @@ impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
             HookEvent::UserPromptSubmit => println!("Placing TTL markers, injecting HUD"),
             HookEvent::PreToolUse => println!("Executing predictive prefetch"),
             HookEvent::PostToolUse => println!("Running auto-promotion, updating amp ledger"),
-            HookEvent::Stop => println!("Persisting snapshot, checking staleness"),
+            HookEvent::Stop => {
+                println!("Persisting snapshot, checking staleness");
+                let dir = Path::new(".l1.5");
+                if !dir.exists() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let file_path = dir.join("manifest.json");
+                let mut file = match std::fs::File::create(&file_path) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("[DaemonAdapter] Failed to create manifest.json: {}", e);
+                        return;
+                    }
+                };
+                let status = json!({
+                    "status": "persisted",
+                    "timestamp": std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                });
+                if let Err(e) = writeln!(file, "{}", status.to_string()) {
+                    eprintln!("[DaemonAdapter] Failed to write manifest.json: {}", e);
+                }
+            }
         }
     }
 }
@@ -377,7 +408,7 @@ mod tests {
             .store("firmware".to_string(), b"sys_prompt", "ws1".to_string())
             .await;
         assert_eq!(page.state, PageState::Hot);
-        assert!(page.file_id.is_some());
+        assert!(page.file_id.is_none());
 
         let loaded = table
             .load("firmware".to_string(), "ws1".to_string())

@@ -1,13 +1,12 @@
+use dashmap::DashMap;
 use ostk_cache::{
     AnthropicRequest, ProviderUsage, SessionId, account, persist_amp_row, project_hud,
 };
 use serde_json::json;
 use sha2::Digest;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 
 #[derive(Default, Clone, Debug)]
 struct AmpAccumulator {
@@ -17,7 +16,7 @@ struct AmpAccumulator {
     hot_count: usize,
 }
 
-type AmpStore = Arc<Mutex<HashMap<SessionId, AmpAccumulator>>>;
+type AmpStore = Arc<DashMap<SessionId, AmpAccumulator>>;
 
 #[tokio::main]
 async fn main() {
@@ -32,7 +31,7 @@ async fn main() {
     };
     println!("Capture Proxy running on 8080");
 
-    let amp_store: AmpStore = Arc::new(Mutex::new(HashMap::new()));
+    let amp_store: AmpStore = Arc::new(DashMap::new());
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -108,8 +107,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     });
 
     let prior_amp = {
-        let guard = amp_store.lock().await;
-        guard.get(&session_id).cloned().unwrap_or_default()
+        amp_store.get(&session_id).map(|r| r.clone()).unwrap_or_default()
     };
 
     let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(body) {
@@ -299,8 +297,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
             eprintln!("[proxy] persist_amp_row error: {}", e);
         }
 
-        let mut guard = amp_store.lock().await;
-        let acc = guard.entry(session_id).or_default();
+        let mut acc = amp_store.entry(session_id).or_default();
         let n = acc.turns_seen as f64;
         acc.cumulative_amp_mean = (acc.cumulative_amp_mean * n + row.amp_ratio) / (n + 1.0);
         acc.turns_seen += 1;
