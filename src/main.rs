@@ -1,0 +1,391 @@
+use ostk_cache::{
+    account, persist_amp_row, project_hud, render_partition, AnthropicRequest, ProviderUsage,
+    SessionId,
+};
+use serde_json::json;
+use sha2::Digest;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::Mutex;
+
+#[derive(Default, Clone, Debug)]
+struct AmpAccumulator {
+    cumulative_amp_mean: f64,
+    turns_seen: u64,
+    stored_count: usize,
+    hot_count: usize,
+}
+
+type AmpStore = Arc<Mutex<HashMap<SessionId, AmpAccumulator>>>;
+
+#[tokio::main]
+async fn main() {
+    let listener = match TcpListener::bind("127.0.0.1:8080").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[proxy] fatal: bind 127.0.0.1:8080 failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    println!("Capture Proxy running on 8080");
+
+    let amp_store: AmpStore = Arc::new(Mutex::new(HashMap::new()));
+
+    loop {
+        let (stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("[proxy] accept error: {} (continuing)", e);
+                continue;
+            }
+        };
+        let store = Arc::clone(&amp_store);
+        tokio::spawn(async move {
+            handle_connection(stream, store).await;
+        });
+    }
+}
+
+async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStore) {
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let bytes_read = match stream.read(&mut buffer).await {
+        Ok(0) => return,
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[proxy] stream read error: {}", e);
+            return;
+        }
+    };
+
+    let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
+    println!("--- INTERCEPTED REQUEST ---");
+
+    let req_string = request_str.to_string();
+    let parts: Vec<&str> = req_string.splitn(2, "\r\n\r\n").collect();
+    if parts.len() < 2 {
+        let _ = write_client_error(&mut stream, 400, "missing request body").await;
+        return;
+    }
+    let headers = parts[0];
+    let body = parts[1];
+
+    let mut api_key = String::new();
+    let mut anthropic_version = String::new();
+    let mut session_header: Option<String> = None;
+    for line in headers.lines() {
+        let lower = line.to_lowercase();
+        if let Some(rest) = line.get(10..).filter(|_| lower.starts_with("x-api-key:")) {
+            api_key = rest.trim().to_string();
+        } else if let Some(rest) = line.get(18..).filter(|_| lower.starts_with("anthropic-version:")) {
+            anthropic_version = rest.trim().to_string();
+        } else if lower.starts_with("anthropic-session-id:")
+            && let Some(rest) = line.get("anthropic-session-id:".len()..)
+        {
+            session_header = Some(rest.trim().to_string());
+        }
+    }
+
+    let session_id: SessionId = session_header.unwrap_or_else(|| {
+        // Stable session key derived from api_key. NOT a security boundary —
+        // just a deterministic accumulator key for callers without a session header.
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(api_key.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        digest[..16].to_string()
+    });
+
+    let prior_amp = {
+        let guard = amp_store.lock().await;
+        guard.get(&session_id).cloned().unwrap_or_default()
+    };
+
+    let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(body) {
+        Ok(mut req) => {
+            // TODO statefulize per session for cross-turn LCP; for v1 we use the
+            // single-prompt heuristic. Concatenate system + all messages into one
+            // string and let render_partition's single-turn branch place the cut.
+            let mut concatenated = String::new();
+            if let Some(sys) = &req.system {
+                if let Some(s) = sys.as_str() {
+                    concatenated.push_str(s);
+                } else if let Some(arr) = sys.as_array() {
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            concatenated.push_str(text);
+                        }
+                    }
+                }
+            }
+            for msg in &req.messages {
+                if !concatenated.is_empty() {
+                    concatenated.push('\n');
+                }
+                if let Some(s) = msg.content.as_str() {
+                    concatenated.push_str(s);
+                } else if let Some(arr) = msg.content.as_array() {
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            concatenated.push_str(text);
+                        }
+                    }
+                }
+            }
+
+            let (firmware, state) = render_partition(&[concatenated.as_str()]);
+
+            req.system = Some(json!([
+                {
+                    "type": "text",
+                    "text": firmware,
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }
+            ]));
+
+            if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
+                let amp_for_hud = if prior_amp.turns_seen == 0 {
+                    1.0
+                } else {
+                    prior_amp.cumulative_amp_mean
+                };
+                let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
+                let new_state = format!("{}\n{}", hud, state);
+                last_msg.content = json!([
+                    {
+                        "type": "text",
+                        "text": new_state,
+                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                    }
+                ]);
+            }
+
+            match serde_json::to_string(&req) {
+                Ok(s) => (s, false),
+                Err(_) => (body.to_string(), false),
+            }
+        }
+        Err(_) => (body.to_string(), true),
+    };
+
+    if parse_failed {
+        let _ = write_client_error(&mut stream, 400, "invalid JSON request body").await;
+        return;
+    }
+
+    let client = reqwest::Client::new();
+    let mut req_builder = client.post("https://api.anthropic.com/v1/messages");
+
+    if !api_key.is_empty() {
+        req_builder = req_builder.header("x-api-key", api_key);
+    }
+    if !anthropic_version.is_empty() {
+        req_builder = req_builder.header("anthropic-version", anthropic_version);
+    }
+    req_builder = req_builder.header("content-type", "application/json");
+
+    let res = req_builder.body(payload).send().await;
+
+    let mut response = match res {
+        Ok(r) => r,
+        Err(e) => {
+            let body = json!({
+                "type": "error",
+                "error": {"type": "upstream_error", "message": format!("{}", e)}
+            })
+            .to_string();
+            let _ = write_status(&mut stream, 502, "Bad Gateway", &body).await;
+            return;
+        }
+    };
+
+    let status = response.status();
+    let resp_headers = response.headers().clone();
+    let mut is_chunked = false;
+    let mut is_sse = false;
+
+    let mut resp_str = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Unknown")
+    );
+    for (k, v) in resp_headers.iter() {
+        let key_lower = k.as_str().to_lowercase();
+        let val_str = v.to_str().unwrap_or("");
+        if key_lower == "transfer-encoding" && val_str.to_lowercase().contains("chunked") {
+            is_chunked = true;
+        }
+        if key_lower == "content-type" && val_str.to_lowercase().contains("text/event-stream") {
+            is_sse = true;
+        }
+        resp_str.push_str(&format!("{}: {}\r\n", k.as_str(), val_str));
+    }
+    if !is_chunked && !resp_headers.contains_key("content-length") {
+        resp_str.push_str("Transfer-Encoding: chunked\r\n");
+        is_chunked = true;
+    }
+    resp_str.push_str("\r\n");
+
+    if let Err(e) = stream.write_all(resp_str.as_bytes()).await {
+        eprintln!("[proxy] client write (headers) error: {}", e);
+        return;
+    }
+
+    let mut accumulated = Vec::<u8>::new();
+
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                accumulated.extend_from_slice(&chunk);
+                let write_res = if is_chunked {
+                    stream
+                        .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                        .await
+                        .and(stream.write_all(&chunk).await)
+                        .and(stream.write_all(b"\r\n").await)
+                } else {
+                    stream.write_all(&chunk).await
+                };
+                if let Err(e) = write_res {
+                    eprintln!("[proxy] client write (chunk) error: {} — closing", e);
+                    return;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                eprintln!("[proxy] upstream chunk error: {} — closing client", e);
+                return;
+            }
+        }
+    }
+
+    if is_chunked {
+        let _ = stream.write_all(b"0\r\n\r\n").await;
+    }
+
+    if let Some(usage) = if is_sse {
+        parse_usage_from_sse(&accumulated)
+    } else {
+        parse_usage_from_json(&accumulated)
+    } {
+        let row = account(&usage, session_id.clone());
+        if let Err(e) = persist_amp_row(&row) {
+            eprintln!("[proxy] persist_amp_row error: {}", e);
+        }
+
+        let mut guard = amp_store.lock().await;
+        let acc = guard.entry(session_id).or_default();
+        let n = acc.turns_seen as f64;
+        acc.cumulative_amp_mean = (acc.cumulative_amp_mean * n + row.amp_ratio) / (n + 1.0);
+        acc.turns_seen += 1;
+        // Stored/hot counts are not yet observable from upstream usage; they
+        // become real once the page-table side of the daemon lands. For now
+        // we surface turns_seen as a stand-in for "stored" so the HUD shows
+        // movement across turns.
+        acc.stored_count = acc.turns_seen as usize;
+    }
+}
+
+fn parse_usage_from_json(body: &[u8]) -> Option<ProviderUsage> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = v.get("usage")?;
+    Some(ProviderUsage {
+        input_tokens: usage.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        cache_read_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as usize,
+        cache_create_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as usize,
+    })
+}
+
+fn parse_usage_from_sse(body: &[u8]) -> Option<ProviderUsage> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut current_event: Option<&str> = None;
+    let mut input_tokens = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_create = 0u64;
+    let mut found = false;
+
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("event: ") {
+            current_event = Some(rest);
+        } else if let Some(rest) = line.strip_prefix("data: ") {
+            let event = current_event.unwrap_or("");
+            if (event == "message_start" || event == "message_delta")
+                && let Ok(v) = serde_json::from_str::<serde_json::Value>(rest)
+            {
+                let usage = v
+                    .get("usage")
+                    .or_else(|| v.get("message").and_then(|m| m.get("usage")));
+                if let Some(u) = usage {
+                    if let Some(n) = u.get("input_tokens").and_then(|x| x.as_u64()) {
+                        input_tokens = n;
+                        found = true;
+                    }
+                    if let Some(n) = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()) {
+                        cache_read = n;
+                        found = true;
+                    }
+                    if let Some(n) = u
+                        .get("cache_creation_input_tokens")
+                        .and_then(|x| x.as_u64())
+                    {
+                        cache_create = n;
+                        found = true;
+                    }
+                }
+            }
+        } else if line.is_empty() {
+            current_event = None;
+        }
+    }
+
+    if found {
+        Some(ProviderUsage {
+            input_tokens: input_tokens as usize,
+            cache_read_tokens: cache_read as usize,
+            cache_create_tokens: cache_create as usize,
+        })
+    } else {
+        None
+    }
+}
+
+async fn write_client_error(
+    stream: &mut tokio::net::TcpStream,
+    code: u16,
+    message: &str,
+) -> std::io::Result<()> {
+    let body = json!({
+        "type": "error",
+        "error": {"type": "invalid_request_error", "message": message}
+    })
+    .to_string();
+    let reason = match code {
+        400 => "Bad Request",
+        502 => "Bad Gateway",
+        _ => "Error",
+    };
+    write_status(stream, code, reason, &body).await
+}
+
+async fn write_status(
+    stream: &mut tokio::net::TcpStream,
+    code: u16,
+    reason: &str,
+    body: &str,
+) -> std::io::Result<()> {
+    let resp = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        code,
+        reason,
+        body.len(),
+        body
+    );
+    stream.write_all(resp.as_bytes()).await
+}

@@ -1,0 +1,18 @@
+[package]
+name = "ostk-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+bytes = "1.0"
+
+[dev-dependencies]
+tempfile = "3"
