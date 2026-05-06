@@ -33,6 +33,18 @@ type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 struct AppState {
     amp_store: AmpStore,
     hook_adapter: HookAdapterHandle,
+    passthrough: bool,
+}
+
+/// Returns true if the value parses as a truthy flag.
+///
+/// Truthy: any of "1", "true", "yes" case-insensitive (trimmed).
+/// Anything else (empty, "0", "false", or unset) returns false.
+fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
+        Err(_) => false,
+    }
 }
 
 #[tokio::main]
@@ -46,11 +58,14 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    println!("Capture Proxy running on {}", bind_addr);
+    let passthrough = env_truthy("OSTK_CACHE_PASSTHROUGH");
+    let mode = if passthrough { "passthrough" } else { "mutate" };
+    println!("Capture Proxy running on {} (mode: {})", bind_addr, mode);
 
     let state = AppState {
         amp_store: Arc::new(DashMap::new()),
         hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
+        passthrough,
     };
 
     let app = Router::new()
@@ -137,6 +152,7 @@ async fn handle_anthropic_message(
     body_bytes: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
     let amp_store = state.amp_store.clone();
+    let passthrough = state.passthrough;
     println!("--- INTERCEPTED REQUEST ---");
 
     let api_key = headers
@@ -175,7 +191,18 @@ async fn handle_anthropic_message(
     let body_str = String::from_utf8_lossy(&body_bytes);
     let mut firmware_len = 0;
     let mut state_len = 0;
-    let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(&body_str) {
+    let (payload, parse_failed) = if passthrough {
+        // Passthrough mode: forward the original body verbatim. We still
+        // perform a cheap JSON validity check so malformed bodies error
+        // the same way they do in mutate mode (the caller benefits from
+        // the structured 400 response). Accounting (usage parsing,
+        // ledger persist, amp_store update) still runs downstream.
+        match serde_json::from_str::<serde_json::Value>(&body_str) {
+            Ok(_) => (body_str.to_string(), false),
+            Err(_) => (body_str.to_string(), true),
+        }
+    } else {
+        match serde_json::from_str::<AnthropicRequest>(&body_str) {
         Ok(mut req) => {
             let firmware: String = match &req.system {
                 Some(sys) if sys.is_string() => sys.as_str().unwrap().to_string(),
@@ -257,6 +284,7 @@ async fn handle_anthropic_message(
             }
         }
         Err(_) => (body_str.to_string(), true),
+        }
     };
 
     if parse_failed {
