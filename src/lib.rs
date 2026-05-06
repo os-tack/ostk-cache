@@ -365,6 +365,13 @@ pub struct ProviderUsage {
     pub cache_create_tokens: usize,
 }
 
+/// Default value for `AmpRow.mode` when deserializing rows persisted before
+/// the passthrough A/B mode was introduced. Old rows always reflect the
+/// (then-only) mutate path.
+pub fn default_amp_mode() -> String {
+    "mutate".to_string()
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct AmpRow {
     pub session: SessionId,
@@ -384,6 +391,11 @@ pub struct AmpRow {
     pub hot_count: usize,
     #[serde(default)]
     pub timestamp: u64,
+    /// "mutate" (proxy rewrote the request) or "passthrough" (proxy
+    /// forwarded byte-identical, accounting only). Older ledger rows
+    /// without this field default to "mutate" via `default_amp_mode`.
+    #[serde(default = "default_amp_mode")]
+    pub mode: String,
 }
 
 pub fn account(
@@ -393,6 +405,7 @@ pub fn account(
     firmware_bytes: usize,
     state_bytes: usize,
     hot_count: usize,
+    mode: &str,
 ) -> AmpRow {
     let amp_ratio = if usage.input_tokens == 0 {
         1.0
@@ -416,6 +429,7 @@ pub fn account(
         state_bytes,
         hot_count,
         timestamp,
+        mode: mode.to_string(),
     }
 }
 
@@ -689,7 +703,15 @@ mod tests {
             cache_read_tokens: 200,
             cache_create_tokens: 50,
         };
-        let row = account(&usage, "sess_1".to_string(), "ws_1".to_string(), 10, 20, 5);
+        let row = account(
+            &usage,
+            "sess_1".to_string(),
+            "ws_1".to_string(),
+            10,
+            20,
+            5,
+            "mutate",
+        );
         assert_eq!(row.session, "sess_1");
         assert_eq!(row.workspace_id, "ws_1");
         assert_eq!(row.input_total, 100);
@@ -697,6 +719,7 @@ mod tests {
         assert_eq!(row.firmware_bytes, 10);
         assert_eq!(row.state_bytes, 20);
         assert_eq!(row.hot_count, 5);
+        assert_eq!(row.mode, "mutate");
     }
 
     #[test]
@@ -706,7 +729,15 @@ mod tests {
             cache_read_tokens: 200,
             cache_create_tokens: 50,
         };
-        let row = account(&usage, "sess_2".to_string(), "ws_2".to_string(), 15, 25, 2);
+        let row = account(
+            &usage,
+            "sess_2".to_string(),
+            "ws_2".to_string(),
+            15,
+            25,
+            2,
+            "passthrough",
+        );
         assert_eq!(row.session, "sess_2");
         assert_eq!(row.workspace_id, "ws_2");
         assert_eq!(row.input_total, 0);
@@ -714,6 +745,23 @@ mod tests {
         assert_eq!(row.firmware_bytes, 15);
         assert_eq!(row.state_bytes, 25);
         assert_eq!(row.hot_count, 2);
+        assert_eq!(row.mode, "passthrough");
+    }
+
+    #[test]
+    fn test_amp_row_legacy_row_defaults_to_mutate() {
+        // Old rows persisted before the `mode` field existed must still
+        // parse, with mode defaulting to "mutate" so --mode mutate sees
+        // them in stats analysis.
+        let legacy = r#"{
+            "session": "sess_legacy",
+            "workspace_id": "ws_legacy",
+            "input_total": 10,
+            "amp_ratio": 1.0
+        }"#;
+        let row: AmpRow = serde_json::from_str(legacy).expect("legacy row parses");
+        assert_eq!(row.mode, "mutate");
+        assert_eq!(row.session, "sess_legacy");
     }
 
     fn git_init(dir: &Path) {

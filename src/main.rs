@@ -379,13 +379,15 @@ async fn handle_anthropic_message(
 
         if let Some(usage) = parsed_usage {
             let prior_amp_for_write = prior_amp.clone();
+            let mode_str = if passthrough { "passthrough" } else { "mutate" };
             let row = account(
                 &usage, 
                 session_id_clone.clone(),
                 workspace.priority_hash.clone(),
                 firmware_len,
                 state_len,
-                prior_amp_for_write.hot_count
+                prior_amp_for_write.hot_count,
+                mode_str,
             );
             if let Err(e) = persist_amp_row(&row) {
                 eprintln!("[proxy] persist_amp_row error: {}", e);
