@@ -23,9 +23,30 @@ cargo run --bin ostk-cache
 Set `PROXY_PORT` to bind a different port; the hook URLs below use
 `8080`.
 
-## 2. Wire `~/.claude/settings.json`
+## 2. Install hooks (CLI — recommended)
 
-The `hooks` key is keyed by event name. Each value is an array of
+```bash
+cargo run --bin hooks -- install
+# dispatch script: ~/.config/ostk-cache/hooks/dispatch.sh
+# settings backup: ~/.claude/settings.json.ostk-cache.bak
+# install:         added 5 entries
+```
+
+The CLI is **idempotent and non-destructive** — it appends entries
+alongside any existing hooks on the same events, never replaces them.
+Backup is written before any change. Inspect with `hooks status` and
+remove with `hooks uninstall` (or `hooks uninstall --purge` to also
+delete the script directory).
+
+The dispatch script reads `session_id` from stdin JSON (Claude Code's
+canonical channel) and falls back to `CLAUDE_SESSION_ID` if absent;
+fails quietly with `curl ... || true` so a missing or wedged proxy
+never blocks a Claude session.
+
+## 3. Wire `~/.claude/settings.json` (manual — alternative)
+
+If you'd rather edit settings.json by hand instead of using the CLI,
+the `hooks` key is keyed by event name. Each value is an array of
 `{matcher, hooks: [{type: "command", command: "..."}]}` rules. The
 command runs in a shell with environment variables Claude exports
 (`CLAUDE_PROJECT_DIR`, `CLAUDE_SESSION_ID`, ...) and any stdin Claude
