@@ -257,8 +257,14 @@ pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
                         return id.to_string();
                     }
                 }
+            } else {
+                eprintln!("[proxy] materialize failed: HTTP {}", response.status());
             }
+        } else if let Err(e) = res {
+            eprintln!("[proxy] materialize request error: {}", e);
         }
+    } else {
+        eprintln!("[proxy] ANTHROPIC_API_KEY missing, using fallback hash for materialize");
     }
     
     fallback

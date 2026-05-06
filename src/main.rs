@@ -89,13 +89,19 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
         }
     }
 
+    let workspace = ostk_cache::Workspace::from_path(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    ).unwrap_or_else(|_| ostk_cache::Workspace {
+        priority_hash: "unknown".to_string(),
+        source: ostk_cache::WorkspaceSource::Cwd,
+    });
+
     let session_id: SessionId = session_header.unwrap_or_else(|| {
-        // Stable session key derived from api_key. NOT a security boundary —
-        // just a deterministic accumulator key for callers without a session header.
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(api_key.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        digest[..16].to_string()
+        format!("{}:{}", workspace.priority_hash, {
+            let mut h = sha2::Sha256::new();
+            h.update(api_key.as_bytes());
+            format!("{:x}", h.finalize())[..12].to_string()
+        })
     });
 
     let prior_amp = {
@@ -234,27 +240,39 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     let mut accumulated = Vec::<u8>::new();
 
     loop {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                accumulated.extend_from_slice(&chunk);
-                let write_res = if is_chunked {
-                    stream
-                        .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
-                        .await
-                        .and(stream.write_all(&chunk).await)
-                        .and(stream.write_all(b"\r\n").await)
-                } else {
-                    stream.write_all(&chunk).await
-                };
-                if let Err(e) = write_res {
-                    eprintln!("[proxy] client write (chunk) error: {} — closing", e);
-                    return;
+        tokio::select! {
+            chunk_res = response.chunk() => {
+                match chunk_res {
+                    Ok(Some(chunk)) => {
+                        if chunk.is_empty() { continue; }
+                        accumulated.extend_from_slice(&chunk);
+                        let write_res = if is_chunked {
+                            stream
+                                .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
+                                .await
+                                .and(stream.write_all(&chunk).await)
+                                .and(stream.write_all(b"\r\n").await)
+                        } else {
+                            stream.write_all(&chunk).await
+                        };
+                        if let Err(e) = write_res {
+                            eprintln!("[proxy] client write (chunk) error: {} — closing", e);
+                            return;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("[proxy] upstream chunk error: {} — closing client", e);
+                        return;
+                    }
                 }
             }
-            Ok(None) => break,
-            Err(e) => {
-                eprintln!("[proxy] upstream chunk error: {} — closing client", e);
-                return;
+            _ = stream.readable() => {
+                let mut buf = [0u8; 1];
+                if stream.try_read(&mut buf).is_err() {
+                    eprintln!("[proxy] client disconnected mid-stream; aborting upstream read");
+                    break;
+                }
             }
         }
     }
@@ -312,7 +330,9 @@ fn parse_usage_from_sse(body: &[u8]) -> Option<ProviderUsage> {
 
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
-        if let Some(rest) = line.strip_prefix("event: ") {
+        if line.is_empty() {
+            current_event = None;
+        } else if let Some(rest) = line.strip_prefix("event: ") {
             current_event = Some(rest);
         } else if let Some(rest) = line.strip_prefix("data: ") {
             let event = current_event.unwrap_or("");
