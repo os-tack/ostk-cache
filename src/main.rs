@@ -1,3 +1,12 @@
+use async_stream::stream;
+use axum::{
+    Router,
+    body::Body,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, post},
+};
 use dashmap::DashMap;
 use ostk_cache::{
     AnthropicRequest, ProviderUsage, SessionId, account, persist_amp_row, project_hud,
@@ -5,7 +14,6 @@ use ostk_cache::{
 use serde_json::json;
 use sha2::Digest;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[derive(Default, Clone, Debug)]
@@ -29,65 +37,37 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    println!("Capture Proxy running on 8080");
+    println!("Capture Proxy running on {}", bind_addr);
 
     let amp_store: AmpStore = Arc::new(DashMap::new());
 
-    loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("[proxy] accept error: {} (continuing)", e);
-                continue;
-            }
-        };
-        let store = Arc::clone(&amp_store);
-        tokio::spawn(async move {
-            handle_connection(stream, store).await;
-        });
-    }
+    let app = Router::new()
+        .route("/v1/messages", post(handle_anthropic_message))
+        .fallback(any(|| async { (StatusCode::NOT_FOUND, "Not Found") }))
+        .with_state(amp_store);
+
+    axum::serve(listener, app).await.unwrap();
 }
 
-async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStore) {
-    let mut buffer = vec![0u8; 1024 * 1024];
-    let bytes_read = match stream.read(&mut buffer).await {
-        Ok(0) => return,
-        Ok(n) => n,
-        Err(e) => {
-            eprintln!("[proxy] stream read error: {}", e);
-            return;
-        }
-    };
-
-    let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
+async fn handle_anthropic_message(
+    State(amp_store): State<AmpStore>,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
     println!("--- INTERCEPTED REQUEST ---");
-
-    let req_string = request_str.to_string();
-    let parts: Vec<&str> = req_string.splitn(2, "\r\n\r\n").collect();
-    if parts.len() < 2 {
-        let _ = write_client_error(&mut stream, 400, "missing request body").await;
-        return;
-    }
-    let headers = parts[0];
-    let body = parts[1];
 
     let mut api_key = String::new();
     let mut anthropic_version = String::new();
     let mut session_header: Option<String> = None;
-    for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if let Some(rest) = line.get(10..).filter(|_| lower.starts_with("x-api-key:")) {
-            api_key = rest.trim().to_string();
-        } else if let Some(rest) = line
-            .get(18..)
-            .filter(|_| lower.starts_with("anthropic-version:"))
-        {
-            anthropic_version = rest.trim().to_string();
-        } else if lower.starts_with("anthropic-session-id:")
-            && let Some(rest) = line.get("anthropic-session-id:".len()..)
-        {
-            session_header = Some(rest.trim().to_string());
-        }
+
+    if let Some(v) = headers.get("x-api-key") {
+        api_key = v.to_str().unwrap_or("").to_string();
+    }
+    if let Some(v) = headers.get("anthropic-version") {
+        anthropic_version = v.to_str().unwrap_or("").to_string();
+    }
+    if let Some(v) = headers.get("anthropic-session-id") {
+        session_header = Some(v.to_str().unwrap_or("").to_string());
     }
 
     let workspace = ostk_cache::Workspace::from_path(
@@ -107,10 +87,14 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     });
 
     let prior_amp = {
-        amp_store.get(&session_id).map(|r| r.clone()).unwrap_or_default()
+        amp_store
+            .get(&session_id)
+            .map(|r| r.clone())
+            .unwrap_or_default()
     };
 
-    let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(body) {
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(&body_str) {
         Ok(mut req) => {
             let firmware: String = match &req.system {
                 Some(sys) if sys.is_string() => sys.as_str().unwrap().to_string(),
@@ -142,15 +126,12 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
 
                 let mut new_content_array = Vec::new();
 
-                // 1. Add HUD as the first text block with the 5m ephemeral marker
                 new_content_array.push(json!({
                     "type": "text",
                     "text": format!("{}\n", hud),
                     "cache_control": {"type": "ephemeral", "ttl": "5m"}
                 }));
 
-                // 2. Preserve original content (including images/documents)
-                // stripping existing cache_control markers to avoid Anthropic's 4-marker limit
                 if let Some(s) = last_msg.content.as_str() {
                     new_content_array.push(json!({
                         "type": "text",
@@ -171,15 +152,22 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
 
             match serde_json::to_string(&req) {
                 Ok(s) => (s, false),
-                Err(_) => (body.to_string(), false),
+                Err(_) => (body_str.to_string(), false),
             }
         }
-        Err(_) => (body.to_string(), true),
+        Err(_) => (body_str.to_string(), true),
     };
 
     if parse_failed {
-        let _ = write_client_error(&mut stream, 400, "invalid JSON request body").await;
-        return;
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            json!({
+                "type": "error",
+                "error": {"type": "invalid_request_error", "message": "invalid JSON request body"}
+            })
+            .to_string(),
+        )
+            .into_response());
     }
 
     let client = reqwest::Client::new();
@@ -196,117 +184,78 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     }
     req_builder = req_builder.header("content-type", "application/json");
 
-    let res = req_builder.body(payload).send().await;
-
-    let mut response = match res {
+    let mut response = match req_builder.body(payload).send().await {
         Ok(r) => r,
         Err(e) => {
-            let body = json!({
-                "type": "error",
-                "error": {"type": "upstream_error", "message": format!("{}", e)}
-            })
-            .to_string();
-            let _ = write_status(&mut stream, 502, "Bad Gateway", &body).await;
-            return;
+            return Ok((
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "type": "error",
+                    "error": {"type": "upstream_error", "message": format!("{}", e)}
+                })
+                .to_string(),
+            )
+                .into_response());
         }
     };
 
     let status = response.status();
-    let resp_headers = response.headers().clone();
-    let mut is_chunked = false;
+    let mut resp_builder = Response::builder().status(status.as_u16());
+
     let mut is_sse = false;
 
-    let mut resp_str = format!(
-        "HTTP/1.1 {} {}\r\n",
-        status.as_u16(),
-        status.canonical_reason().unwrap_or("Unknown")
-    );
-    for (k, v) in resp_headers.iter() {
+    for (k, v) in response.headers().iter() {
         let key_lower = k.as_str().to_lowercase();
-        let val_str = v.to_str().unwrap_or("");
-        if key_lower == "transfer-encoding" && val_str.to_lowercase().contains("chunked") {
-            is_chunked = true;
+        if key_lower == "transfer-encoding"
+            || key_lower == "connection"
+            || key_lower == "content-length"
+        {
+            continue;
         }
-        if key_lower == "content-type" && val_str.to_lowercase().contains("text/event-stream") {
+        if key_lower == "content-type"
+            && v.to_str()
+                .unwrap_or("")
+                .to_lowercase()
+                .contains("text/event-stream")
+        {
             is_sse = true;
         }
-        resp_str.push_str(&format!("{}: {}\r\n", k.as_str(), val_str));
-    }
-    if !is_chunked && !resp_headers.contains_key("content-length") {
-        resp_str.push_str("Transfer-Encoding: chunked\r\n");
-        is_chunked = true;
-    }
-    resp_str.push_str("\r\n");
-
-    if let Err(e) = stream.write_all(resp_str.as_bytes()).await {
-        eprintln!("[proxy] client write (headers) error: {}", e);
-        return;
+        resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
 
-    let mut accumulated = Vec::<u8>::new();
+    let session_id_clone = session_id.clone();
 
-    loop {
-        tokio::select! {
-            chunk_res = response.chunk() => {
-                match chunk_res {
-                    Ok(Some(chunk)) => {
-                        if chunk.is_empty() { continue; }
-                        accumulated.extend_from_slice(&chunk);
-                        let write_res = if is_chunked {
-                            stream
-                                .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
-                                .await
-                                .and(stream.write_all(&chunk).await)
-                                .and(stream.write_all(b"\r\n").await)
-                        } else {
-                            stream.write_all(&chunk).await
-                        };
-                        if let Err(e) = write_res {
-                            eprintln!("[proxy] client write (chunk) error: {} — closing", e);
-                            return;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("[proxy] upstream chunk error: {} — closing client", e);
-                        return;
-                    }
-                }
+    let stream = stream! {
+        let mut accumulated = Vec::<u8>::new();
+
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if chunk.is_empty() {
+                continue;
             }
-            _ = stream.readable() => {
-                let mut buf = [0u8; 1];
-                if stream.try_read(&mut buf).is_err() {
-                    eprintln!("[proxy] client disconnected mid-stream; aborting upstream read");
-                    break;
-                }
-            }
-        }
-    }
-
-    if is_chunked {
-        let _ = stream.write_all(b"0\r\n\r\n").await;
-    }
-
-    if let Some(usage) = if is_sse {
-        parse_usage_from_sse(&accumulated)
-    } else {
-        parse_usage_from_json(&accumulated)
-    } {
-        let row = account(&usage, session_id.clone());
-        if let Err(e) = persist_amp_row(&row) {
-            eprintln!("[proxy] persist_amp_row error: {}", e);
+            accumulated.extend_from_slice(&chunk);
+            yield Ok::<_, std::io::Error>(chunk);
         }
 
-        let mut acc = amp_store.entry(session_id).or_default();
-        let n = acc.turns_seen as f64;
-        acc.cumulative_amp_mean = (acc.cumulative_amp_mean * n + row.amp_ratio) / (n + 1.0);
-        acc.turns_seen += 1;
-        // Stored/hot counts are not yet observable from upstream usage; they
-        // become real once the page-table side of the daemon lands. For now
-        // we surface turns_seen as a stand-in for "stored" so the HUD shows
-        // movement across turns.
-        acc.stored_count = acc.turns_seen as usize;
-    }
+        if let Some(usage) = if is_sse {
+            parse_usage_from_sse(&accumulated)
+        } else {
+            parse_usage_from_json(&accumulated)
+        } {
+            let row = account(&usage, session_id_clone.clone());
+            if let Err(e) = persist_amp_row(&row) {
+                eprintln!("[proxy] persist_amp_row error: {}", e);
+            }
+
+            let mut acc = amp_store.entry(session_id_clone).or_default();
+            let n = acc.turns_seen as f64;
+            acc.cumulative_amp_mean = (acc.cumulative_amp_mean * n + row.amp_ratio) / (n + 1.0);
+            acc.turns_seen += 1;
+            acc.stored_count = acc.turns_seen as usize;
+        }
+    };
+
+    let body = Body::from_stream(stream);
+    Ok(resp_builder.body(body).unwrap())
 }
 
 fn parse_usage_from_json(body: &[u8]) -> Option<ProviderUsage> {
@@ -351,28 +300,23 @@ fn parse_usage_from_sse(body: &[u8]) -> Option<ProviderUsage> {
                     .get("usage")
                     .or_else(|| v.get("message").and_then(|m| m.get("usage")));
                 if let Some(u) = usage {
-                    if let Some(n) = u.get("input_tokens").and_then(|x| x.as_u64()) {
-                        input_tokens = n;
-                        found = true;
+                    if let Some(it) = u.get("input_tokens").and_then(|x| x.as_u64()) {
+                        input_tokens += it;
                     }
-                    if let Some(n) = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()) {
-                        cache_read = n;
-                        found = true;
+                    if let Some(cr) = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()) {
+                        cache_read += cr;
                     }
-                    if let Some(n) = u
+                    if let Some(cc) = u
                         .get("cache_creation_input_tokens")
                         .and_then(|x| x.as_u64())
                     {
-                        cache_create = n;
-                        found = true;
+                        cache_create += cc;
                     }
+                    found = true;
                 }
             }
-        } else if line.is_empty() {
-            current_event = None;
         }
     }
-
     if found {
         Some(ProviderUsage {
             input_tokens: input_tokens as usize,
@@ -382,38 +326,4 @@ fn parse_usage_from_sse(body: &[u8]) -> Option<ProviderUsage> {
     } else {
         None
     }
-}
-
-async fn write_client_error(
-    stream: &mut tokio::net::TcpStream,
-    code: u16,
-    message: &str,
-) -> std::io::Result<()> {
-    let body = json!({
-        "type": "error",
-        "error": {"type": "invalid_request_error", "message": message}
-    })
-    .to_string();
-    let reason = match code {
-        400 => "Bad Request",
-        502 => "Bad Gateway",
-        _ => "Error",
-    };
-    write_status(stream, code, reason, &body).await
-}
-
-async fn write_status(
-    stream: &mut tokio::net::TcpStream,
-    code: u16,
-    reason: &str,
-    body: &str,
-) -> std::io::Result<()> {
-    let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-        code,
-        reason,
-        body.len(),
-        body
-    );
-    stream.write_all(resp.as_bytes()).await
 }
