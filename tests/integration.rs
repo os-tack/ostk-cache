@@ -1,7 +1,7 @@
 use serde_json::json;
+use std::process::Command;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-use std::process::Command;
 
 #[tokio::test]
 async fn proxy_firmware_byte_stability_across_user_message_length() {
@@ -42,10 +42,11 @@ async fn proxy_firmware_byte_stability_across_user_message_length() {
         });
 
         let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
-        
+
         let client = reqwest::Client::new();
         let request_task = tokio::spawn(async move {
-            let _ = client.post(&proxy_url)
+            let _ = client
+                .post(&proxy_url)
                 .header("anthropic-session-id", "test-session")
                 .json(&req_body)
                 .send()
@@ -83,6 +84,12 @@ async fn proxy_firmware_byte_stability_across_user_message_length() {
 
     // Assert stability
     assert_eq!(captured_firmwares.len(), 3);
-    assert_eq!(captured_firmwares[0], captured_firmwares[1], "Firmware changed between T1 and T2");
-    assert_eq!(captured_firmwares[1], captured_firmwares[2], "Firmware changed between T2 and T3");
+    assert_eq!(
+        captured_firmwares[0], captured_firmwares[1],
+        "Firmware changed between T1 and T2"
+    );
+    assert_eq!(
+        captured_firmwares[1], captured_firmwares[2],
+        "Firmware changed between T2 and T3"
+    );
 }

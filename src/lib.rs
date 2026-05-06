@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
+use std::time::SystemTime;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AnthropicRequest {
@@ -99,7 +99,12 @@ fn normalize_git_url(raw: &str) -> String {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum PageState { Hot, Warm, Cold, Evicted }
+pub enum PageState {
+    Hot,
+    Warm,
+    Cold,
+    Evicted,
+}
 
 #[derive(Clone, Debug)]
 pub struct Page {
@@ -127,7 +132,17 @@ pub struct InMemoryPageTable {
 }
 
 impl InMemoryPageTable {
-    pub fn new() -> Self { Self { pages: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            pages: HashMap::new(),
+        }
+    }
+}
+
+impl Default for InMemoryPageTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PageTable for InMemoryPageTable {
@@ -153,26 +168,34 @@ impl PageTable for InMemoryPageTable {
         if let Some(page) = self.pages.get_mut(&(ws, name)) {
             page.last_used = SystemTime::now();
             Some(page.clone())
-        } else { None }
+        } else {
+            None
+        }
     }
-    
+
     fn pin(&mut self, name: PageName, ws: WorkspaceId) {
-        if let Some(page) = self.pages.get_mut(&(ws, name)) { page.pinned = true; }
+        if let Some(page) = self.pages.get_mut(&(ws, name)) {
+            page.pinned = true;
+        }
     }
-    
+
     fn evict(&mut self, name: PageName, ws: WorkspaceId) {
         self.pages.remove(&(ws, name));
     }
-    
+
     fn release(&mut self, name: PageName, ws: WorkspaceId) {
-        if let Some(page) = self.pages.get_mut(&(ws, name)) { page.state = PageState::Warm; }
+        if let Some(page) = self.pages.get_mut(&(ws, name)) {
+            page.state = PageState::Warm;
+        }
     }
-    
+
     fn restore(&mut self, name: PageName, ws: WorkspaceId) -> Option<Page> {
         if let Some(page) = self.pages.get_mut(&(ws, name)) {
             page.state = PageState::Hot;
             Some(page.clone())
-        } else { None }
+        } else {
+            None
+        }
     }
 
     fn list(&self, ws: &WorkspaceId, state: Option<PageState>) -> Vec<Page> {
@@ -192,7 +215,7 @@ pub fn render_partition(history: &[&str]) -> (String, String) {
         let prompt = history[0];
         let len = prompt.len();
         let threshold = len - (len / 4);
-        
+
         if let Some(idx) = prompt[..threshold].rfind('\n') {
             let firmware = prompt[..idx].to_string();
             let state = prompt[idx + 1..].to_string();
@@ -227,7 +250,10 @@ pub fn render_partition(history: &[&str]) -> (String, String) {
 }
 
 pub fn project_hud(amp: f64, stored: usize, hot: usize) -> String {
-    format!("cache: 5m=- 1h=- amp={:.1}x stored={} hot={}", amp, stored, hot)
+    format!(
+        "cache: 5m=- 1h=- amp={:.1}x stored={} hot={}",
+        amp, stored, hot
+    )
 }
 
 pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
@@ -238,18 +264,17 @@ pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
 
     if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
         let client = reqwest::Client::new();
-        let part = reqwest::multipart::Part::bytes(content.to_vec())
-            .file_name("file");
-        let form = reqwest::multipart::Form::new()
-            .part("file", part);
-            
-        let res = client.post("https://api.anthropic.com/v1/files")
+        let part = reqwest::multipart::Part::bytes(content.to_vec()).file_name("file");
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let res = client
+            .post("https://api.anthropic.com/v1/files")
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .multipart(form)
             .send()
             .await;
-            
+
         if let Ok(response) = res {
             if response.status().is_success() {
                 if let Ok(json) = response.json::<serde_json::Value>().await {
@@ -266,7 +291,7 @@ pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
     } else {
         eprintln!("[proxy] ANTHROPIC_API_KEY missing, using fallback hash for materialize");
     }
-    
+
     fallback
 }
 
@@ -307,7 +332,7 @@ pub fn persist_amp_row(row: &AmpRow) -> std::io::Result<()> {
         .create(true)
         .append(true)
         .open(file_path)?;
-    
+
     let json = serde_json::to_string(row)?;
     writeln!(file, "{}", json)?;
     Ok(())
@@ -348,25 +373,37 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_load_flow() {
         let mut table = InMemoryPageTable::new();
-        let page = table.store("firmware".to_string(), b"sys_prompt", "ws1".to_string()).await;
+        let page = table
+            .store("firmware".to_string(), b"sys_prompt", "ws1".to_string())
+            .await;
         assert_eq!(page.state, PageState::Hot);
         assert!(page.file_id.is_some());
-        
-        let loaded = table.load("firmware".to_string(), "ws1".to_string()).unwrap();
+
+        let loaded = table
+            .load("firmware".to_string(), "ws1".to_string())
+            .unwrap();
         assert_eq!(loaded.content_hash, page.content_hash);
-        
+
         table.release("firmware".to_string(), "ws1".to_string());
-        let released = table.load("firmware".to_string(), "ws1".to_string()).unwrap();
+        let released = table
+            .load("firmware".to_string(), "ws1".to_string())
+            .unwrap();
         assert_eq!(released.state, PageState::Warm);
     }
 
     #[tokio::test]
     async fn test_list() {
         let mut table = InMemoryPageTable::new();
-        table.store("p1".to_string(), b"c1", "ws1".to_string()).await;
-        table.store("p2".to_string(), b"c2", "ws1".to_string()).await;
-        table.store("p3".to_string(), b"c3", "ws2".to_string()).await;
-        
+        table
+            .store("p1".to_string(), b"c1", "ws1".to_string())
+            .await;
+        table
+            .store("p2".to_string(), b"c2", "ws1".to_string())
+            .await;
+        table
+            .store("p3".to_string(), b"c3", "ws2".to_string())
+            .await;
+
         table.release("p2".to_string(), "ws1".to_string());
 
         let all_ws1 = table.list(&"ws1".to_string(), None);
@@ -387,7 +424,7 @@ mod tests {
         let (firmware, state) = render_partition(&[prompt]);
         assert_eq!(firmware, "line1\nline2\nline3");
         assert_eq!(state, "line4");
-        
+
         let prompt2 = "short";
         let (f2, s2) = render_partition(&[prompt2]);
         assert_eq!(f2, "");
@@ -437,17 +474,22 @@ mod tests {
 
     fn git_init(dir: &Path) {
         let out = std::process::Command::new("git")
-            .arg("-C").arg(dir)
-            .arg("init").arg("-q")
-            .output().expect("git init");
+            .arg("-C")
+            .arg(dir)
+            .arg("init")
+            .arg("-q")
+            .output()
+            .expect("git init");
         assert!(out.status.success(), "git init failed: {:?}", out);
     }
 
     fn git_set_origin(dir: &Path, url: &str) {
         let out = std::process::Command::new("git")
-            .arg("-C").arg(dir)
+            .arg("-C")
+            .arg(dir)
             .args(["remote", "add", "origin", url])
-            .output().expect("git remote add");
+            .output()
+            .expect("git remote add");
         assert!(out.status.success(), "git remote add failed: {:?}", out);
     }
 

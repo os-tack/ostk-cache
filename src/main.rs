@@ -1,6 +1,5 @@
 use ostk_cache::{
-    account, persist_amp_row, project_hud, AnthropicRequest, ProviderUsage,
-    SessionId,
+    AnthropicRequest, ProviderUsage, SessionId, account, persist_amp_row, project_hud,
 };
 use serde_json::json;
 use sha2::Digest;
@@ -80,7 +79,10 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
         let lower = line.to_lowercase();
         if let Some(rest) = line.get(10..).filter(|_| lower.starts_with("x-api-key:")) {
             api_key = rest.trim().to_string();
-        } else if let Some(rest) = line.get(18..).filter(|_| lower.starts_with("anthropic-version:")) {
+        } else if let Some(rest) = line
+            .get(18..)
+            .filter(|_| lower.starts_with("anthropic-version:"))
+        {
             anthropic_version = rest.trim().to_string();
         } else if lower.starts_with("anthropic-session-id:")
             && let Some(rest) = line.get("anthropic-session-id:".len()..)
@@ -90,8 +92,9 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     }
 
     let workspace = ostk_cache::Workspace::from_path(
-        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    ).unwrap_or_else(|_| ostk_cache::Workspace {
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    )
+    .unwrap_or_else(|_| ostk_cache::Workspace {
         priority_hash: "unknown".to_string(),
         source: ostk_cache::WorkspaceSource::Cwd,
     });
@@ -113,9 +116,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
         Ok(mut req) => {
             let firmware: String = match &req.system {
                 Some(sys) if sys.is_string() => sys.as_str().unwrap().to_string(),
-                Some(sys) if sys.is_array() => sys.as_array().unwrap().iter()
+                Some(sys) if sys.is_array() => sys
+                    .as_array()
+                    .unwrap()
+                    .iter()
                     .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>().join(""),
+                    .collect::<Vec<_>>()
+                    .join(""),
                 _ => String::new(),
             };
 
@@ -136,7 +143,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
                 let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
 
                 let mut new_content_array = Vec::new();
-                
+
                 // 1. Add HUD as the first text block with the 5m ephemeral marker
                 new_content_array.push(json!({
                     "type": "text",
@@ -144,7 +151,7 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
                     "cache_control": {"type": "ephemeral", "ttl": "5m"}
                 }));
 
-                // 2. Preserve original content (including images/documents) 
+                // 2. Preserve original content (including images/documents)
                 // stripping existing cache_control markers to avoid Anthropic's 4-marker limit
                 if let Some(s) = last_msg.content.as_str() {
                     new_content_array.push(json!({
@@ -178,7 +185,8 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     }
 
     let client = reqwest::Client::new();
-    let base_url = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let base_url = std::env::var("ANTHROPIC_BASE_URL")
+        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
     let url = format!("{}/v1/messages", base_url);
     let mut req_builder = client.post(url);
 
@@ -308,7 +316,10 @@ fn parse_usage_from_json(body: &[u8]) -> Option<ProviderUsage> {
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let usage = v.get("usage")?;
     Some(ProviderUsage {
-        input_tokens: usage.get("input_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as usize,
         cache_read_tokens: usage
             .get("cache_read_input_tokens")
             .and_then(|x| x.as_u64())
