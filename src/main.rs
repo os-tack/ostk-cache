@@ -1,5 +1,5 @@
 use ostk_cache::{
-    account, persist_amp_row, project_hud, render_partition, AnthropicRequest, ProviderUsage,
+    account, persist_amp_row, project_hud, AnthropicRequest, ProviderUsage,
     SessionId,
 };
 use serde_json::json;
@@ -22,10 +22,12 @@ type AmpStore = Arc<Mutex<HashMap<SessionId, AmpAccumulator>>>;
 
 #[tokio::main]
 async fn main() {
-    let listener = match TcpListener::bind("127.0.0.1:8080").await {
+    let port = std::env::var("PROXY_PORT").unwrap_or_else(|_| "8080".to_string());
+    let bind_addr = format!("127.0.0.1:{}", port);
+    let listener = match TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[proxy] fatal: bind 127.0.0.1:8080 failed: {}", e);
+            eprintln!("[proxy] fatal: bind {} failed: {}", bind_addr, e);
             std::process::exit(1);
         }
     };
@@ -103,37 +105,13 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
 
     let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(body) {
         Ok(mut req) => {
-            // TODO statefulize per session for cross-turn LCP; for v1 we use the
-            // single-prompt heuristic. Concatenate system + all messages into one
-            // string and let render_partition's single-turn branch place the cut.
-            let mut concatenated = String::new();
-            if let Some(sys) = &req.system {
-                if let Some(s) = sys.as_str() {
-                    concatenated.push_str(s);
-                } else if let Some(arr) = sys.as_array() {
-                    for item in arr {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            concatenated.push_str(text);
-                        }
-                    }
-                }
-            }
-            for msg in &req.messages {
-                if !concatenated.is_empty() {
-                    concatenated.push('\n');
-                }
-                if let Some(s) = msg.content.as_str() {
-                    concatenated.push_str(s);
-                } else if let Some(arr) = msg.content.as_array() {
-                    for item in arr {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            concatenated.push_str(text);
-                        }
-                    }
-                }
-            }
-
-            let (firmware, state) = render_partition(&[concatenated.as_str()]);
+            let firmware: String = match &req.system {
+                Some(sys) if sys.is_string() => sys.as_str().unwrap().to_string(),
+                Some(sys) if sys.is_array() => sys.as_array().unwrap().iter()
+                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>().join(""),
+                _ => String::new(),
+            };
 
             req.system = Some(json!([
                 {
@@ -144,13 +122,24 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
             ]));
 
             if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
+                let mut original_content = String::new();
+                if let Some(s) = last_msg.content.as_str() {
+                    original_content.push_str(s);
+                } else if let Some(arr) = last_msg.content.as_array() {
+                    for item in arr {
+                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                            original_content.push_str(text);
+                        }
+                    }
+                }
+
                 let amp_for_hud = if prior_amp.turns_seen == 0 {
                     1.0
                 } else {
                     prior_amp.cumulative_amp_mean
                 };
                 let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
-                let new_state = format!("{}\n{}", hud, state);
+                let new_state = format!("{}\n{}", hud, original_content);
                 last_msg.content = json!([
                     {
                         "type": "text",
@@ -174,7 +163,9 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
     }
 
     let client = reqwest::Client::new();
-    let mut req_builder = client.post("https://api.anthropic.com/v1/messages");
+    let base_url = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let url = format!("{}/v1/messages", base_url);
+    let mut req_builder = client.post(url);
 
     if !api_key.is_empty() {
         req_builder = req_builder.header("x-api-key", api_key);
