@@ -56,19 +56,15 @@ async fn handle_anthropic_message(
 ) -> Result<Response, StatusCode> {
     println!("--- INTERCEPTED REQUEST ---");
 
-    let mut api_key = String::new();
-    let mut anthropic_version = String::new();
-    let mut session_header: Option<String> = None;
-
-    if let Some(v) = headers.get("x-api-key") {
-        api_key = v.to_str().unwrap_or("").to_string();
-    }
-    if let Some(v) = headers.get("anthropic-version") {
-        anthropic_version = v.to_str().unwrap_or("").to_string();
-    }
-    if let Some(v) = headers.get("anthropic-session-id") {
-        session_header = Some(v.to_str().unwrap_or("").to_string());
-    }
+    let api_key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let session_header = headers
+        .get("anthropic-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let workspace = ostk_cache::Workspace::from_path(
         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
@@ -182,17 +178,10 @@ async fn handle_anthropic_message(
     let url = format!("{}/v1/messages", base_url);
     let mut req_builder = client.post(url);
 
-    if !api_key.is_empty() {
-        req_builder = req_builder.header("x-api-key", api_key);
-    }
-    if !anthropic_version.is_empty() {
-        req_builder = req_builder.header("anthropic-version", anthropic_version);
-    }
-
     let hop_by_hop = [
         "host", "content-length", "transfer-encoding", "connection",
         "keep-alive", "te", "trailer", "upgrade", "proxy-authorization",
-        "proxy-authenticate",
+        "proxy-authenticate", "content-type",
     ];
 
     for (k, v) in headers.iter() {

@@ -145,6 +145,8 @@ async fn proxy_forwards_authorization_and_api_key_headers() {
     let _ = proxy_process.wait();
 
     let lower = received_str.to_lowercase();
-    assert!(lower.contains("x-api-key: my-api-key"), "Missing x-api-key header");
-    assert!(lower.contains("authorization: bearer test-token"), "Missing authorization header");
+    let api_key_count = lower.matches("x-api-key: my-api-key").count();
+    let auth_count = lower.matches("authorization: bearer test-token").count();
+    assert_eq!(api_key_count, 1, "x-api-key header should appear exactly once, got {}", api_key_count);
+    assert_eq!(auth_count, 1, "authorization header should appear exactly once, got {}", auth_count);
 }
