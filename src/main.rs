@@ -197,7 +197,7 @@ async fn handle_anthropic_message(
     let hop_by_hop = [
         "host", "content-length", "transfer-encoding", "connection",
         "keep-alive", "te", "trailer", "upgrade", "proxy-authorization",
-        "proxy-authenticate", "content-type",
+        "proxy-authenticate", "content-type", "accept-encoding",
     ];
 
     for (k, v) in headers.iter() {
@@ -206,6 +206,7 @@ async fn handle_anthropic_message(
         }
     }
     req_builder = req_builder.header("content-type", "application/json");
+    req_builder = req_builder.header("accept-encoding", "identity");
 
     let mut response = match req_builder.body(payload).send().await {
         Ok(r) => r,
@@ -259,11 +260,13 @@ async fn handle_anthropic_message(
             yield Ok::<_, std::io::Error>(chunk);
         }
 
-        if let Some(usage) = if is_sse {
+        let parsed_usage = if is_sse {
             parse_usage_from_sse(&accumulated)
         } else {
             parse_usage_from_json(&accumulated)
-        } {
+        };
+
+        if let Some(usage) = parsed_usage {
             let prior_amp_for_write = prior_amp.clone();
             let row = account(
                 &usage, 

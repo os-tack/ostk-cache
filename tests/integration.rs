@@ -225,3 +225,62 @@ async fn proxy_does_not_prepend_hud_when_user_message_has_tool_results() {
     assert!(!has_text_with_hud,
         "no HUD text block should be inserted into a tool_result-bearing user message");
 }
+
+#[tokio::test]
+async fn proxy_sends_identity_accept_encoding_upstream() {
+    // Anthropic gzips SSE if the request has `Accept-Encoding: gzip`.
+    // Reqwest in this build has no gzip feature, so the accumulated buffer
+    // would hold compressed bytes the parser can't read. Proxy must strip
+    // the caller's accept-encoding and force `identity` upstream so the
+    // accumulated SSE is plain UTF-8.
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let proxy_port = 8092;
+    let mut proxy_process = Command::new("cargo")
+        .arg("run")
+        .arg("--bin")
+        .arg("ostk-cache")
+        .env("PROXY_PORT", proxy_port.to_string())
+        .env("ANTHROPIC_BASE_URL", upstream_url)
+        .spawn()
+        .expect("Failed to start proxy");
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+
+    let req_body = json!({
+        "system": "Sys",
+        "messages": [{"role": "user", "content": "Hi"}]
+    });
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+
+    let client = reqwest::Client::new();
+    let _request_task = tokio::spawn(async move {
+        let _ = client
+            .post(&proxy_url)
+            .header("x-api-key", "k")
+            .header("accept-encoding", "gzip, br, zstd")
+            .json(&req_body)
+            .send()
+            .await;
+    });
+
+    let (mut stream, _) = mock_upstream.accept().await.unwrap();
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf).await.unwrap();
+    let received_str = String::from_utf8_lossy(&buf[..n]);
+
+    let _ = proxy_process.kill();
+    let _ = proxy_process.wait();
+
+    let lower = received_str.to_lowercase();
+    let identity_count = lower.matches("accept-encoding: identity").count();
+    let gzip_count = lower.matches("accept-encoding: gzip").count();
+
+    assert_eq!(identity_count, 1,
+        "expected accept-encoding: identity exactly once upstream, got {}", identity_count);
+    assert_eq!(gzip_count, 0,
+        "expected no accept-encoding: gzip upstream (caller's gzip preference must be stripped), got {}", gzip_count);
+}
