@@ -17,6 +17,7 @@
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -136,9 +137,13 @@ fn install(
     fs::create_dir_all(&dir)?;
     let dp = dispatch_path(&dir);
     fs::write(&dp, DISPATCH_SCRIPT)?;
-    let mut perms = fs::metadata(&dp)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&dp, perms)?;
+    
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&dp)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&dp, perms)?;
+    }
 
     let dispatch_str = dp.to_string_lossy().to_string();
 
