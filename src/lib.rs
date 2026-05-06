@@ -54,8 +54,8 @@ impl Workspace {
             .arg(p)
             .args(["config", "--get", "remote.origin.url"])
             .output();
-        if let Ok(out) = output {
-            if out.status.success() {
+        if let Ok(out) = output
+            && out.status.success() {
                 let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !raw.is_empty() {
                     let normalized = normalize_git_url(&raw);
@@ -65,7 +65,6 @@ impl Workspace {
                     });
                 }
             }
-        }
 
         let canonical = p.canonicalize()?;
         let s = canonical.to_string_lossy().into_owned();
@@ -213,7 +212,7 @@ impl PageTable for InMemoryPageTable {
     fn list(&self, ws: &WorkspaceId, state: Option<PageState>) -> Vec<Page> {
         self.pages
             .iter()
-            .filter(|((w, _), p)| w == ws && state.as_ref().map_or(true, |s| &p.state == s))
+            .filter(|((w, _), p)| w == ws && state.as_ref().is_none_or(|s| &p.state == s))
             .map(|(_, p)| p.clone())
             .collect()
     }
@@ -289,11 +288,10 @@ pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
 
         if let Ok(response) = res {
             if response.status().is_success() {
-                if let Ok(json) = response.json::<serde_json::Value>().await {
-                    if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
+                if let Ok(json) = response.json::<serde_json::Value>().await
+                    && let Some(id) = json.get("id").and_then(|v| v.as_str()) {
                         return id.to_string();
                     }
-                }
             } else {
                 eprintln!("[proxy] materialize failed: HTTP {}", response.status());
             }
@@ -427,7 +425,7 @@ impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
                         .unwrap_or_default()
                         .as_secs()
                 });
-                if let Err(e) = writeln!(file, "{}", status.to_string()) {
+                if let Err(e) = writeln!(file, "{}", status) {
                     eprintln!("[DaemonAdapter] Failed to write manifest.json: {}", e);
                 }
             }

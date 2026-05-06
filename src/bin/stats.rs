@@ -65,19 +65,17 @@ fn main() {
     let mut stats_map: HashMap<(WorkspaceId, SessionId), SessionStats> = HashMap::new();
 
     for line in reader.lines() {
-        if let Ok(l) = line {
-            if let Ok(row) = serde_json::from_str::<AmpRow>(&l) {
-                if let Some(ws) = &args.workspace {
-                    if &row.workspace_id != ws {
+        if let Ok(l) = line
+            && let Ok(row) = serde_json::from_str::<AmpRow>(&l) {
+                if let Some(ws) = &args.workspace
+                    && &row.workspace_id != ws {
                         continue;
                     }
-                }
 
-                if let Some(w_secs) = window_secs {
-                    if row.timestamp > 0 && row.timestamp < now - w_secs {
+                if let Some(w_secs) = window_secs
+                    && row.timestamp > 0 && row.timestamp < now - w_secs {
                         continue;
                     }
-                }
 
                 let key = (row.workspace_id.clone(), row.session.clone());
                 let entry = stats_map.entry(key).or_insert_with(|| SessionStats {
@@ -103,7 +101,6 @@ fn main() {
                 entry.firmware_bytes = row.firmware_bytes;
                 entry.state_bytes_sum += row.state_bytes;
             }
-        }
     }
 
     let mut results = Vec::new();
@@ -165,8 +162,8 @@ fn main() {
         for res in &results {
             println!("{}", serde_json::to_string(res).unwrap());
         }
-    } else if args.format == "csv" {
-        if !results.is_empty() {
+    } else if args.format == "csv"
+        && !results.is_empty() {
             println!("workspace_id,session_id,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,hot_pages_max,evictions,firmware_bytes,state_bytes_mean");
             for res in results {
                 let obj = res.as_object().unwrap();
@@ -185,7 +182,6 @@ fn main() {
                 );
             }
         }
-    }
 }
 
 #[cfg(test)]
