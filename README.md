@@ -25,3 +25,30 @@ cargo run --bin ostk-cache
 ```
 
 The proxy will listen on `127.0.0.1:8080` (or `PROXY_PORT`).
+
+## Stats Subcommand
+
+The proxy tracks cache performance and token usage in a local ledger (`.ostk/memory/ledger.jsonl`). You can analyze these statistics using the `stats` subcommand:
+
+```bash
+cargo run --bin stats -- --window 24h --format json
+```
+
+### Options:
+- `--window <5m|1h|24h|session>`: Filters the stats to the specified time window (default: `session`).
+- `--format <json|csv>`: Sets the output format (default: `json`).
+- `--workspace <WS_ID>`: Filters results for a specific workspace hash.
+
+## Cache Layout
+
+The proxy stores its persistent memory and ledger data within the `.ostk/memory/` directory.
+
+```text
+.ostk/
+└── memory/
+    └── ledger.jsonl      # Append-only JSONL ledger of cache hits, token usage, and AMP ratios
+.l1.5/
+└── workspace-id          # (Optional) Explicit workspace identifier marker
+```
+
+Each row in `ledger.jsonl` contains session tracking and cache efficiency metrics.
