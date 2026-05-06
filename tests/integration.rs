@@ -1036,3 +1036,437 @@ async fn hook_endpoint_writes_null_payload_when_omitted() {
         "omitted payload must serialize as JSON null, got {:?}", rows[0]["payload"]);
     assert_eq!(rows[0]["event_type"].as_str(), Some("SessionStart"));
 }
+
+// ===========================================================================
+// Passthrough mode tests (Task #4)
+// ===========================================================================
+//
+// These tests prove that OSTK_CACHE_PASSTHROUGH=1 makes the proxy forward
+// the original request body byte-for-byte (modulo header housekeeping) and
+// that the ledger row carries mode="passthrough" — and conversely that the
+// default (unset) behavior still produces the mutate-mode rewrites and
+// mode="mutate" rows.
+
+/// Spawn the proxy with an explicit `OSTK_CACHE_PASSTHROUGH` env value and
+/// optional cwd. Returns the child handle once the port is listening.
+fn spawn_proxy_with_passthrough(
+    proxy_port: u16,
+    upstream_url: &str,
+    passthrough_value: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> std::process::Child {
+    let bin = env!("CARGO_BIN_EXE_ostk-cache");
+    let mut cmd = Command::new(bin);
+    cmd.env("PROXY_PORT", proxy_port.to_string())
+        .env("ANTHROPIC_BASE_URL", upstream_url);
+    match passthrough_value {
+        Some(v) => {
+            cmd.env("OSTK_CACHE_PASSTHROUGH", v);
+        }
+        None => {
+            cmd.env_remove("OSTK_CACHE_PASSTHROUGH");
+        }
+    }
+    if let Some(p) = cwd {
+        cmd.current_dir(p);
+    }
+    cmd.spawn().expect("Failed to start proxy")
+}
+
+#[tokio::test]
+async fn passthrough_mode_forwards_body_byte_identical_no_mutations() {
+    // With OSTK_CACHE_PASSTHROUGH=1 the proxy must NOT:
+    //   - collapse the system field into the [{type:"text", cache_control:1h}]
+    //     wrapper,
+    //   - prepend a HUD text block to the last user message,
+    //   - strip cache_control from user message blocks.
+    //
+    // We send a request whose system is a plain string and whose last user
+    // message is an array of blocks where one block carries cache_control.
+    // After the proxy forwards it, the upstream-received body must be
+    // structurally identical to what we sent.
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let proxy_port = 8103;
+    let mut proxy = spawn_proxy_with_passthrough(
+        proxy_port,
+        &upstream_url,
+        Some("1"),
+        None,
+    );
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let original_body = json!({
+        "system": "You are a helpful assistant.",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "block with cache_control",
+                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                    },
+                    {
+                        "type": "text",
+                        "text": "trailing block, no cache_control"
+                    }
+                ]
+            }
+        ],
+        "model": "claude-test"
+    });
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+    let original_for_send = original_body.clone();
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(&proxy_url)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "passthrough-noop-test")
+            .json(&original_for_send)
+            .send()
+            .await
+            .map(|r| r.bytes());
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let req_bytes = read_full_http_request(&mut up).await;
+    write_usage_response(&mut up, 100).await;
+    let _ = req_task.await;
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let body_idx = find_subseq(&req_bytes, b"\r\n\r\n").expect("upstream req has body separator") + 4;
+    let body = &req_bytes[body_idx..];
+    let parsed: serde_json::Value = serde_json::from_slice(body)
+        .unwrap_or_else(|e| panic!("upstream body must be valid JSON, got error {}: {:?}",
+            e, String::from_utf8_lossy(body)));
+
+    // (1) system field is the original plain string — NOT the
+    //     [{type:"text", cache_control:{ttl:"1h"}}] mutate-mode wrapper.
+    assert!(
+        parsed["system"].is_string(),
+        "passthrough must keep system as a plain string, got {:?}",
+        parsed["system"]
+    );
+    assert_eq!(
+        parsed["system"].as_str(),
+        Some("You are a helpful assistant."),
+        "passthrough must forward the original system string verbatim, got {:?}",
+        parsed["system"]
+    );
+
+    // (2) The last user message has the same number of blocks we sent —
+    //     no HUD block was prepended.
+    let last_msg = parsed["messages"]
+        .as_array()
+        .and_then(|a| a.last())
+        .expect("messages array should have last");
+    let content = last_msg["content"].as_array()
+        .expect("user content should still be an array in passthrough mode");
+    assert_eq!(
+        content.len(),
+        2,
+        "passthrough must NOT prepend a HUD block; expected 2 user content blocks, got {}: {:?}",
+        content.len(), content
+    );
+
+    // (2b) None of the forwarded user blocks should be a HUD-style block
+    //      (no `cache:` text, no 5m TTL block at index 0 we didn't send).
+    let has_hud_text = content.iter().any(|b| {
+        b.get("type").and_then(|t| t.as_str()) == Some("text")
+            && b.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.contains("cache:") && s.contains("amp="))
+                .unwrap_or(false)
+    });
+    assert!(
+        !has_hud_text,
+        "passthrough must NOT inject a HUD text block, got blocks: {:?}",
+        content
+    );
+
+    // (3) The first block is the one we sent (with its cache_control intact).
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "block with cache_control");
+    assert_eq!(
+        content[0]["cache_control"],
+        json!({"type": "ephemeral", "ttl": "5m"}),
+        "passthrough must NOT strip cache_control from user message blocks; \
+         expected the original 5m ephemeral marker, got {:?}",
+        content[0].get("cache_control")
+    );
+
+    // (4) The second block is unchanged.
+    assert_eq!(content[1]["type"], "text");
+    assert_eq!(content[1]["text"], "trailing block, no cache_control");
+
+    // (5) Strong byte-identity check: the JSON the proxy forwarded must
+    //     parse equal to the JSON we sent. This catches any silent
+    //     reshape or extra-key insertion that the field-by-field asserts
+    //     above might miss.
+    assert_eq!(
+        parsed, original_body,
+        "passthrough-forwarded body must equal the original request body byte-for-byte (semantically). \
+         original: {}\nforwarded: {}",
+        original_body, parsed
+    );
+}
+
+#[tokio::test]
+async fn mutate_mode_default_still_collapses_system_and_prepends_hud() {
+    // Regression check: when OSTK_CACHE_PASSTHROUGH is unset (default
+    // mutate mode), the proxy must still rewrite system into the wrapped
+    // [{type:"text", cache_control:1h}] form AND prepend a HUD text block
+    // to the last (non-tool-result) user message. This is the contract the
+    // existing `proxy_firmware_byte_stability_across_user_message_length`
+    // test relies on; we re-pin it here so the new passthrough branch
+    // can't silently change default behavior.
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let proxy_port = 8104;
+    let mut proxy = spawn_proxy_with_passthrough(
+        proxy_port,
+        &upstream_url,
+        None, // env var unset → default mutate mode
+        None,
+    );
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let req_body = json!({
+        "system": "Plain system string",
+        "messages": [
+            {"role": "user", "content": "Hello"}
+        ],
+        "model": "claude-test"
+    });
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(&proxy_url)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "default-mutate-test")
+            .json(&req_body)
+            .send()
+            .await
+            .map(|r| r.bytes());
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let req_bytes = read_full_http_request(&mut up).await;
+    write_usage_response(&mut up, 50).await;
+    let _ = req_task.await;
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let body_idx = find_subseq(&req_bytes, b"\r\n\r\n").expect("body separator") + 4;
+    let body = &req_bytes[body_idx..];
+    let parsed: serde_json::Value = serde_json::from_slice(body)
+        .unwrap_or_else(|e| panic!("upstream body must be valid JSON, got {}: {:?}",
+            e, String::from_utf8_lossy(body)));
+
+    // System collapsed into the wrapped array form with 1h cache_control.
+    let sys = &parsed["system"];
+    assert!(
+        sys.is_array(),
+        "default mutate mode must collapse system into an array, got {:?}",
+        sys
+    );
+    let sys_arr = sys.as_array().unwrap();
+    assert_eq!(sys_arr.len(), 1, "system array should have one element, got {:?}", sys_arr);
+    assert_eq!(sys_arr[0]["type"], "text");
+    assert_eq!(sys_arr[0]["text"], "Plain system string");
+    assert_eq!(
+        sys_arr[0]["cache_control"],
+        json!({"type": "ephemeral", "ttl": "1h"}),
+        "system block must carry the 1h ephemeral marker in mutate mode, got {:?}",
+        sys_arr[0].get("cache_control")
+    );
+
+    // HUD prepended to user content (now an array with a HUD block first).
+    let last_msg = parsed["messages"].as_array().and_then(|a| a.last())
+        .expect("last message");
+    let content = last_msg["content"].as_array()
+        .expect("default mode rewrites user content into an array");
+    assert!(content.len() >= 2,
+        "default mutate must prepend HUD block (≥2 entries), got {:?}", content);
+
+    let first = &content[0];
+    assert_eq!(first["type"], "text");
+    let hud_text = first["text"].as_str().expect("HUD text should be a string");
+    assert!(
+        hud_text.contains("cache:") && hud_text.contains("amp="),
+        "first user block should be the HUD line ('cache: ... amp=...'), got {:?}",
+        hud_text
+    );
+    assert_eq!(
+        first["cache_control"],
+        json!({"type": "ephemeral", "ttl": "5m"}),
+        "HUD block must carry the 5m ephemeral marker, got {:?}",
+        first.get("cache_control")
+    );
+}
+
+#[tokio::test]
+async fn ledger_row_mode_field_reflects_passthrough_env_var() {
+    // Phase A: run proxy with OSTK_CACHE_PASSTHROUGH=1 in tempdir A, fire
+    //          one request, kill, expect ledger row with mode="passthrough".
+    // Phase B: run proxy with OSTK_CACHE_PASSTHROUGH unset in tempdir B,
+    //          fire one request, kill, expect ledger row with mode="mutate".
+    //
+    // We use two separate tempdirs so the two ledgers are independent —
+    // no cross-contamination if either phase writes more than one row.
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    // ---- Phase A: passthrough ----
+    let tmp_a = tempfile::tempdir().expect("tempdir A");
+    let proxy_port_a = 8105;
+    let mut proxy_a = spawn_proxy_with_passthrough(
+        proxy_port_a,
+        &upstream_url,
+        Some("1"),
+        Some(tmp_a.path()),
+    );
+    wait_for_proxy(proxy_port_a, 5000).await;
+
+    let url_a = format!("http://127.0.0.1:{}/v1/messages", proxy_port_a);
+    let req_task_a = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url_a)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "passthrough-ledger-a")
+            .json(&json!({"system": "S", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            let _ = r.bytes().await;
+        }
+    });
+
+    let (mut up_a, _) = mock_upstream.accept().await.unwrap();
+    let _ = read_full_http_request(&mut up_a).await;
+    write_usage_response(&mut up_a, 42).await;
+    let _ = req_task_a.await;
+
+    let ledger_a = tmp_a.path().join(".ostk/memory/ledger.jsonl");
+    let mut tries = 0;
+    while tries < 100 {
+        if let Ok(s) = std::fs::read_to_string(&ledger_a)
+            && s.lines().filter(|l| !l.trim().is_empty()).count() >= 1
+        {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tries += 1;
+    }
+    let _ = proxy_a.kill();
+    let _ = proxy_a.wait();
+
+    let content_a = std::fs::read_to_string(&ledger_a)
+        .expect("ledger.jsonl must exist after Phase A request");
+    let rows_a: Vec<serde_json::Value> = content_a
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l)
+             .unwrap_or_else(|e| panic!("Phase A ledger row not valid JSON: {} (line: {:?})", e, l)))
+        .collect();
+    assert!(
+        !rows_a.is_empty(),
+        "Phase A: expected at least one ledger row, got: {:?}", content_a
+    );
+    let mode_a = rows_a[0]["mode"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Phase A row must include mode field, got: {}", rows_a[0]));
+    assert_eq!(
+        mode_a, "passthrough",
+        "Phase A: OSTK_CACHE_PASSTHROUGH=1 must produce mode=\"passthrough\" rows, got {:?} (full row: {})",
+        mode_a, rows_a[0]
+    );
+    assert_eq!(
+        rows_a[0]["session"].as_str(), Some("passthrough-ledger-a"),
+        "Phase A row should carry the session id we sent: {}", rows_a[0]
+    );
+
+    // ---- Phase B: default mutate (env var unset) ----
+    let tmp_b = tempfile::tempdir().expect("tempdir B");
+    let proxy_port_b = 8106;
+    let mut proxy_b = spawn_proxy_with_passthrough(
+        proxy_port_b,
+        &upstream_url,
+        None,
+        Some(tmp_b.path()),
+    );
+    wait_for_proxy(proxy_port_b, 5000).await;
+
+    let url_b = format!("http://127.0.0.1:{}/v1/messages", proxy_port_b);
+    let req_task_b = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url_b)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "mutate-ledger-b")
+            .json(&json!({"system": "S", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            let _ = r.bytes().await;
+        }
+    });
+
+    let (mut up_b, _) = mock_upstream.accept().await.unwrap();
+    let _ = read_full_http_request(&mut up_b).await;
+    write_usage_response(&mut up_b, 84).await;
+    let _ = req_task_b.await;
+
+    let ledger_b = tmp_b.path().join(".ostk/memory/ledger.jsonl");
+    let mut tries = 0;
+    while tries < 100 {
+        if let Ok(s) = std::fs::read_to_string(&ledger_b)
+            && s.lines().filter(|l| !l.trim().is_empty()).count() >= 1
+        {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tries += 1;
+    }
+    let _ = proxy_b.kill();
+    let _ = proxy_b.wait();
+
+    let content_b = std::fs::read_to_string(&ledger_b)
+        .expect("ledger.jsonl must exist after Phase B request");
+    let rows_b: Vec<serde_json::Value> = content_b
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l)
+             .unwrap_or_else(|e| panic!("Phase B ledger row not valid JSON: {} (line: {:?})", e, l)))
+        .collect();
+    assert!(
+        !rows_b.is_empty(),
+        "Phase B: expected at least one ledger row, got: {:?}", content_b
+    );
+    let mode_b = rows_b[0]["mode"]
+        .as_str()
+        .unwrap_or_else(|| panic!("Phase B row must include mode field, got: {}", rows_b[0]));
+    assert_eq!(
+        mode_b, "mutate",
+        "Phase B: unset OSTK_CACHE_PASSTHROUGH must produce mode=\"mutate\" rows, got {:?} (full row: {})",
+        mode_b, rows_b[0]
+    );
+    assert_eq!(
+        rows_b[0]["session"].as_str(), Some("mutate-ledger-b"),
+        "Phase B row should carry the session id we sent: {}", rows_b[0]
+    );
+}
