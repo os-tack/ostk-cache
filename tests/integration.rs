@@ -735,3 +735,304 @@ async fn ledger_jsonl_survives_proxy_sigkill_and_remains_appendable() {
         "post-restart row should carry the second session id"
     );
 }
+
+// ===========================================================================
+// /hook/event endpoint tests (Task #4)
+// ===========================================================================
+
+/// Helper for /hook/event tests: spawn proxy in tempdir, return (child, port,
+/// tempdir handle). Caller drives requests against `http://127.0.0.1:<port>/hook/event`.
+async fn spawn_hook_proxy(port: u16) -> (std::process::Child, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // No upstream is needed for /hook/event — pass a bogus URL just so the env
+    // var is set (the proxy never contacts upstream for hook events).
+    let mut child = spawn_proxy(port, "http://127.0.0.1:1", Some(tmp.path()));
+    // Wait for the port to come up; if the binary fails to start, surface that.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("hook proxy did not come up on port {} within 5000ms", port);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    (child, tmp)
+}
+
+fn read_hooks_jsonl(dir: &std::path::Path) -> Vec<serde_json::Value> {
+    let path = dir.join(".l1.5/hooks.jsonl");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("hooks.jsonl missing at {:?}: {}", path, e));
+    content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l)
+             .unwrap_or_else(|e| panic!("hooks.jsonl row not valid JSON: {} (line: {:?})", e, l)))
+        .collect()
+}
+
+#[tokio::test]
+async fn hook_endpoint_accepts_all_five_event_types_and_writes_correct_rows() {
+    // Each of the 5 valid Claude Code event types should:
+    //   * return 200 on POST /hook/event
+    //   * append exactly one row to .l1.5/hooks.jsonl carrying the matching
+    //     event_type, the workspace_id and session_id we sent, and our payload.
+    let (mut proxy, tmp) = spawn_hook_proxy(8097).await;
+    let url = "http://127.0.0.1:8097/hook/event";
+    let client = reqwest::Client::new();
+
+    // Order matters only for the row sequence we assert at the end.
+    let events = [
+        ("SessionStart", json!({"reason": "boot"})),
+        ("UserPromptSubmit", json!({"prompt": "hi"})),
+        ("PreToolUse", json!({"tool": "echo"})),
+        ("PostToolUse", json!({"tool": "echo", "ok": true})),
+        ("Stop", json!({"reason": "user"})),
+    ];
+
+    for (idx, (kind, payload)) in events.iter().enumerate() {
+        let body = json!({
+            "type": kind,
+            "workspace_id": "ws-hook-test",
+            "session_id": format!("sess-hook-{}", idx),
+            "payload": payload,
+        });
+        let resp = client.post(url).json(&body).send().await
+            .unwrap_or_else(|e| panic!("POST /hook/event failed for {}: {}", kind, e));
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "expected 200 for valid event {}, got {}",
+            kind, resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("response is JSON");
+        assert_eq!(body["ok"], json!(true), "valid event response should include {{\"ok\":true}}");
+    }
+
+    // Allow filesystem flush before reading.
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let rows = read_hooks_jsonl(tmp.path());
+    assert_eq!(
+        rows.len(),
+        events.len(),
+        "expected one hooks.jsonl row per event, got {} rows for {} events",
+        rows.len(), events.len()
+    );
+
+    for (idx, (kind, payload)) in events.iter().enumerate() {
+        let row = &rows[idx];
+        assert_eq!(row["event_type"].as_str(), Some(*kind),
+            "row {} has wrong event_type: {:?}", idx, row);
+        assert_eq!(row["workspace_id"].as_str(), Some("ws-hook-test"),
+            "row {} has wrong workspace_id: {:?}", idx, row);
+        assert_eq!(
+            row["session_id"].as_str(),
+            Some(format!("sess-hook-{}", idx).as_str()),
+            "row {} has wrong session_id: {:?}", idx, row
+        );
+        assert_eq!(&row["payload"], payload,
+            "row {} payload mismatch: {:?} vs {:?}", idx, row["payload"], payload);
+        assert!(row["timestamp"].is_string() || row["timestamp"].is_number(),
+            "row {} timestamp should be present: {:?}", idx, row);
+    }
+}
+
+#[tokio::test]
+async fn hook_endpoint_accepts_snake_case_event_aliases() {
+    // The proxy advertises snake_case as a shell-hook ergonomic alias; verify
+    // each one round-trips into the canonical PascalCase event_type field.
+    let (mut proxy, tmp) = spawn_hook_proxy(8098).await;
+    let url = "http://127.0.0.1:8098/hook/event";
+    let client = reqwest::Client::new();
+
+    let aliases = [
+        ("session_start", "SessionStart"),
+        ("user_prompt_submit", "UserPromptSubmit"),
+        ("pre_tool_use", "PreToolUse"),
+        ("post_tool_use", "PostToolUse"),
+        ("stop", "Stop"),
+    ];
+
+    for (snake, _expected) in aliases.iter() {
+        let resp = client.post(url)
+            .json(&json!({
+                "type": snake,
+                "workspace_id": "w",
+                "session_id": "s",
+            }))
+            .send().await.expect("send");
+        assert_eq!(resp.status().as_u16(), 200,
+            "snake_case alias {} should be accepted, got {}", snake, resp.status());
+    }
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let rows = read_hooks_jsonl(tmp.path());
+    assert_eq!(rows.len(), aliases.len(),
+        "expected one row per alias, got {}: {:?}", rows.len(), rows);
+    for (idx, (_, expected)) in aliases.iter().enumerate() {
+        assert_eq!(rows[idx]["event_type"].as_str(), Some(*expected),
+            "row {} should normalize snake_case alias to {}: {:?}",
+            idx, expected, rows[idx]);
+    }
+}
+
+#[tokio::test]
+async fn hook_endpoint_rejects_unknown_event_type_with_400() {
+    // Unknown `type` strings (not in the 5 PascalCase or 5 snake_case names)
+    // must be rejected with 400 and produce no hooks.jsonl row.
+    let (mut proxy, tmp) = spawn_hook_proxy(8099).await;
+    let url = "http://127.0.0.1:8099/hook/event";
+    let client = reqwest::Client::new();
+
+    let resp = client.post(url)
+        .json(&json!({
+            "type": "NotARealHookKind",
+            "workspace_id": "w",
+            "session_id": "s",
+        }))
+        .send().await.expect("send");
+    let status = resp.status().as_u16();
+    let body: serde_json::Value = resp.json().await.expect("response is JSON");
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    assert_eq!(status, 400,
+        "unknown event type must return 400, got {} (body: {})", status, body);
+    assert_eq!(body["type"], json!("error"),
+        "400 body should be the proxy's error envelope: {}", body);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .map(|m| m.contains("NotARealHookKind"))
+            .unwrap_or(false),
+        "error message should name the offending type: {}", body
+    );
+    // No row should have been written.
+    let path = tmp.path().join(".l1.5/hooks.jsonl");
+    assert!(
+        !path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty(),
+        "hooks.jsonl must not record an invalid event"
+    );
+}
+
+#[tokio::test]
+async fn hook_endpoint_rejects_malformed_json_with_400() {
+    // Bytes that aren't valid JSON must be rejected by axum's Json extractor
+    // with 400 (not 200) and must not produce a hooks.jsonl row.
+    let (mut proxy, tmp) = spawn_hook_proxy(8100).await;
+    let url = "http://127.0.0.1:8100/hook/event";
+    let client = reqwest::Client::new();
+
+    let cases = [
+        ("not json at all", "this is not JSON {{{"),
+        ("truncated object", "{\"type\":\"SessionStart\""),
+        ("empty body", ""),
+    ];
+
+    for (label, body_str) in cases.iter() {
+        let resp = client.post(url)
+            .header("content-type", "application/json")
+            .body(body_str.to_string())
+            .send().await.expect("send");
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "case {:?}: malformed JSON must return 400, got {}",
+            label, resp.status()
+        );
+    }
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let path = tmp.path().join(".l1.5/hooks.jsonl");
+    assert!(
+        !path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty(),
+        "hooks.jsonl must not record any rows for malformed JSON requests"
+    );
+}
+
+#[tokio::test]
+async fn hook_endpoint_rejects_missing_required_fields_with_4xx() {
+    // The HookEventRequest schema requires `type`, `workspace_id`, and
+    // `session_id`. Omitting any of them must produce a 4xx response and
+    // must not write a hooks.jsonl row. (axum's Json extractor returns 422
+    // for schema violations by default; the contract here is "the proxy
+    // refuses to write a partial event," which 422 satisfies.)
+    let (mut proxy, tmp) = spawn_hook_proxy(8101).await;
+    let url = "http://127.0.0.1:8101/hook/event";
+    let client = reqwest::Client::new();
+
+    let cases = [
+        ("missing workspace_id", json!({"type": "SessionStart", "session_id": "s"})),
+        ("missing session_id", json!({"type": "SessionStart", "workspace_id": "w"})),
+        ("missing type", json!({"workspace_id": "w", "session_id": "s"})),
+        ("empty object", json!({})),
+    ];
+
+    for (label, body) in cases.iter() {
+        let resp = client.post(url)
+            .json(body)
+            .send().await.expect("send");
+        let status = resp.status().as_u16();
+        assert!(
+            (400..500).contains(&status),
+            "case {:?}: missing required field must return a 4xx, got {} (body sent: {})",
+            label, status, body
+        );
+        // Specifically, the proxy must not return 200 for an incomplete event.
+        assert_ne!(status, 200,
+            "case {:?}: must NOT return 200 for body missing required fields ({})",
+            label, body);
+    }
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let path = tmp.path().join(".l1.5/hooks.jsonl");
+    assert!(
+        !path.exists() || std::fs::read_to_string(&path).unwrap().trim().is_empty(),
+        "hooks.jsonl must not record rows for any incomplete-body request"
+    );
+}
+
+#[tokio::test]
+async fn hook_endpoint_writes_null_payload_when_omitted() {
+    // The `payload` field is optional. When the client omits it, the
+    // hooks.jsonl row should still be written with payload: null (rather
+    // than rejecting the request or writing a row missing the key).
+    let (mut proxy, tmp) = spawn_hook_proxy(8102).await;
+    let url = "http://127.0.0.1:8102/hook/event";
+    let client = reqwest::Client::new();
+
+    let resp = client.post(url)
+        .json(&json!({
+            "type": "SessionStart",
+            "workspace_id": "w",
+            "session_id": "s",
+        }))
+        .send().await.expect("send");
+    assert_eq!(resp.status().as_u16(), 200,
+        "valid event with no payload must return 200, got {}", resp.status());
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let rows = read_hooks_jsonl(tmp.path());
+    assert_eq!(rows.len(), 1, "expected exactly one row, got {}", rows.len());
+    assert_eq!(rows[0]["payload"], serde_json::Value::Null,
+        "omitted payload must serialize as JSON null, got {:?}", rows[0]["payload"]);
+    assert_eq!(rows[0]["event_type"].as_str(), Some("SessionStart"));
+}
