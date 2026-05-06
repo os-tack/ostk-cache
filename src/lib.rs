@@ -119,7 +119,12 @@ pub struct Page {
 }
 
 pub trait PageTable {
-    async fn store(&mut self, name: PageName, content: &[u8], ws: WorkspaceId) -> Page;
+    fn store(
+        &mut self,
+        name: PageName,
+        content: &[u8],
+        ws: WorkspaceId,
+    ) -> impl std::future::Future<Output = Page> + Send;
     fn load(&mut self, name: PageName, ws: WorkspaceId) -> Option<Page>;
     fn pin(&mut self, name: PageName, ws: WorkspaceId);
     fn evict(&mut self, name: PageName, ws: WorkspaceId);
