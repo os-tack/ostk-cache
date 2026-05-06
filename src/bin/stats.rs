@@ -17,6 +17,13 @@ struct Args {
 
     #[arg(long)]
     workspace: Option<String>,
+
+    /// Filter ledger rows by proxy mode. "mutate" (proxy rewrote
+    /// the request), "passthrough" (proxy forwarded verbatim), or
+    /// "all" (no filter, default). Old rows persisted before the
+    /// mode field existed parse as "mutate" via serde default.
+    #[arg(long, default_value = "all")]
+    mode: String,
 }
 
 #[derive(Default, Debug)]
@@ -36,7 +43,20 @@ struct SessionStats {
 
 fn main() {
     let args = Args::parse();
-    
+
+    // Validate --mode before doing any work; surface bad values with a
+    // pointed error rather than silently returning an empty result set.
+    match args.mode.as_str() {
+        "mutate" | "passthrough" | "all" => {}
+        other => {
+            eprintln!(
+                "Invalid --mode {:?}: expected one of mutate, passthrough, all",
+                other
+            );
+            std::process::exit(1);
+        }
+    }
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -71,6 +91,10 @@ fn main() {
                     && &row.workspace_id != ws {
                         continue;
                     }
+
+                if args.mode != "all" && row.mode != args.mode {
+                    continue;
+                }
 
                 if let Some(w_secs) = window_secs
                     && row.timestamp > 0 && row.timestamp < now - w_secs {
@@ -144,6 +168,7 @@ fn main() {
         let result = serde_json::json!({
             "workspace_id": stats.workspace_id,
             "session_id": stats.session_id,
+            "mode": args.mode,
             "turns": stats.turns,
             "amp_mean": amp_mean,
             "amp_p50": amp_p50,
@@ -164,12 +189,13 @@ fn main() {
         }
     } else if args.format == "csv"
         && !results.is_empty() {
-            println!("workspace_id,session_id,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,hot_pages_max,evictions,firmware_bytes,state_bytes_mean");
+            println!("workspace_id,session_id,mode,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,hot_pages_max,evictions,firmware_bytes,state_bytes_mean");
             for res in results {
                 let obj = res.as_object().unwrap();
-                println!("{},{},{},{:.2},{:.2},{:.2},{:.2},{},{},{},{:.2}",
+                println!("{},{},{},{},{:.2},{:.2},{:.2},{:.2},{},{},{},{:.2}",
                     obj["workspace_id"].as_str().unwrap_or(""),
                     obj["session_id"].as_str().unwrap_or(""),
+                    obj["mode"].as_str().unwrap_or(""),
                     obj["turns"],
                     obj["amp_mean"].as_f64().unwrap_or(0.0),
                     obj["amp_p50"].as_f64().unwrap_or(0.0),
@@ -182,6 +208,46 @@ fn main() {
                 );
             }
         }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stats_computation() {
+        let mut stats_map: HashMap<(WorkspaceId, SessionId), SessionStats> = HashMap::new();
+        
+        let key = ("ws1".to_string(), "sess1".to_string());
+        let mut entry = SessionStats {
+            workspace_id: "ws1".to_string(),
+            session_id: "sess1".to_string(),
+            ..Default::default()
+        };
+
+        for i in 1..=10 {
+            entry.turns += 1;
+            entry.input_total_sum += 100;
+            entry.cache_read_total_sum += 50;
+            entry.amp_ratios.push(i as f64);
+        }
+        
+        stats_map.insert(key, entry);
+        
+        let stats = stats_map.get(&("ws1".to_string(), "sess1".to_string())).unwrap();
+        let mut sorted_amps = stats.amp_ratios.clone();
+        sorted_amps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let turns_f = stats.turns as f64;
+        let amp_mean = stats.amp_ratios.iter().sum::<f64>() / turns_f;
+        let amp_p50 = sorted_amps[sorted_amps.len() / 2];
+        let idx = (sorted_amps.len() as f64 * 0.95) as usize;
+        let amp_p95 = sorted_amps[std::cmp::min(idx, sorted_amps.len() - 1)];
+
+        assert_eq!(amp_mean, 5.5);
+        assert_eq!(amp_p50, 6.0);
+        assert_eq!(amp_p95, 10.0);
+    }
 }
 
 #[cfg(test)]
