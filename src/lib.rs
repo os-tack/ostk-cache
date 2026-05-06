@@ -150,7 +150,7 @@ impl PageTable for InMemoryPageTable {
     async fn store(&mut self, name: PageName, content: &[u8], ws: WorkspaceId) -> Page {
         let content_clone = content.to_vec();
         let ws_clone = ws.clone();
-        
+
         tokio::spawn(async move {
             let _file_id = materialize(&content_clone, &ws_clone).await;
         });
@@ -308,24 +308,57 @@ pub struct ProviderUsage {
     pub cache_create_tokens: usize,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct AmpRow {
     pub session: SessionId,
+    #[serde(default)]
+    pub workspace_id: String,
     pub input_total: usize,
+    #[serde(default)]
+    pub cache_read_tokens: usize,
+    #[serde(default)]
+    pub cache_create_tokens: usize,
     pub amp_ratio: f64,
+    #[serde(default)]
+    pub firmware_bytes: usize,
+    #[serde(default)]
+    pub state_bytes: usize,
+    #[serde(default)]
+    pub hot_count: usize,
+    #[serde(default)]
+    pub timestamp: u64,
 }
 
-pub fn account(usage: &ProviderUsage, session: SessionId) -> AmpRow {
+pub fn account(
+    usage: &ProviderUsage,
+    session: SessionId,
+    workspace_id: String,
+    firmware_bytes: usize,
+    state_bytes: usize,
+    hot_count: usize,
+) -> AmpRow {
     let amp_ratio = if usage.input_tokens == 0 {
         1.0
     } else {
         (usage.cache_read_tokens + usage.input_tokens) as f64 / usage.input_tokens as f64
     };
 
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     AmpRow {
         session,
+        workspace_id,
         input_total: usage.input_tokens,
+        cache_read_tokens: usage.cache_read_tokens,
+        cache_create_tokens: usage.cache_create_tokens,
         amp_ratio,
+        firmware_bytes,
+        state_bytes,
+        hot_count,
+        timestamp,
     }
 }
 
@@ -484,10 +517,14 @@ mod tests {
             cache_read_tokens: 200,
             cache_create_tokens: 50,
         };
-        let row = account(&usage, "sess_1".to_string());
+        let row = account(&usage, "sess_1".to_string(), "ws_1".to_string(), 10, 20, 5);
         assert_eq!(row.session, "sess_1");
+        assert_eq!(row.workspace_id, "ws_1");
         assert_eq!(row.input_total, 100);
         assert_eq!(row.amp_ratio, 3.0);
+        assert_eq!(row.firmware_bytes, 10);
+        assert_eq!(row.state_bytes, 20);
+        assert_eq!(row.hot_count, 5);
     }
 
     #[test]
@@ -497,10 +534,14 @@ mod tests {
             cache_read_tokens: 200,
             cache_create_tokens: 50,
         };
-        let row = account(&usage, "sess_2".to_string());
+        let row = account(&usage, "sess_2".to_string(), "ws_2".to_string(), 15, 25, 2);
         assert_eq!(row.session, "sess_2");
+        assert_eq!(row.workspace_id, "ws_2");
         assert_eq!(row.input_total, 0);
         assert_eq!(row.amp_ratio, 1.0);
+        assert_eq!(row.firmware_bytes, 15);
+        assert_eq!(row.state_bytes, 25);
+        assert_eq!(row.hot_count, 2);
     }
 
     fn git_init(dir: &Path) {

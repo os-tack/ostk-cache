@@ -94,6 +94,8 @@ async fn handle_anthropic_message(
     };
 
     let body_str = String::from_utf8_lossy(&body_bytes);
+    let mut firmware_len = 0;
+    let mut state_len = 0;
     let (payload, parse_failed) = match serde_json::from_str::<AnthropicRequest>(&body_str) {
         Ok(mut req) => {
             let firmware: String = match &req.system {
@@ -107,6 +109,8 @@ async fn handle_anthropic_message(
                     .join(""),
                 _ => String::new(),
             };
+
+            firmware_len = firmware.len();
 
             req.system = Some(json!([
                 {
@@ -147,7 +151,9 @@ async fn handle_anthropic_message(
                     }
                 }
 
-                last_msg.content = json!(new_content_array);
+                let final_json = json!(new_content_array);
+                state_len = serde_json::to_string(&final_json).unwrap_or_default().len();
+                last_msg.content = final_json;
             }
 
             match serde_json::to_string(&req) {
@@ -175,6 +181,13 @@ async fn handle_anthropic_message(
         .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
     let url = format!("{}/v1/messages", base_url);
     let mut req_builder = client.post(url);
+
+    if !api_key.is_empty() {
+        req_builder = req_builder.header("x-api-key", api_key);
+    }
+    if !anthropic_version.is_empty() {
+        req_builder = req_builder.header("anthropic-version", anthropic_version);
+    }
 
     let hop_by_hop = [
         "host", "content-length", "transfer-encoding", "connection",
@@ -246,7 +259,15 @@ async fn handle_anthropic_message(
         } else {
             parse_usage_from_json(&accumulated)
         } {
-            let row = account(&usage, session_id_clone.clone());
+            let prior_amp_for_write = prior_amp.clone();
+            let row = account(
+                &usage, 
+                session_id_clone.clone(),
+                workspace.priority_hash.clone(),
+                firmware_len,
+                state_len,
+                prior_amp_for_write.hot_count
+            );
             if let Err(e) = persist_amp_row(&row) {
                 eprintln!("[proxy] persist_amp_row error: {}", e);
             }
