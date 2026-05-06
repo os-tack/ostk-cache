@@ -381,12 +381,61 @@ pub fn persist_amp_row(row: &AmpRow) -> std::io::Result<()> {
     Ok(())
 }
 
-pub enum HookEvent {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HookEventKind {
     SessionStart,
     UserPromptSubmit,
     PreToolUse,
     PostToolUse,
     Stop,
+}
+
+impl HookEventKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HookEventKind::SessionStart => "SessionStart",
+            HookEventKind::UserPromptSubmit => "UserPromptSubmit",
+            HookEventKind::PreToolUse => "PreToolUse",
+            HookEventKind::PostToolUse => "PostToolUse",
+            HookEventKind::Stop => "Stop",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<HookEventKind> {
+        match s {
+            "SessionStart" => Some(HookEventKind::SessionStart),
+            "UserPromptSubmit" => Some(HookEventKind::UserPromptSubmit),
+            "PreToolUse" => Some(HookEventKind::PreToolUse),
+            "PostToolUse" => Some(HookEventKind::PostToolUse),
+            "Stop" => Some(HookEventKind::Stop),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HookEvent {
+    pub kind: HookEventKind,
+    pub workspace_id: String,
+    pub session_id: String,
+    pub payload: Option<serde_json::Value>,
+}
+
+impl HookEvent {
+    pub fn new(kind: HookEventKind, workspace_id: String, session_id: String) -> Self {
+        Self {
+            kind,
+            workspace_id,
+            session_id,
+            payload: None,
+        }
+    }
+
+    pub fn with_payload(mut self, payload: serde_json::Value) -> Self {
+        self.payload = Some(payload);
+        self
+    }
 }
 
 pub trait HookAdapter {
@@ -397,36 +446,93 @@ pub struct DaemonAdapter<T: PageTable> {
     pub table: T,
 }
 
+impl<T: PageTable> DaemonAdapter<T> {
+    pub fn new(table: T) -> Self {
+        Self { table }
+    }
+}
+
 impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
     fn on_event(&mut self, event: HookEvent) {
-        match event {
-            HookEvent::SessionStart => println!("Binding file_id / firmware materialization"),
-            HookEvent::UserPromptSubmit => println!("Placing TTL markers, injecting HUD"),
-            HookEvent::PreToolUse => println!("Executing predictive prefetch"),
-            HookEvent::PostToolUse => println!("Running auto-promotion, updating amp ledger"),
-            HookEvent::Stop => {
-                println!("Persisting snapshot, checking staleness");
-                let dir = Path::new(".l1.5");
-                if !dir.exists() {
-                    let _ = std::fs::create_dir_all(dir);
+        // Terminal observation lines (preserved from before).
+        match event.kind {
+            HookEventKind::SessionStart => {
+                println!("Binding file_id / firmware materialization")
+            }
+            HookEventKind::UserPromptSubmit => {
+                println!("Placing TTL markers, injecting HUD")
+            }
+            HookEventKind::PreToolUse => println!("Executing predictive prefetch"),
+            HookEventKind::PostToolUse => {
+                println!("Running auto-promotion, updating amp ledger")
+            }
+            HookEventKind::Stop => println!("Persisting snapshot, checking staleness"),
+        }
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let dir = Path::new(".l1.5");
+        if !dir.exists()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            eprintln!("[DaemonAdapter] Failed to create .l1.5 dir: {}", e);
+            return;
+        }
+
+        // Append a row to .l1.5/hooks.jsonl for every event kind.
+        let row = json!({
+            "timestamp": timestamp,
+            "workspace_id": event.workspace_id,
+            "session_id": event.session_id,
+            "event_type": event.kind.as_str(),
+            "payload": event.payload.clone().unwrap_or(serde_json::Value::Null),
+        });
+
+        let hooks_path = dir.join("hooks.jsonl");
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&hooks_path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = writeln!(f, "{}", row) {
+                    eprintln!(
+                        "[DaemonAdapter] Failed to write hooks.jsonl: {}",
+                        e
+                    );
                 }
-                let file_path = dir.join("manifest.json");
-                let mut file = match std::fs::File::create(&file_path) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        eprintln!("[DaemonAdapter] Failed to create manifest.json: {}", e);
-                        return;
+            }
+            Err(e) => {
+                eprintln!("[DaemonAdapter] Failed to open hooks.jsonl: {}", e);
+            }
+        }
+
+        // Stop additionally writes a manifest snapshot (kept for compatibility).
+        if event.kind == HookEventKind::Stop {
+            let file_path = dir.join("manifest.json");
+            match std::fs::File::create(&file_path) {
+                Ok(mut file) => {
+                    let status = json!({
+                        "status": "persisted",
+                        "timestamp": timestamp,
+                        "workspace_id": event.workspace_id,
+                        "session_id": event.session_id,
+                    });
+                    if let Err(e) = writeln!(file, "{}", status) {
+                        eprintln!(
+                            "[DaemonAdapter] Failed to write manifest.json: {}",
+                            e
+                        );
                     }
-                };
-                let status = json!({
-                    "status": "persisted",
-                    "timestamp": std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                });
-                if let Err(e) = writeln!(file, "{}", status) {
-                    eprintln!("[DaemonAdapter] Failed to write manifest.json: {}", e);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[DaemonAdapter] Failed to create manifest.json: {}",
+                        e
+                    );
                 }
             }
         }
@@ -632,5 +738,145 @@ mod tests {
         let canonical = dir.path().canonicalize().unwrap();
         let expected = sha256_hex(canonical.to_string_lossy().as_bytes());
         assert_eq!(ws.priority_hash, expected);
+    }
+
+    /// Helper: run `f` inside a temp cwd, restoring the previous cwd on drop.
+    /// We serialize tests that touch cwd via a Mutex because `set_current_dir`
+    /// is process-wide.
+    fn with_temp_cwd<F: FnOnce(&Path)>(f: F) {
+        use std::sync::Mutex;
+        static CWD_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::env::set_current_dir(tmp.path()).expect("cd");
+        f(tmp.path());
+        std::env::set_current_dir(&prev).expect("restore cwd");
+    }
+
+    fn read_hooks_jsonl(dir: &Path) -> Vec<serde_json::Value> {
+        let path = dir.join(".l1.5").join("hooks.jsonl");
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {:?}: {}", path, e));
+        contents
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .unwrap_or_else(|e| panic!("parse {:?}: {}", l, e))
+            })
+            .collect()
+    }
+
+    fn dispatch_each_kind(adapter: &mut DaemonAdapter<InMemoryPageTable>) {
+        for kind in [
+            HookEventKind::SessionStart,
+            HookEventKind::UserPromptSubmit,
+            HookEventKind::PreToolUse,
+            HookEventKind::PostToolUse,
+            HookEventKind::Stop,
+        ] {
+            adapter.on_event(HookEvent::new(
+                kind,
+                "ws-test".to_string(),
+                "sess-test".to_string(),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_daemon_adapter_writes_row_for_each_event_kind() {
+        with_temp_cwd(|dir| {
+            let mut adapter = DaemonAdapter::new(InMemoryPageTable::new());
+            dispatch_each_kind(&mut adapter);
+
+            let rows = read_hooks_jsonl(dir);
+            assert_eq!(rows.len(), 5, "expected one row per event kind");
+
+            let kinds: Vec<&str> = rows
+                .iter()
+                .map(|r| r["event_type"].as_str().expect("event_type str"))
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    "SessionStart",
+                    "UserPromptSubmit",
+                    "PreToolUse",
+                    "PostToolUse",
+                    "Stop",
+                ]
+            );
+
+            for r in &rows {
+                assert_eq!(r["workspace_id"].as_str().unwrap(), "ws-test");
+                assert_eq!(r["session_id"].as_str().unwrap(), "sess-test");
+                assert!(r["timestamp"].as_u64().is_some(), "timestamp must be u64");
+                // payload defaults to null when not provided
+                assert!(r["payload"].is_null());
+            }
+        });
+    }
+
+    #[test]
+    fn test_daemon_adapter_stop_writes_manifest_and_hook_row() {
+        with_temp_cwd(|dir| {
+            let mut adapter = DaemonAdapter::new(InMemoryPageTable::new());
+            adapter.on_event(HookEvent::new(
+                HookEventKind::Stop,
+                "ws-stop".to_string(),
+                "sess-stop".to_string(),
+            ));
+
+            // hooks.jsonl has the Stop row
+            let rows = read_hooks_jsonl(dir);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["event_type"].as_str().unwrap(), "Stop");
+
+            // manifest.json still produced
+            let manifest_path = dir.join(".l1.5").join("manifest.json");
+            let manifest_text = std::fs::read_to_string(&manifest_path)
+                .unwrap_or_else(|e| panic!("read {:?}: {}", manifest_path, e));
+            let manifest: serde_json::Value =
+                serde_json::from_str(manifest_text.trim()).expect("manifest json");
+            assert_eq!(manifest["status"].as_str().unwrap(), "persisted");
+            assert_eq!(manifest["workspace_id"].as_str().unwrap(), "ws-stop");
+            assert_eq!(manifest["session_id"].as_str().unwrap(), "sess-stop");
+        });
+    }
+
+    #[test]
+    fn test_daemon_adapter_appends_payload() {
+        with_temp_cwd(|dir| {
+            let mut adapter = DaemonAdapter::new(InMemoryPageTable::new());
+            let payload = json!({"tool": "Read", "args": {"path": "/x"}});
+            adapter.on_event(
+                HookEvent::new(
+                    HookEventKind::PreToolUse,
+                    "ws-p".to_string(),
+                    "sess-p".to_string(),
+                )
+                .with_payload(payload.clone()),
+            );
+
+            let rows = read_hooks_jsonl(dir);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["event_type"].as_str().unwrap(), "PreToolUse");
+            assert_eq!(rows[0]["payload"], payload);
+        });
+    }
+
+    #[test]
+    fn test_hook_event_kind_str_roundtrip() {
+        for kind in [
+            HookEventKind::SessionStart,
+            HookEventKind::UserPromptSubmit,
+            HookEventKind::PreToolUse,
+            HookEventKind::PostToolUse,
+            HookEventKind::Stop,
+        ] {
+            assert_eq!(HookEventKind::from_str(kind.as_str()), Some(kind));
+        }
+        assert_eq!(HookEventKind::from_str("Unknown"), None);
     }
 }
