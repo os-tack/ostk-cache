@@ -117,39 +117,55 @@ async fn handle_anthropic_message(
             ]));
 
             if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
-                let amp_for_hud = if prior_amp.turns_seen == 0 {
-                    1.0
+                let has_tool_result = last_msg
+                    .content
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter().any(|b| {
+                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                        })
+                    })
+                    .unwrap_or(false);
+
+                if has_tool_result {
+                    state_len = serde_json::to_string(&last_msg.content)
+                        .unwrap_or_default()
+                        .len();
                 } else {
-                    prior_amp.cumulative_amp_mean
-                };
-                let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
+                    let amp_for_hud = if prior_amp.turns_seen == 0 {
+                        1.0
+                    } else {
+                        prior_amp.cumulative_amp_mean
+                    };
+                    let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
 
-                let mut new_content_array = Vec::new();
+                    let mut new_content_array = Vec::new();
 
-                new_content_array.push(json!({
-                    "type": "text",
-                    "text": format!("{}\n", hud),
-                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
-                }));
-
-                if let Some(s) = last_msg.content.as_str() {
                     new_content_array.push(json!({
                         "type": "text",
-                        "text": s
+                        "text": format!("{}\n", hud),
+                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
                     }));
-                } else if let Some(arr) = last_msg.content.as_array() {
-                    for item in arr {
-                        let mut block = item.clone();
-                        if let Some(obj) = block.as_object_mut() {
-                            obj.remove("cache_control");
-                        }
-                        new_content_array.push(block);
-                    }
-                }
 
-                let final_json = json!(new_content_array);
-                state_len = serde_json::to_string(&final_json).unwrap_or_default().len();
-                last_msg.content = final_json;
+                    if let Some(s) = last_msg.content.as_str() {
+                        new_content_array.push(json!({
+                            "type": "text",
+                            "text": s
+                        }));
+                    } else if let Some(arr) = last_msg.content.as_array() {
+                        for item in arr {
+                            let mut block = item.clone();
+                            if let Some(obj) = block.as_object_mut() {
+                                obj.remove("cache_control");
+                            }
+                            new_content_array.push(block);
+                        }
+                    }
+
+                    let final_json = json!(new_content_array);
+                    state_len = serde_json::to_string(&final_json).unwrap_or_default().len();
+                    last_msg.content = final_json;
+                }
             }
 
             match serde_json::to_string(&req) {
