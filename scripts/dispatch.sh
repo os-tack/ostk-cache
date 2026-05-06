@@ -72,11 +72,24 @@ else
     BODY="{\"type\":\"$EVENT_TYPE\",\"workspace_id\":\"$WS\",\"session_id\":\"$SID\"}"
 fi
 
-# Fire-and-forget POST. Hard timeout to avoid stalling the editor.
-curl -fsS --connect-timeout 1 -m 2 \
-    -X POST "$PROXY_URL/hook/event" \
-    -H 'content-type: application/json' \
-    -d "$BODY" \
-    >/dev/null 2>&1 || true
+# Truly fire-and-forget: detach the curl into the background so the script
+# returns to Claude Code in milliseconds regardless of proxy responsiveness.
+# A synchronous curl with -m 2 still costs up to 2s wall-clock per hook fire,
+# which compounds badly across the hook lattice on tool-heavy sessions.
+#
+# Pattern:
+#   - Wrap the curl in a brace group.
+#   - Redirect all three stdio to /dev/null so the parent has no fds to wait on.
+#   - `&` puts it in the background.
+#   - `disown` removes it from the shell's job table so the parent shell
+#     doesn't SIGHUP it on exit. (`|| true` because some shells lack disown.)
+{
+    curl -fsS --connect-timeout 1 -m 2 \
+        -X POST "$PROXY_URL/hook/event" \
+        -H 'content-type: application/json' \
+        -d "$BODY" \
+        >/dev/null 2>&1 || true
+} </dev/null >/dev/null 2>&1 &
+disown 2>/dev/null || true
 
 exit 0
