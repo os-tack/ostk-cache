@@ -1,6 +1,6 @@
 use serde_json::json;
 use std::process::Command;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -283,4 +283,455 @@ async fn proxy_sends_identity_accept_encoding_upstream() {
         "expected accept-encoding: identity exactly once upstream, got {}", identity_count);
     assert_eq!(gzip_count, 0,
         "expected no accept-encoding: gzip upstream (caller's gzip preference must be stripped), got {}", gzip_count);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers used by the three follow-up tests below
+// ---------------------------------------------------------------------------
+
+/// Read one HTTP/1.1 request from `stream` (headers + Content-Length body) and
+/// return the full bytes received. Returns the raw bytes so callers can split
+/// header / body themselves.
+async fn read_full_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 * 1024);
+    let mut tmp = [0u8; 8192];
+
+    // Read until end of headers
+    let header_end;
+    loop {
+        let n = stream.read(&mut tmp).await.expect("read upstream req");
+        if n == 0 {
+            return buf;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(idx) = find_subseq(&buf, b"\r\n\r\n") {
+            header_end = idx + 4;
+            break;
+        }
+    }
+
+    // Parse Content-Length
+    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_lowercase();
+    let cl: usize = header_str
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    // Read the rest of the body
+    while buf.len() < header_end + cl {
+        let n = stream.read(&mut tmp).await.expect("read upstream body");
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    }
+    buf
+}
+
+fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Write a complete HTTP/1.1 200 response with a JSON body containing a `usage`
+/// block so the proxy persists a ledger row.
+async fn write_usage_response(stream: &mut tokio::net::TcpStream, input_tokens: u64) {
+    let body = json!({
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "ok"}],
+        "model": "claude-test",
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": 1,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0
+        }
+    })
+    .to_string();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+/// Spawn the proxy binary with the given env, optional cwd, and wait briefly
+/// for it to be listening. Caller must kill/wait on the returned Child.
+///
+/// Uses the pre-built binary (`CARGO_BIN_EXE_ostk-cache`) so we can set an
+/// arbitrary cwd without `cargo run` failing to locate the workspace Cargo.toml.
+fn spawn_proxy(
+    proxy_port: u16,
+    upstream_url: &str,
+    cwd: Option<&std::path::Path>,
+) -> std::process::Child {
+    let bin = env!("CARGO_BIN_EXE_ostk-cache");
+    let mut cmd = Command::new(bin);
+    cmd.env("PROXY_PORT", proxy_port.to_string())
+        .env("ANTHROPIC_BASE_URL", upstream_url);
+    if let Some(p) = cwd {
+        cmd.current_dir(p);
+    }
+    cmd.spawn().expect("Failed to start proxy")
+}
+
+async fn wait_for_proxy(port: u16, timeout_ms: u64) {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("proxy did not come up on port {} within {}ms", port, timeout_ms);
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T6 follow-up: session isolation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proxy_isolates_per_session_amp_accumulators_and_ledger_rows() {
+    // Two requests with distinct anthropic-session-id headers should produce
+    // two ledger rows whose `session` fields differ. The per-session
+    // AmpAccumulator must not leak state from one session into the other.
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proxy_port = 8093;
+    let mut proxy = spawn_proxy(proxy_port, &upstream_url, Some(tmp.path()));
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+
+    // Fire request #1 (session A) and serve a response so the ledger persists.
+    let url1 = proxy_url.clone();
+    let req_task_a = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(&url1)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "session-a")
+            .json(&json!({"system": "S", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .map(|r| r.bytes());
+    });
+
+    let (mut up_a, _) = mock_upstream.accept().await.unwrap();
+    let _ = read_full_http_request(&mut up_a).await;
+    write_usage_response(&mut up_a, 100).await;
+    let _ = req_task_a.await;
+
+    // Fire request #2 (session B).
+    let url2 = proxy_url.clone();
+    let req_task_b = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let _ = client
+            .post(&url2)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "session-b")
+            .json(&json!({"system": "S", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .map(|r| r.bytes());
+    });
+
+    let (mut up_b, _) = mock_upstream.accept().await.unwrap();
+    let _ = read_full_http_request(&mut up_b).await;
+    write_usage_response(&mut up_b, 200).await;
+    let _ = req_task_b.await;
+
+    // Wait briefly for the streaming task in the proxy to flush ledger rows.
+    let ledger_path = tmp.path().join(".ostk/memory/ledger.jsonl");
+    let mut tries = 0;
+    while tries < 50 {
+        if let Ok(s) = std::fs::read_to_string(&ledger_path)
+            && s.lines().count() >= 2
+        {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        tries += 1;
+    }
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let content = std::fs::read_to_string(&ledger_path)
+        .expect("ledger.jsonl should exist after two completed requests");
+    let rows: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("each ledger line is valid JSON"))
+        .collect();
+    assert_eq!(rows.len(), 2, "expected exactly two ledger rows, got {}: {}", rows.len(), content);
+
+    let sessions: Vec<&str> = rows.iter()
+        .map(|r| r["session"].as_str().expect("session field is a string"))
+        .collect();
+    assert!(sessions.contains(&"session-a"), "ledger missing session-a: {:?}", sessions);
+    assert!(sessions.contains(&"session-b"), "ledger missing session-b: {:?}", sessions);
+    assert_ne!(sessions[0], sessions[1], "two rows must carry different session ids");
+}
+
+// ---------------------------------------------------------------------------
+// T6 follow-up: content-type variants
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn proxy_accepts_charset_qualified_content_type_and_normalizes_upstream() {
+    // Caller sends `application/json; charset=utf-8`. Proxy must:
+    //   (1) parse the body successfully (no 400),
+    //   (2) forward `content-type: application/json` upstream exactly once,
+    //   (3) NOT pass the `charset=utf-8` suffix upstream (proxy controls
+    //       canonicalization; upstream should see the canonical form).
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let proxy_port = 8094;
+    let mut proxy = spawn_proxy(proxy_port, &upstream_url, None);
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+    let req_body = serde_json::to_vec(&json!({
+        "system": "Sys",
+        "messages": [{"role": "user", "content": "Hello"}]
+    }))
+    .unwrap();
+
+    let client = reqwest::Client::new();
+    let req_task = tokio::spawn(async move {
+        let resp = client
+            .post(&proxy_url)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "ct-test")
+            .header("content-type", "application/json; charset=utf-8")
+            .body(req_body)
+            .send()
+            .await;
+        // Drain to completion so the proxy finishes its work cleanly.
+        if let Ok(r) = resp {
+            let status = r.status();
+            let _ = r.bytes().await;
+            status
+        } else {
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        }
+    });
+
+    let (mut stream, _) = mock_upstream.accept().await.unwrap();
+    let req_bytes = read_full_http_request(&mut stream).await;
+    write_usage_response(&mut stream, 1).await;
+
+    let status = req_task.await.unwrap();
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    assert_eq!(status.as_u16(), 200, "proxy must accept charset-qualified content-type and return 200");
+
+    let received = String::from_utf8_lossy(&req_bytes);
+    let lower = received.to_lowercase();
+
+    let canonical = lower.matches("content-type: application/json\r\n").count();
+    let with_charset = lower.matches("content-type: application/json; charset=utf-8").count();
+    assert_eq!(
+        canonical, 1,
+        "upstream must see canonical `content-type: application/json` exactly once, got {} (raw: {:?})",
+        canonical, received
+    );
+    assert_eq!(
+        with_charset, 0,
+        "proxy must not propagate the caller's `charset=utf-8` suffix upstream, got {}",
+        with_charset
+    );
+
+    // Body before the headers/body split must be parseable JSON — confirms the
+    // proxy did not mangle the payload while normalizing the content-type.
+    let body_idx = find_subseq(&req_bytes, b"\r\n\r\n").expect("upstream req has body separator") + 4;
+    let body = &req_bytes[body_idx..];
+    let parsed: serde_json::Value = serde_json::from_slice(body)
+        .unwrap_or_else(|e| panic!("upstream body must be valid JSON, got error {}: {:?}", e, String::from_utf8_lossy(body)));
+    assert_eq!(parsed["messages"][0]["role"], "user");
+}
+
+// ---------------------------------------------------------------------------
+// T6 follow-up: ledger crash-survival under SIGKILL
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ledger_jsonl_survives_proxy_sigkill_and_remains_appendable() {
+    // Sequence:
+    //   1. Spawn proxy in a tempdir cwd, fire one full request, wait for the
+    //      ledger row to land on disk.
+    //   2. SIGKILL the proxy (simulates abrupt crash, no graceful shutdown).
+    //   3. Re-spawn proxy in the same cwd, fire another full request.
+    //   4. Verify ledger.jsonl now has 2 well-formed JSON rows (the first row
+    //      survived the kill, the second appended cleanly).
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ledger_path = tmp.path().join(".ostk/memory/ledger.jsonl");
+
+    // ---- Phase 1: first proxy, one completed request, wait for row ----
+    let proxy_port_a = 8095;
+    let mut proxy_a = spawn_proxy(proxy_port_a, &upstream_url, Some(tmp.path()));
+    wait_for_proxy(proxy_port_a, 5000).await;
+
+    let url_a = format!("http://127.0.0.1:{}/v1/messages", proxy_port_a);
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url_a)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "crash-sess-1")
+            .json(&json!({"system": "S", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            let _ = r.bytes().await;
+        }
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let _ = read_full_http_request(&mut up).await;
+    write_usage_response(&mut up, 50).await;
+    let _ = req_task.await;
+
+    // Wait for the ledger row to actually land before we kill -9.
+    let mut tries = 0;
+    while tries < 100 {
+        if let Ok(s) = std::fs::read_to_string(&ledger_path)
+            && s.lines().filter(|l| !l.trim().is_empty()).count() >= 1
+        {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tries += 1;
+    }
+    let pre_crash = std::fs::read_to_string(&ledger_path)
+        .expect("ledger.jsonl must exist before crash");
+    assert!(
+        pre_crash.lines().filter(|l| !l.trim().is_empty()).count() >= 1,
+        "expected at least one ledger row before SIGKILL, got: {:?}", pre_crash
+    );
+
+    // ---- Phase 2: SIGKILL (force kill — no chance for graceful shutdown) ----
+    // The cargo wrapper PID is not the binary PID; killing it leaves the
+    // child running. Send SIGKILL to the actual ostk-cache binary using pkill
+    // scoped to our PROXY_PORT env via the cmdline arg PROXY_PORT=8095.
+    // std::process::Child::kill on macOS sends SIGKILL, which is propagated to
+    // the cargo subprocess. To be sure the proxy binary itself dies, we also
+    // pkill any matching binary with our specific port env in its environment.
+    let _ = proxy_a.kill(); // SIGKILL on Unix
+    let _ = proxy_a.wait();
+    // Best-effort: kill any lingering child that didn't go down with cargo.
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg(format!("PROXY_PORT={}", proxy_port_a))
+        .output();
+    // Wait for the port to actually free.
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port_a)).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+
+    // The pre-crash ledger contents must still be on disk and parseable.
+    let after_crash = std::fs::read_to_string(&ledger_path)
+        .expect("ledger.jsonl must still exist after SIGKILL");
+    let rows_after_crash: Vec<serde_json::Value> = after_crash
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l)
+             .unwrap_or_else(|e| panic!("ledger row corrupted after crash: {} (line: {:?})", e, l)))
+        .collect();
+    assert!(
+        !rows_after_crash.is_empty(),
+        "ledger rows written before crash must survive SIGKILL"
+    );
+    let pre_count = rows_after_crash.len();
+
+    // ---- Phase 3: restart proxy in the same cwd; fire another request ----
+    let proxy_port_b = 8096;
+    let mut proxy_b = spawn_proxy(proxy_port_b, &upstream_url, Some(tmp.path()));
+    wait_for_proxy(proxy_port_b, 10_000).await;
+
+    let url_b = format!("http://127.0.0.1:{}/v1/messages", proxy_port_b);
+    let req_task2 = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&url_b)
+            .header("x-api-key", "k")
+            .header("anthropic-session-id", "crash-sess-2")
+            .json(&json!({"system": "S", "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await;
+        if let Ok(r) = resp {
+            let _ = r.bytes().await;
+        }
+    });
+
+    let (mut up2, _) = mock_upstream.accept().await.unwrap();
+    let _ = read_full_http_request(&mut up2).await;
+    write_usage_response(&mut up2, 75).await;
+    let _ = req_task2.await;
+
+    // Wait for the new row to land.
+    let mut tries = 0;
+    while tries < 100 {
+        if let Ok(s) = std::fs::read_to_string(&ledger_path)
+            && s.lines().filter(|l| !l.trim().is_empty()).count() > pre_count
+        {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        tries += 1;
+    }
+
+    let _ = proxy_b.kill();
+    let _ = proxy_b.wait();
+
+    let final_content = std::fs::read_to_string(&ledger_path)
+        .expect("ledger.jsonl must exist after restart and second request");
+    let final_rows: Vec<serde_json::Value> = final_content
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l)
+             .unwrap_or_else(|e| panic!("ledger row not valid JSON after restart: {} (line: {:?})", e, l)))
+        .collect();
+    assert!(
+        final_rows.len() > pre_count,
+        "expected new ledger row appended after restart (had {}, now {}): {}",
+        pre_count, final_rows.len(), final_content
+    );
+    // Confirm pre-crash rows are still byte-identical at the front of the file
+    // — no truncation, no rewrite during restart.
+    assert!(
+        final_content.starts_with(&after_crash),
+        "post-restart ledger must start with pre-crash bytes (append-only invariant)"
+    );
+
+    // Confirm the new row carries the second session id.
+    let last = final_rows.last().expect("at least one row");
+    assert_eq!(
+        last["session"].as_str(),
+        Some("crash-sess-2"),
+        "post-restart row should carry the second session id"
+    );
 }
