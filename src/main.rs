@@ -122,31 +122,40 @@ async fn handle_connection(mut stream: tokio::net::TcpStream, amp_store: AmpStor
             ]));
 
             if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
-                let mut original_content = String::new();
-                if let Some(s) = last_msg.content.as_str() {
-                    original_content.push_str(s);
-                } else if let Some(arr) = last_msg.content.as_array() {
-                    for item in arr {
-                        if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                            original_content.push_str(text);
-                        }
-                    }
-                }
-
                 let amp_for_hud = if prior_amp.turns_seen == 0 {
                     1.0
                 } else {
                     prior_amp.cumulative_amp_mean
                 };
                 let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
-                let new_state = format!("{}\n{}", hud, original_content);
-                last_msg.content = json!([
-                    {
+
+                let mut new_content_array = Vec::new();
+                
+                // 1. Add HUD as the first text block with the 5m ephemeral marker
+                new_content_array.push(json!({
+                    "type": "text",
+                    "text": format!("{}\n", hud),
+                    "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                }));
+
+                // 2. Preserve original content (including images/documents) 
+                // stripping existing cache_control markers to avoid Anthropic's 4-marker limit
+                if let Some(s) = last_msg.content.as_str() {
+                    new_content_array.push(json!({
                         "type": "text",
-                        "text": new_state,
-                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                        "text": s
+                    }));
+                } else if let Some(arr) = last_msg.content.as_array() {
+                    for item in arr {
+                        let mut block = item.clone();
+                        if let Some(obj) = block.as_object_mut() {
+                            obj.remove("cache_control");
+                        }
+                        new_content_array.push(block);
                     }
-                ]);
+                }
+
+                last_msg.content = json!(new_content_array);
             }
 
             match serde_json::to_string(&req) {
