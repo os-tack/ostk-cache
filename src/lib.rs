@@ -1,4 +1,9 @@
+pub mod cycle_digest;
+pub mod kernel_client;
+pub mod rebuild;
 pub mod rewrite_middleware;
+pub mod standalone;
+pub mod transcript_tail;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -380,7 +385,8 @@ pub struct AmpRow {
     pub session: SessionId,
     #[serde(default)]
     pub workspace_id: String,
-    pub input_total: usize,
+    #[serde(alias = "input_total")]
+    pub input_tokens_total: usize,
     #[serde(default)]
     pub cache_read_tokens: usize,
     #[serde(default)]
@@ -424,7 +430,7 @@ pub fn account(
     AmpRow {
         session,
         workspace_id,
-        input_total: usage.input_tokens,
+        input_tokens_total: usage.input_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_create_tokens: usage.cache_create_tokens,
         amp_ratio,
@@ -725,7 +731,7 @@ mod tests {
         );
         assert_eq!(row.session, "sess_1");
         assert_eq!(row.workspace_id, "ws_1");
-        assert_eq!(row.input_total, 100);
+        assert_eq!(row.input_tokens_total, 100);
         assert_eq!(row.amp_ratio, 3.0);
         assert_eq!(row.firmware_bytes, 10);
         assert_eq!(row.state_bytes, 20);
@@ -751,7 +757,7 @@ mod tests {
         );
         assert_eq!(row.session, "sess_2");
         assert_eq!(row.workspace_id, "ws_2");
-        assert_eq!(row.input_total, 0);
+        assert_eq!(row.input_tokens_total, 0);
         assert_eq!(row.amp_ratio, 1.0);
         assert_eq!(row.firmware_bytes, 15);
         assert_eq!(row.state_bytes, 25);

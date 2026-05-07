@@ -1000,6 +1000,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostk-abi"
+version = "1.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "ostk-cache"
 version = "0.1.0"
 dependencies = [
@@ -1012,6 +1021,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ostk-abi",
  "ostk-files-light",
  "ostk-page",
  "reqwest",

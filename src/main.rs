@@ -8,6 +8,7 @@ use axum::{
     routing::{any, post},
 };
 use dashmap::DashMap;
+use ostk_cache::rebuild::{RebuildConfig, RebuildOutcome, apply_rebuild};
 use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome, apply_rewrite};
 use ostk_cache::{
     AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind, InMemoryPageTable,
@@ -192,20 +193,179 @@ async fn handle_anthropic_message(
     let body_str = String::from_utf8_lossy(&body_bytes);
     let mut firmware_len = 0;
     let mut state_len = 0;
+    let mut rebuild_mode_tag: Option<String> = None;
+
+    // Construct the rebuild config up front so we can decide whether to
+    // fetch a kernel projection over IPC before the sync rewrite block.
+    let mut rebuild_config = RebuildConfig::from_env();
+
+    // Federated mode (OSTK_CACHE_REBUILD=kernel): fetch a fresh envelope
+    // from the kernel daemon over IPC. Any failure falls through to
+    // standalone synthesis (the rebuild module extracts an envelope from
+    // the request body's prior tool_results).
+    if rebuild_config.enabled && rebuild_config.mode_tag == "rebuild_kernel" {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        if let Some(projection) =
+            ostk_cache::kernel_client::fetch_projection(&cwd, "ostk-cache").await
+        {
+            rebuild_config.live_envelope_override = Some(projection.envelope);
+            println!(
+                "[proxy] rebuild: fetched live envelope from kernel (wire_version={})",
+                projection.wire_version
+            );
+        } else {
+            // Demote to standalone for this request — kernel unavailable.
+            rebuild_config.mode_tag = "rebuild_local".to_string();
+            println!("[proxy] rebuild: kernel projection unavailable, demoted to standalone");
+        }
+    }
+
+    // Layer 1 cycle digest read: if prior digests exist in the
+    // standalone state dir, render the last K into a section the
+    // synthesis can drop in as `## Recent assistant turns`. Independent
+    // of the rebuild mode and the transcript tail.
+    if rebuild_config.enabled {
+        let cwd_for_digests =
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let recent = ostk_cache::cycle_digest::read_recent(&cwd_for_digests, 5);
+        if let Some(section) = ostk_cache::cycle_digest::render_recent_section(&recent) {
+            println!(
+                "[proxy] rebuild: composed {} recent assistant digests",
+                recent.len()
+            );
+            rebuild_config.recent_assistant_digests = Some(section);
+        }
+    }
+
+    // Layer 3 Pattern A: transcript tail. When OSTK_CACHE_TAIL_TRANSCRIPT
+    // is set, locate the harness's session JSONL log and read the last
+    // K events for cross-session/cross-window activity awareness.
+    // Composes with both standalone and federated rebuild modes.
+    if rebuild_config.enabled {
+        let tail_config = ostk_cache::transcript_tail::TailConfig::from_env();
+        if tail_config.enabled {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if let Some(session_path) = ostk_cache::transcript_tail::locate_session_file(
+                &tail_config.claude_projects_dir,
+                &cwd,
+            ) {
+                let events = ostk_cache::transcript_tail::read_tail_events(
+                    &session_path,
+                    tail_config.tail_limit,
+                );
+                if let Some(summary) =
+                    ostk_cache::transcript_tail::render_cross_session_summary(&events, None)
+                {
+                    println!(
+                        "[proxy] rebuild: transcript tail composed {} events from {}",
+                        events.len(),
+                        session_path.display()
+                    );
+                    rebuild_config.transcript_tail_summary = Some(summary);
+                }
+            } else {
+                eprintln!(
+                    "[proxy] rebuild: transcript tail enabled but no session file found in {}",
+                    tail_config.claude_projects_dir.display()
+                );
+            }
+        }
+    }
 
     // ----------------------------------------------------------------
-    // Rewrite middleware (→1799): swap inline content for file_id refs
-    // when the FileCache already holds a non-stale handle for the
-    // content's SHA-256. Runs BEFORE the legacy mutate/passthrough path
-    // so both modes benefit. Pass-through fallback: any failure leaves
-    // `body_str` unchanged for downstream code.
+    // Rewrite passes (single parse/serialize cycle):
+    //
+    // 1. **Rebuild** (Layer 1, →1809 plan): when OSTK_CACHE_REBUILD is
+    //    set, discard messages[0..last_user_idx] and replace with a
+    //    synthetic kernel-projection context message. Preserves the
+    //    in-flight chain. Tags AmpRow.mode = "rebuild_local" or
+    //    "rebuild_kernel" (Layer 2 reserved).
+    //
+    // 2. **File-handle rewrite** (→1799): swap inline content for
+    //    file_id refs when the FileCache holds a non-stale handle for
+    //    the content's SHA-256. Runs after rebuild so it only operates
+    //    on the surviving in-flight chain.
+    //
+    // Pass-through fallback: any failure leaves `body_str` unchanged
+    // for downstream code. Breaking the proxy is far worse than missing
+    // a rewrite opportunity.
     // ----------------------------------------------------------------
     let rewritten_body_str: std::borrow::Cow<'_, str> =
         match serde_json::from_str::<serde_json::Value>(&body_str) {
             Ok(mut value) => {
+                let mut mutated = false;
+
+                // Pass 0: kernel orientation in system tier (→1830).
+                // Append the firmware-class discipline preamble to
+                // req.system with cache_control:1h so it cache-hits on
+                // every turn after the first. Idempotent — repeated
+                // requests do not double-append.
+                if rebuild_config.enabled
+                    && ostk_cache::rebuild::append_kernel_orientation_to_system(&mut value)
+                {
+                    println!(
+                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl=1h)"
+                    );
+                    mutated = true;
+                }
+
+                // Pass 1: rebuild (Layer 1 standalone or Layer 2
+                // federated — distinguished by rebuild_config.mode_tag
+                // and the optional live_envelope_override populated
+                // above when mode == "rebuild_kernel").
+                if rebuild_config.enabled {
+                    match apply_rebuild(&mut value, &rebuild_config) {
+                        RebuildOutcome::Applied(report) => {
+                            println!(
+                                "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}",
+                                report.turns_dropped,
+                                report.bytes_in,
+                                report.bytes_out,
+                                report.envelope_found,
+                                report.native_tool_calls_summarized,
+                                report.user_messages_summarized,
+                            );
+                            rebuild_mode_tag = Some(rebuild_config.mode_tag.clone());
+                            mutated = true;
+                            // Standalone-mode bookkeeping: append the
+                            // activation to ~/.ostk-cache/state/<hash>/
+                            // journal.jsonl so the run is auditable.
+                            let cwd = std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                            ostk_cache::standalone::log_activation(
+                                &cwd,
+                                &rebuild_config.mode_tag,
+                                &session_id,
+                                report.turns_dropped,
+                            );
+                        }
+                        RebuildOutcome::Skipped(reason) => {
+                            eprintln!("[proxy] rebuild skipped: {}", reason);
+                            // Even when rebuild skips, claude-code's
+                            // history can contain orphaned tool_result
+                            // blocks (interrupt artifacts). Strip them
+                            // defensively so Anthropic doesn't 400.
+                            if let Some(messages) =
+                                value.get_mut("messages").and_then(|m| m.as_array_mut())
+                            {
+                                let orphans =
+                                    ostk_cache::rebuild::repair_orphaned_tool_results(messages);
+                                if orphans > 0 {
+                                    eprintln!(
+                                        "[proxy] rebuild_skip: stripped {} orphaned tool_result blocks",
+                                        orphans
+                                    );
+                                    mutated = true;
+                                }
+                            }
+                        }
+                        RebuildOutcome::Disabled => {}
+                    }
+                }
+
+                // Pass 2: file-handle rewrite.
                 let rewrite_config = RewriteConfig::from_env(session_id.clone());
-                let outcome = apply_rewrite(&mut value, &rewrite_config);
-                match outcome {
+                match apply_rewrite(&mut value, &rewrite_config) {
                     RewriteOutcome::Applied(report) => {
                         if report.rewrites_applied > 0 {
                             println!(
@@ -216,31 +376,31 @@ async fn handle_anthropic_message(
                                 report.hits,
                                 report.misses,
                             );
-                            match serde_json::to_string(&value) {
-                                Ok(s) => std::borrow::Cow::Owned(s),
-                                Err(e) => {
-                                    eprintln!(
-                                        "[proxy] rewrite reserialize failed (forwarding original): {}",
-                                        e
-                                    );
-                                    std::borrow::Cow::Borrowed(body_str.as_ref())
-                                }
-                            }
-                        } else {
-                            // No swaps; avoid re-serialization churn.
-                            std::borrow::Cow::Borrowed(body_str.as_ref())
+                            mutated = true;
                         }
                     }
-                    RewriteOutcome::Disabled => {
-                        std::borrow::Cow::Borrowed(body_str.as_ref())
-                    }
+                    RewriteOutcome::Disabled => {}
                     RewriteOutcome::CacheLoadFailed(err) => {
                         eprintln!(
                             "[proxy] rewrite cache load failed (forwarding original): {}",
                             err
                         );
-                        std::borrow::Cow::Borrowed(body_str.as_ref())
                     }
+                }
+
+                if mutated {
+                    match serde_json::to_string(&value) {
+                        Ok(s) => std::borrow::Cow::Owned(s),
+                        Err(e) => {
+                            eprintln!(
+                                "[proxy] rewrite reserialize failed (forwarding original): {}",
+                                e
+                            );
+                            std::borrow::Cow::Borrowed(body_str.as_ref())
+                        }
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(body_str.as_ref())
                 }
             }
             Err(_) => {
@@ -251,7 +411,19 @@ async fn handle_anthropic_message(
         };
     let body_str = rewritten_body_str;
 
-    let (payload, parse_failed) = if passthrough {
+    // When rebuild is **enabled**, treat the request as effective
+    // passthrough downstream — regardless of whether rebuild actually
+    // applied this turn (it may have skipped: first turn, no real user
+    // message, etc.). The legacy mutate path inserts a `5m` HUD block
+    // at messages[0], which violates Anthropic's `longer-TTL-first`
+    // ordering whenever the in-flight chain already carries a `1h`
+    // cache_control (claude-code does this on its user messages).
+    // Rebuild mode opts out of the mutate path entirely; if rebuild
+    // skipped this turn, the original body forwards unmodified rather
+    // than getting a stale-mode HUD bolted on.
+    let effective_passthrough = passthrough || rebuild_config.enabled;
+
+    let (payload, parse_failed) = if effective_passthrough {
         // Passthrough mode: forward the original body verbatim. We still
         // perform a cheap JSON validity check so malformed bodies error
         // the same way they do in mutate mode (the caller benefits from
@@ -419,6 +591,11 @@ async fn handle_anthropic_message(
     }
 
     let session_id_clone = session_id.clone();
+    // Capture rebuild-enabled state for the stream-side accounting
+    // closure. `rebuild_config` itself is not available there (lives
+    // in the sync prelude); a single bool is enough to disambiguate
+    // the `rebuild_skip` ledger row.
+    let rebuild_enabled_capture = rebuild_config.enabled;
 
     let stream = stream! {
         let mut accumulated = Vec::<u8>::new();
@@ -437,9 +614,50 @@ async fn handle_anthropic_message(
             parse_usage_from_json(&accumulated)
         };
 
+        // Layer 1 cycle digest harvest: scan the completed assistant
+        // response for a `<turn-digest>{...}</turn-digest>` fence and
+        // persist it to the standalone state dir's
+        // cycle_digests.jsonl. The next request's projection will
+        // include the last K digests as `## Recent assistant turns`.
+        // Best-effort: any failure is logged and skipped.
+        if rebuild_enabled_capture
+            && let Some(mut digest) = ostk_cache::cycle_digest::parse_digest(
+                std::str::from_utf8(&accumulated).unwrap_or(""),
+            )
+        {
+            digest.session = session_id_clone.clone();
+            let cwd_for_digest =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            match ostk_cache::cycle_digest::write_digest(&cwd_for_digest, &digest) {
+                Ok(()) => {
+                    println!(
+                        "[proxy] rebuild: harvested cycle digest (intent={:?}, outcome={:?}, artifacts={})",
+                        digest.intent.as_deref().unwrap_or("?"),
+                        digest.outcome.as_deref().unwrap_or("?"),
+                        digest.artifacts.len(),
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[proxy] cycle_digest write error: {}", e);
+                }
+            }
+        }
+
         if let Some(usage) = parsed_usage {
             let prior_amp_for_write = prior_amp.clone();
-            let mode_str = if passthrough { "passthrough" } else { "mutate" };
+            let mode_str: &str = if let Some(tag) = rebuild_mode_tag.as_deref() {
+                tag
+            } else if rebuild_enabled_capture {
+                // Rebuild was configured but couldn't apply this turn
+                // (first-turn request, no real user message, etc.).
+                // Body was forwarded unmodified — distinct from
+                // `passthrough` (where rebuild was never on).
+                "rebuild_skip"
+            } else if passthrough {
+                "passthrough"
+            } else {
+                "mutate"
+            };
             let row = account(
                 &usage, 
                 session_id_clone.clone(),

@@ -10,6 +10,11 @@ ostk-files-light = { path = "../haystack/crates/ostk-files-light" }
 # membrane. Replaced the local Page/PageState definitions in src/lib.rs
 # at the carve.
 ostk-page = { path = "../haystack/crates/ostk-page" }
+# →1831: cache_control budget helpers (count_cache_control_fields,
+# ANTHROPIC_CACHE_CONTROL_LIMIT). Single source of truth in the
+# membrane — kernel and ostk-cache both reach the same numbers when
+# deciding whether to add a cache breakpoint.
+ostk-abi = { path = "../haystack/crates/ostk-abi" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
