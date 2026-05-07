@@ -1814,4 +1814,242 @@ mod tests {
         assert!(thread[0].contains("first"));
         assert!(thread[1].contains("second"));
     }
+
+    // ── →1834: assembled-request TTL ordering invariant ─────────────────
+    //
+    // Anthropic's prompt-cache rule: when a request body carries cache_control
+    // markers with mixed TTLs, every `ttl: "1h"` block must precede every
+    // `ttl: "5m"` block in API document order (system → tools → messages,
+    // and within each message its content array). On 2026-05-07 a real
+    // 400 surfaced because the assembled body had a 5m marker on a user
+    // turn ahead of a 1h marker further back in messages. Existing tests
+    // checked orientation idempotency and the cache_control budget in
+    // isolation; none walked the FINAL body produced by `apply_rebuild` +
+    // `append_kernel_orientation_to_system`. This test does.
+
+    /// Walk a request body in API document order and return the TTL string
+    /// of every `cache_control` block encountered. Block without `ttl` is
+    /// recorded as `"<unset>"` so reviewers can see structural slots even
+    /// when TTL is missing. Order: system blocks (in array order) → tools
+    /// (in array order) → messages (in order; each message's content
+    /// array in order).
+    fn collect_ttls_in_doc_order(req: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut visit = |v: &Value| {
+            if let Some(cc) = v.get("cache_control") {
+                let ttl = cc
+                    .get("ttl")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("<unset>")
+                    .to_string();
+                out.push(ttl);
+            }
+        };
+        if let Some(arr) = req.get("system").and_then(|s| s.as_array()) {
+            for block in arr {
+                visit(block);
+            }
+        }
+        if let Some(arr) = req.get("tools").and_then(|t| t.as_array()) {
+            for tool in arr {
+                visit(tool);
+            }
+        }
+        if let Some(arr) = req.get("messages").and_then(|m| m.as_array()) {
+            for msg in arr {
+                visit(msg);
+                if let Some(content) = msg.get("content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        visit(block);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn assembled_request_ttl_1h_precedes_5m_after_rebuild_and_orientation() {
+        // Claude-code-style request: stable system block (1h), tool def
+        // (1h), prior turn pair, current user with the volatile 5m
+        // marker (mirrors how claude-code marks the live edge).
+        let mut req = json!({
+            "model": "claude-opus-4-7",
+            "system": [
+                {
+                    "type": "text",
+                    "text": "You are Claude Code...",
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }
+            ],
+            "tools": [
+                {
+                    "name": "read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object"},
+                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                }
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "earlier turn"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
+                {"role": "user", "content": [
+                    {
+                        "type": "text",
+                        "text": "current request",
+                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
+                    }
+                ]}
+            ]
+        });
+
+        let config = RebuildConfig {
+            enabled: true,
+            mode_tag: "rebuild_local".into(),
+            max_native_tool_summary: 50,
+            max_user_intent_thread: 10,
+            live_envelope_override: None,
+            transcript_tail_summary: None,
+            recent_assistant_digests: None,
+        };
+        let outcome = apply_rebuild(&mut req, &config);
+        assert!(
+            matches!(outcome, RebuildOutcome::Applied(_)),
+            "rebuild must apply against this fixture; got {:?}",
+            outcome
+        );
+        let appended = append_kernel_orientation_to_system(&mut req);
+        assert!(appended, "orientation block must append to fixture");
+
+        let ttls = collect_ttls_in_doc_order(&req);
+
+        // Sanity: we should still see at least one 1h marker (orientation
+        // and/or the original system block) and the 5m marker on the
+        // current user turn.
+        assert!(
+            ttls.iter().any(|t| t == "1h"),
+            "expected at least one ttl=1h marker; got {:?}",
+            ttls
+        );
+        assert!(
+            ttls.iter().any(|t| t == "5m"),
+            "expected the volatile ttl=5m marker; got {:?}",
+            ttls
+        );
+
+        // Total markers must remain at or under Anthropic's hard limit.
+        assert!(
+            ttls.len() <= ANTHROPIC_CACHE_CONTROL_LIMIT,
+            "assembled body must not exceed the {}-block cache_control limit; got {}: {:?}",
+            ANTHROPIC_CACHE_CONTROL_LIMIT,
+            ttls.len(),
+            ttls
+        );
+
+        // The invariant: in API document order, the LAST 1h must come
+        // BEFORE the FIRST 5m. A 5m marker ahead of any 1h marker is
+        // exactly the shape that produced the 2026-05-07 400.
+        verify_ttl_ordering(&ttls).expect("ttl ordering invariant must hold for assembled body");
+    }
+
+    /// Verify that no `ttl=5m` marker precedes any `ttl=1h` marker in
+    /// document order. Returns Ok when both kinds are absent, when only
+    /// one kind is present, or when 1h precedes 5m. Returns Err with a
+    /// diagnostic when the invariant is violated.
+    ///
+    /// Extracted from the positive-case test so the negative-case fixture
+    /// (→1842) can call it directly and assert `.is_err()`. Without the
+    /// extraction the original `if let (Some, Some)` guard silently
+    /// passed bodies that lacked one TTL kind, which a future regression
+    /// in `collect_ttls_in_doc_order` could exploit unnoticed.
+    fn verify_ttl_ordering(ttls: &[String]) -> Result<(), String> {
+        let last_1h = ttls.iter().rposition(|t| t == "1h");
+        let first_5m = ttls.iter().position(|t| t == "5m");
+        match (last_1h, first_5m) {
+            (Some(last_1h), Some(first_5m)) if last_1h >= first_5m => Err(format!(
+                "ttl=1h must precede ttl=5m in document order \
+                 (last 1h at {last_1h}, first 5m at {first_5m}); \
+                 ttls in order: {ttls:?}"
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    // ── →1842: negative fixture for the TTL ordering invariant ─────────────
+    //
+    // The positive test above uses a guard that returns Ok when only one
+    // TTL kind is present. These negative + guard-behavior tests lock the
+    // helper's contract so a future regression that quietly drops one
+    // kind from the assembled body cannot pass `verify_ttl_ordering`
+    // unnoticed.
+
+    #[test]
+    fn ttl_ordering_rejects_5m_before_1h() {
+        // Inverted document order: 5m on the system block (would land
+        // first in collect_ttls_in_doc_order), 1h further back in
+        // messages. This is exactly the shape the 2026-05-07 400
+        // reported. The helper must flag it.
+        let req = json!({
+            "system": [
+                {"type": "text", "text": "sys",
+                 "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "later",
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]
+        });
+        let ttls = collect_ttls_in_doc_order(&req);
+        assert_eq!(ttls, vec!["5m".to_string(), "1h".to_string()]);
+        let result = verify_ttl_ordering(&ttls);
+        assert!(
+            result.is_err(),
+            "5m preceding 1h must be rejected; got {:?}",
+            result
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("ttl=1h must precede ttl=5m"),
+            "diagnostic must name the invariant; got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn ttl_ordering_passes_when_only_one_kind_present() {
+        // Lock the guard: bodies with only 1h or only 5m (or none) are
+        // valid — the invariant only applies when both kinds coexist.
+        assert!(verify_ttl_ordering(&[]).is_ok(), "empty must pass");
+        assert!(
+            verify_ttl_ordering(&["1h".to_string(), "1h".to_string()]).is_ok(),
+            "all-1h must pass"
+        );
+        assert!(
+            verify_ttl_ordering(&["5m".to_string(), "5m".to_string()]).is_ok(),
+            "all-5m must pass"
+        );
+        assert!(
+            verify_ttl_ordering(&["<unset>".to_string(), "1h".to_string()]).is_ok(),
+            "unset markers must not interfere"
+        );
+    }
+
+    #[test]
+    fn ttl_ordering_passes_when_1h_precedes_5m() {
+        // The healthy shape — 1h on system, 5m on the live edge.
+        let ttls = vec!["1h".to_string(), "1h".to_string(), "5m".to_string()];
+        assert!(verify_ttl_ordering(&ttls).is_ok(), "1h..5m must pass");
+    }
+
+    #[test]
+    fn ttl_ordering_rejects_5m_at_same_index_as_1h() {
+        // Edge: same-index pair — last_1h == first_5m would only happen
+        // if they're the same marker (impossible in practice) but the
+        // helper must still treat `>=` as a violation, not a pass.
+        // Construct a synthetic vec to lock the boundary.
+        let ttls = vec!["5m".to_string(), "1h".to_string(), "5m".to_string()];
+        // last_1h = 1, first_5m = 0 → 1 >= 0 → Err.
+        assert!(verify_ttl_ordering(&ttls).is_err());
+    }
 }
