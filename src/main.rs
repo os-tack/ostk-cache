@@ -8,6 +8,7 @@ use axum::{
     routing::{any, post},
 };
 use dashmap::DashMap;
+use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome, apply_rewrite};
 use ostk_cache::{
     AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind, InMemoryPageTable,
     ProviderUsage, SessionId, account, persist_amp_row, project_hud,
@@ -191,6 +192,65 @@ async fn handle_anthropic_message(
     let body_str = String::from_utf8_lossy(&body_bytes);
     let mut firmware_len = 0;
     let mut state_len = 0;
+
+    // ----------------------------------------------------------------
+    // Rewrite middleware (→1799): swap inline content for file_id refs
+    // when the FileCache already holds a non-stale handle for the
+    // content's SHA-256. Runs BEFORE the legacy mutate/passthrough path
+    // so both modes benefit. Pass-through fallback: any failure leaves
+    // `body_str` unchanged for downstream code.
+    // ----------------------------------------------------------------
+    let rewritten_body_str: std::borrow::Cow<'_, str> =
+        match serde_json::from_str::<serde_json::Value>(&body_str) {
+            Ok(mut value) => {
+                let rewrite_config = RewriteConfig::from_env(session_id.clone());
+                let outcome = apply_rewrite(&mut value, &rewrite_config);
+                match outcome {
+                    RewriteOutcome::Applied(report) => {
+                        if report.rewrites_applied > 0 {
+                            println!(
+                                "[proxy] rewrite: applied={} bytes_in={} bytes_out={} hits={} misses={}",
+                                report.rewrites_applied,
+                                report.bytes_in,
+                                report.bytes_out,
+                                report.hits,
+                                report.misses,
+                            );
+                            match serde_json::to_string(&value) {
+                                Ok(s) => std::borrow::Cow::Owned(s),
+                                Err(e) => {
+                                    eprintln!(
+                                        "[proxy] rewrite reserialize failed (forwarding original): {}",
+                                        e
+                                    );
+                                    std::borrow::Cow::Borrowed(body_str.as_ref())
+                                }
+                            }
+                        } else {
+                            // No swaps; avoid re-serialization churn.
+                            std::borrow::Cow::Borrowed(body_str.as_ref())
+                        }
+                    }
+                    RewriteOutcome::Disabled => {
+                        std::borrow::Cow::Borrowed(body_str.as_ref())
+                    }
+                    RewriteOutcome::CacheLoadFailed(err) => {
+                        eprintln!(
+                            "[proxy] rewrite cache load failed (forwarding original): {}",
+                            err
+                        );
+                        std::borrow::Cow::Borrowed(body_str.as_ref())
+                    }
+                }
+            }
+            Err(_) => {
+                // Body is not valid JSON; the existing parse-failed path
+                // below will surface a 400. Don't pre-empt it here.
+                std::borrow::Cow::Borrowed(body_str.as_ref())
+            }
+        };
+    let body_str = rewritten_body_str;
+
     let (payload, parse_failed) = if passthrough {
         // Passthrough mode: forward the original body verbatim. We still
         // perform a cheap JSON validity check so malformed bodies error
