@@ -61,8 +61,24 @@ async fn main() {
         }
     };
     let passthrough = env_truthy("OSTK_CACHE_PASSTHROUGH");
-    let mode = if passthrough { "passthrough" } else { "mutate" };
-    println!("Capture Proxy running on {} (mode: {})", bind_addr, mode);
+    let rebuild_cfg = ostk_cache::rebuild::RebuildConfig::from_env();
+    let tail_transcript = env_truthy("OSTK_CACHE_TAIL_TRANSCRIPT");
+    let mode = if passthrough {
+        "passthrough".to_string()
+    } else if rebuild_cfg.enabled {
+        rebuild_cfg.mode_tag.clone()
+    } else {
+        "mutate".to_string()
+    };
+    let mode_with_tail = if tail_transcript {
+        format!("{} + tail", mode)
+    } else {
+        mode
+    };
+    println!(
+        "Capture Proxy running on {} (mode: {})",
+        bind_addr, mode_with_tail
+    );
 
     let state = AppState {
         amp_store: Arc::new(DashMap::new()),
