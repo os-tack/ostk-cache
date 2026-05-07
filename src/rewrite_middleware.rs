@@ -267,7 +267,11 @@ fn resolve_ostk_dir() -> PathBuf {
 ///
 /// We avoid pulling in `chrono` for a single timestamp; the format is
 /// straightforward and tests verify its shape.
-fn iso8601_utc_now() -> String {
+///
+/// →1781: re-used by `lib.rs` for the canonical Page::stored_at and
+/// Page::last_accessed fields after the federation reconciliation
+/// (was previously `SystemTime::now()` on the local Page type).
+pub(crate) fn iso8601_utc_now() -> String {
     let now = SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

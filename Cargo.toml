@@ -5,6 +5,11 @@ edition = "2024"
 
 [dependencies]
 ostk-files-light = { path = "../haystack/crates/ostk-files-light" }
+# →1781: page-table type surface (Page, PageState). The kernel crate is
+# canonical; ostk-cache (the federation probe) reconciles to it via this
+# membrane. Replaced the local Page/PageState definitions in src/lib.rs
+# at the carve.
+ostk-page = { path = "../haystack/crates/ostk-page" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }

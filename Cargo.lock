@@ -1013,6 +1013,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ostk-files-light",
+ "ostk-page",
  "reqwest",
  "serde",
  "serde_json",
@@ -1028,6 +1029,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "ostk-page"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

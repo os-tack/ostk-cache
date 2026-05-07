@@ -9,6 +9,18 @@ use std::io::Write;
 use std::path::Path;
 use std::time::SystemTime;
 
+// →1781: page-table types are now re-exported from the canonical
+// membrane crate `ostk-page`. The ostk-cache probe converged to the
+// kernel surface at the W3 carve. Field map (probe → canonical):
+//   * `token_count: usize`     → `tokens: u64`
+//   * `last_used: SystemTime`  → `last_accessed: String` (ISO-8601)
+//   * `content_hash: String`   → DROP (use FileCache::get_by_sha256)
+//   * `file_id: Option<FileId>` → `file_id: String` (empty when cold)
+// `stored_at: String` was added (no probe parallel) to match canonical.
+// `PageState::Evicted` was a probe contribution and now lives in the
+// membrane crate alongside Hot/Warm/Cold.
+pub use ostk_page::{Page, PageState};
+
 /// Rotation interval for `.l1.5/hooks.jsonl`: 1 hour.
 pub const HOOKS_ROTATION_INTERVAL_SECS: u64 = 3600;
 
@@ -154,24 +166,9 @@ fn normalize_git_url(raw: &str) -> String {
         .unwrap_or(normalized)
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum PageState {
-    Hot,
-    Warm,
-    Cold,
-    Evicted,
-}
-
-#[derive(Clone, Debug)]
-pub struct Page {
-    pub name: PageName,
-    pub content_hash: String,
-    pub file_id: Option<FileId>,
-    pub token_count: usize,
-    pub last_used: SystemTime,
-    pub state: PageState,
-    pub pinned: bool,
-}
+// PageState and Page are re-exported from ostk-page above (see top of
+// file). The local definitions were carved out at the →1781 federation
+// reconciliation.
 
 pub trait PageTable {
     fn store(
@@ -215,17 +212,21 @@ impl PageTable for InMemoryPageTable {
             let _file_id = materialize(&content_clone, &ws_clone).await;
         });
 
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(content);
-        let content_hash = format!("{:x}", hasher.finalize());
+        // →1781: canonical Page surface — file_id is empty string when
+        // not yet materialized; tokens is u64; last_accessed is ISO
+        // string. content_hash dropped (use FileCache::get_by_sha256
+        // for hash lookups).
+        let now = rewrite_middleware::iso8601_utc_now();
         let page = Page {
             name: name.clone(),
-            content_hash,
-            file_id: None,
-            token_count: content.len() / 4,
-            last_used: SystemTime::now(),
+            file_id: String::new(),
+            tokens: (content.len() / 4) as u64,
+            stored_at: now.clone(),
+            last_accessed: now,
             state: PageState::Hot,
             pinned: false,
+            owner: String::new(),
+            shared_with: vec![],
         };
         self.pages.insert((ws, name), page.clone());
         page
@@ -233,7 +234,7 @@ impl PageTable for InMemoryPageTable {
 
     fn load(&mut self, name: PageName, ws: WorkspaceId) -> Option<Page> {
         if let Some(page) = self.pages.get_mut(&(ws, name)) {
-            page.last_used = SystemTime::now();
+            page.last_accessed = rewrite_middleware::iso8601_utc_now();
             Some(page.clone())
         } else {
             None
@@ -629,12 +630,20 @@ mod tests {
             .store("firmware".to_string(), b"sys_prompt", "ws1".to_string())
             .await;
         assert_eq!(page.state, PageState::Hot);
-        assert!(page.file_id.is_none());
+        // →1781: file_id is now an empty String (not Option<String>) when
+        // the page hasn't been materialized yet.
+        assert!(page.file_id.is_empty());
 
         let loaded = table
             .load("firmware".to_string(), "ws1".to_string())
             .unwrap();
-        assert_eq!(loaded.content_hash, page.content_hash);
+        // content_hash is gone (use FileCache::get_by_sha256 for hash
+        // lookups). Identity is now name + tokens + file_id; Page
+        // derives PartialEq, so we compare the whole record minus the
+        // last_accessed bump that load() applies.
+        assert_eq!(loaded.name, page.name);
+        assert_eq!(loaded.tokens, page.tokens);
+        assert_eq!(loaded.file_id, page.file_id);
 
         table.release("firmware".to_string(), "ws1".to_string());
         let released = table
