@@ -1002,6 +1002,7 @@ dependencies = [
 [[package]]
 name = "ostk-abi"
 version = "1.2.0"
+source = "git+https://github.com/os-tack/haystack.git?tag=ostk-abi-v1.2.0#ea763ca79c616d77d785c831f841bf87b1c26a26"
 dependencies = [
  "serde",
  "serde_json",
@@ -1010,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "ostk-cache"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-stream",
  "axum",
@@ -1035,6 +1036,7 @@ dependencies = [
 [[package]]
 name = "ostk-files-light"
 version = "1.0.0"
+source = "git+https://github.com/os-tack/haystack.git?tag=ostk-files-light-v1.0.0#ea763ca79c616d77d785c831f841bf87b1c26a26"
 dependencies = [
  "serde",
  "serde_json",
@@ -1044,6 +1046,7 @@ dependencies = [
 [[package]]
 name = "ostk-page"
 version = "1.0.0"
+source = "git+https://github.com/os-tack/haystack.git?tag=ostk-page-v1.0.0#ea763ca79c616d77d785c831f841bf87b1c26a26"
 dependencies = [
  "serde",
  "serde_json",

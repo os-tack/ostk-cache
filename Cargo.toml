@@ -1,6 +1,6 @@
 [package]
 name = "ostk-cache"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 
 [dependencies]
@@ -39,11 +39,18 @@ flate2 = "1.0"
 [dev-dependencies]
 tempfile = "3"
 
-# Local-development override: when a sibling checkout of os-tack/haystack
-# exists at ../haystack, cargo prefers these path-deps over the git-dep tags
-# above. CI runners without the sibling checkout fall through to the git-deps
-# (no warning — the patch source is simply unmatched).
-[patch."https://github.com/os-tack/haystack.git"]
-ostk-abi = { path = "../haystack/crates/ostk-abi" }
-ostk-files-light = { path = "../haystack/crates/ostk-files-light" }
-ostk-page = { path = "../haystack/crates/ostk-page" }
+# Local-development tip: cargo doesn't gracefully fall back from a [patch]
+# path to git when the path is missing — a missing sibling checkout breaks
+# the build outright. So no project-level [patch] block here.
+#
+# If you have a sibling checkout at ../haystack and want cargo to short-
+# circuit to it (skip the git fetch on every cargo update), add this block
+# to your ~/.cargo/config.toml:
+#
+#   [patch."https://github.com/os-tack/haystack.git"]
+#   ostk-abi          = { path = "<absolute-path>/haystack/crates/ostk-abi" }
+#   ostk-files-light  = { path = "<absolute-path>/haystack/crates/ostk-files-light" }
+#   ostk-page         = { path = "<absolute-path>/haystack/crates/ostk-page" }
+#
+# Cargo merges configs from the project, parent dirs up to /, and ~/.cargo,
+# so a personal block does not need to live in this repo.
