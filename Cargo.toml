@@ -1,20 +1,24 @@
 [package]
 name = "ostk-cache"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 
 [dependencies]
-ostk-files-light = { path = "../haystack/crates/ostk-files-light" }
+# Membrane crates from os-tack/haystack (private repo). Resolved via git-dep
+# pinned to per-crate tags so a CI runner without a local haystack checkout
+# can still build. Local development uses the [patch] block below to short-
+# circuit to a sibling path checkout.
+ostk-files-light = { git = "ssh://git@github.com/os-tack/haystack.git", package = "ostk-files-light", tag = "ostk-files-light-v1.0.0" }
 # →1781: page-table type surface (Page, PageState). The kernel crate is
 # canonical; ostk-cache (the federation probe) reconciles to it via this
 # membrane. Replaced the local Page/PageState definitions in src/lib.rs
 # at the carve.
-ostk-page = { path = "../haystack/crates/ostk-page" }
+ostk-page = { git = "ssh://git@github.com/os-tack/haystack.git", package = "ostk-page", tag = "ostk-page-v1.0.0" }
 # →1831: cache_control budget helpers (count_cache_control_fields,
 # ANTHROPIC_CACHE_CONTROL_LIMIT). Single source of truth in the
 # membrane — kernel and ostk-cache both reach the same numbers when
 # deciding whether to add a cache breakpoint.
-ostk-abi = { path = "../haystack/crates/ostk-abi" }
+ostk-abi = { git = "ssh://git@github.com/os-tack/haystack.git", package = "ostk-abi", tag = "ostk-abi-v1.2.0" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }
@@ -32,3 +36,12 @@ flate2 = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Local-development override: when a sibling checkout of os-tack/haystack
+# exists at ../haystack, cargo prefers these path-deps over the git-dep tags
+# above. CI runners without the sibling checkout fall through to the git-deps
+# (no warning — the patch source is simply unmatched).
+[patch."ssh://git@github.com/os-tack/haystack.git"]
+ostk-abi = { path = "../haystack/crates/ostk-abi" }
+ostk-files-light = { path = "../haystack/crates/ostk-files-light" }
+ostk-page = { path = "../haystack/crates/ostk-page" }

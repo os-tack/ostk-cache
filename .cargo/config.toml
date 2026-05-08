@@ -1,0 +1,9 @@
+# Use the system git CLI for fetching git deps. Cargo's libgit2-backed
+# fetcher does not always cooperate with ssh-agent / SSH config (operators
+# run through agents, deploy keys, or ~/.ssh/config aliases), and the
+# git-deps to os-tack/haystack live behind SSH auth.
+#
+# CI runners should arrange git CLI auth before cargo runs (deploy key via
+# webfactory/ssh-agent@v0, or HTTPS rewrite via git credential helper).
+[net]
+git-fetch-with-cli = true
