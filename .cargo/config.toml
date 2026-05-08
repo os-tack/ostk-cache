@@ -1,9 +1,16 @@
-# Use the system git CLI for fetching git deps. Cargo's libgit2-backed
-# fetcher does not always cooperate with ssh-agent / SSH config (operators
-# run through agents, deploy keys, or ~/.ssh/config aliases), and the
-# git-deps to os-tack/haystack live behind SSH auth.
+# Use the system git CLI for fetching git deps. Cargo's bundled libgit2
+# fetcher does not see git's credential.helper / OS keychain / gh-cli auth,
+# so HTTPS fetches to private repos fail even when the system `git` succeeds.
+# Switching to git-fetch-with-cli delegates to the system git, which honors
+# whatever auth the developer (or CI runner) has configured.
 #
-# CI runners should arrange git CLI auth before cargo runs (deploy key via
-# webfactory/ssh-agent@v0, or HTTPS rewrite via git credential helper).
+# CI: ci.yml sets a `git config --global url.<...>.insteadOf` rule that
+# injects the OSTK_CRATES PAT for HTTPS fetches to github.com.
+#
+# Local dev: any of the following just works —
+#   - macOS keychain credential helper (Apple's git default)
+#   - `gh auth login` (sets up a credential helper at user level)
+#   - `git config --global url."git@github.com:".insteadOf "https://github.com/"`
+#     to route HTTPS through SSH instead.
 [net]
 git-fetch-with-cli = true
