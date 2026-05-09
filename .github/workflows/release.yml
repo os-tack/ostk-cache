@@ -4,40 +4,54 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Allow manual runs against an existing tag — useful for re-uploading
+  # artifacts when the workflow grows new outputs without cutting a new
+  # tag. Pick the tag from the GH UI; the matrix builds binaries for
+  # every platform and uploads them as release assets (overwrite=true).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build artifacts for (e.g. v0.2.6)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   build-and-upload:
-    name: Build and upload
+    name: Build and upload (${{ matrix.os }} / ${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: ostk-cache
-            asset_name: ostk-cache-linux-amd64
+            asset_suffix: linux-amd64
+            bin_ext: ""
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact_name: ostk-cache
-            asset_name: ostk-cache-macos-amd64
+            asset_suffix: macos-amd64
+            bin_ext: ""
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: ostk-cache
-            asset_name: ostk-cache-macos-arm64
+            asset_suffix: macos-arm64
+            bin_ext: ""
           # Windows: federation (kernel projection over AF_UNIX) is unavailable
           # — fetch_projection_inner is cfg(windows)-stubbed to return Err, so
           # the proxy runs in standalone mode. This mirrors haystack's
           # `#[cfg(unix)] pub mod machined;` pattern (haystack/src/lib.rs:21).
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: ostk-cache.exe
-            asset_name: ostk-cache-windows-amd64.exe
+            asset_suffix: windows-amd64
+            bin_ext: ".exe"
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout (tag from input or push)
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.tag || github.ref }}
 
     - name: Configure git auth for private os-tack/haystack git-deps
       env:
@@ -52,7 +66,7 @@ jobs:
         targets: ${{ matrix.target }}
 
     - name: Cache Cargo registry
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cargo/registry
@@ -62,14 +76,35 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-cargo-release-
 
-    - name: Build Release
+    - name: Build Release (all bins)
+      # `cargo build --release` (no --bin) compiles every binary in the
+      # workspace: ostk-cache (the proxy), hooks (Claude Code installer),
+      # stats (ledger reporter), and probe_p5b (dev-only, not shipped).
       run: cargo build --release --target ${{ matrix.target }}
 
-    - name: Upload binaries to release
+    - name: Upload ostk-cache (proxy)
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-        asset_name: ${{ matrix.asset_name }}
-        tag: ${{ github.ref }}
+        file: target/${{ matrix.target }}/release/ostk-cache${{ matrix.bin_ext }}
+        asset_name: ostk-cache-${{ matrix.asset_suffix }}${{ matrix.bin_ext }}
+        tag: ${{ inputs.tag || github.ref }}
+        overwrite: true
+
+    - name: Upload ostk-cache-hooks (Claude Code installer)
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: target/${{ matrix.target }}/release/hooks${{ matrix.bin_ext }}
+        asset_name: ostk-cache-hooks-${{ matrix.asset_suffix }}${{ matrix.bin_ext }}
+        tag: ${{ inputs.tag || github.ref }}
+        overwrite: true
+
+    - name: Upload ostk-cache-stats (ledger reporter)
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: target/${{ matrix.target }}/release/stats${{ matrix.bin_ext }}
+        asset_name: ostk-cache-stats-${{ matrix.asset_suffix }}${{ matrix.bin_ext }}
+        tag: ${{ inputs.tag || github.ref }}
         overwrite: true

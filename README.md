@@ -6,18 +6,26 @@ Works with **any surface that lets you set `ANTHROPIC_BASE_URL`** — Claude Cod
 
 ## Install
 
-**Pre-built binaries** (proxy only — `hooks` and `stats` are dev binaries, build from source):
+**Pre-built binaries** for every release — three bins per platform, no build step required:
 
-| Platform        | Artifact                            |
-|-----------------|-------------------------------------|
-| Linux x86_64    | `ostk-cache-linux-amd64`            |
-| macOS x86_64    | `ostk-cache-macos-amd64`            |
-| macOS arm64     | `ostk-cache-macos-arm64`            |
-| Windows x86_64  | `ostk-cache-windows-amd64.exe`      |
+| Platform        | Proxy                          | Hooks installer                       | Stats reporter                        |
+|-----------------|--------------------------------|---------------------------------------|---------------------------------------|
+| Linux x86_64    | `ostk-cache-linux-amd64`       | `ostk-cache-hooks-linux-amd64`        | `ostk-cache-stats-linux-amd64`        |
+| macOS x86_64    | `ostk-cache-macos-amd64`       | `ostk-cache-hooks-macos-amd64`        | `ostk-cache-stats-macos-amd64`        |
+| macOS arm64    | `ostk-cache-macos-arm64`       | `ostk-cache-hooks-macos-arm64`        | `ostk-cache-stats-macos-arm64`        |
+| Windows x86_64  | `ostk-cache-windows-amd64.exe` | `ostk-cache-hooks-windows-amd64.exe`  | `ostk-cache-stats-windows-amd64.exe`  |
 
-Grab from the [Releases page](https://github.com/os-tack/ostk-cache/releases/latest), `chmod +x`, drop on `PATH`.
+Grab from the [Releases page](https://github.com/os-tack/ostk-cache/releases/latest), `chmod +x`, drop on `PATH`. Quick install on Linux/macOS:
 
-**From source** (gets you all three binaries: `ostk-cache`, `hooks`, `stats`):
+```bash
+PLATFORM=linux-amd64   # or macos-amd64 / macos-arm64
+BASE=https://github.com/os-tack/ostk-cache/releases/latest/download
+curl -L "$BASE/ostk-cache-$PLATFORM"        -o /usr/local/bin/ostk-cache       && chmod +x /usr/local/bin/ostk-cache
+curl -L "$BASE/ostk-cache-hooks-$PLATFORM"  -o /usr/local/bin/ostk-cache-hooks && chmod +x /usr/local/bin/ostk-cache-hooks
+curl -L "$BASE/ostk-cache-stats-$PLATFORM"  -o /usr/local/bin/ostk-cache-stats && chmod +x /usr/local/bin/ostk-cache-stats
+```
+
+**Building from source** (contributors only):
 
 ```bash
 git clone https://github.com/os-tack/ostk-cache && cd ostk-cache
@@ -71,24 +79,24 @@ The orientation text is byte-stable across turns and cached at the 1h tier — t
 
 ## Hooks (Claude Code)
 
-The `hooks` binary installs Claude Code lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) that POST to the proxy's `/hook/event` endpoint. The proxy ledgers each event into `.l1.5/hooks.jsonl` and snapshots `manifest.json` on session stop.
+`ostk-cache-hooks` installs Claude Code lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`) that POST to the proxy's `/hook/event` endpoint. The proxy ledgers each event into `.l1.5/hooks.jsonl` and snapshots `manifest.json` on session stop.
 
 ```bash
-./target/release/hooks install     # idempotent; appends, never overwrites; backs up settings.json
-./target/release/hooks status
-./target/release/hooks uninstall   # --purge to also remove dispatch script
+ostk-cache-hooks install     # idempotent; appends, never overwrites; backs up settings.json
+ostk-cache-hooks status
+ostk-cache-hooks uninstall   # --purge to also remove dispatch script
 ```
 
 Other agent surfaces with similar hook conventions (any tool that exposes session-lifecycle hooks and lets you shell out) can post to `/hook/event` directly — the endpoint is generic HTTP. See [docs/HOOKS.md](docs/HOOKS.md) for the wire format and a manual `settings.json` snippet.
 
 ## Stats and A/B analysis
 
-The `stats` binary reads `.ostk/memory/ledger.jsonl` and emits per-session JSON or CSV.
+`ostk-cache-stats` reads `.ostk/memory/ledger.jsonl` and emits per-session JSON or CSV.
 
 ```bash
-./target/release/stats --window 24h --format json
-./target/release/stats --mode rebuild_local        # filter by mode
-./target/release/stats --workspace <16-char-hash>  # filter by workspace
+ostk-cache-stats --window 24h --format json
+ostk-cache-stats --mode rebuild_local        # filter by mode
+ostk-cache-stats --workspace <16-char-hash>  # filter by workspace
 ```
 
 Fields per session: `amp_mean`, `amp_p50`, `cache_hit_rate`, `turns`, `state_bytes_mean`, `mode`. For the recommended A/B comparison protocol (collect a window in each mode, partition by `mode` field, run side-by-side aggregation), see [docs/PASSTHROUGH.md](docs/PASSTHROUGH.md).
