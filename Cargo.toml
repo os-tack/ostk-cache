@@ -2,6 +2,8 @@
 name = "ostk-cache"
 version = "0.2.7"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/os-tack/ostk-cache"
 
 [dependencies]
 # Membrane crates from os-tack/haystack (private repo). Resolved via git-dep

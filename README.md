@@ -147,4 +147,9 @@ The `kernel_client` module speaks the haystack daemon's IPC protocol over `.ostk
 
 ## License
 
-See `LICENSE`.
+Dual-licensed under either:
+
+- [MIT License](LICENSE-MIT)
+- [Apache License, Version 2.0](LICENSE-APACHE)
+
+at your option. Contributions are accepted under the same terms (Apache-2.0 §5).
