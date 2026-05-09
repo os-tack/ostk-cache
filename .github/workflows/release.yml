@@ -27,11 +27,14 @@ jobs:
             target: aarch64-apple-darwin
             artifact_name: ostk-cache
             asset_name: ostk-cache-macos-arm64
-          # Windows dropped from the matrix: ostk-cache uses tokio::net::UnixStream
-          # for the scan-trigger socket (and Unix-fork semantics in serve), which
-          # is not portable to Windows. Restoring Windows support requires an IPC
-          # redesign (named pipes / TCP loopback) — out of scope for the build-fix
-          # wave. Linux + macOS are the supported targets today.
+          # Windows: federation (kernel projection over AF_UNIX) is unavailable
+          # — fetch_projection_inner is cfg(windows)-stubbed to return Err, so
+          # the proxy runs in standalone mode. This mirrors haystack's
+          # `#[cfg(unix)] pub mod machined;` pattern (haystack/src/lib.rs:21).
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: ostk-cache.exe
+            asset_name: ostk-cache-windows-amd64.exe
 
     steps:
     - uses: actions/checkout@v4

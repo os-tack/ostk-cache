@@ -22,12 +22,20 @@
 //! local).
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::time::timeout;
+
+// AF_UNIX is the kernel daemon's IPC. On Windows the daemon is unavailable
+// (matching haystack's `#[cfg(unix)] pub mod machined;` gate at lib.rs:21);
+// fetch_projection_inner returns Err immediately and the caller falls back
+// to standalone synthesis per the federation discipline above.
+#[cfg(unix)]
+use serde_json::json;
+#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 const DEFAULT_TIMEOUT_MS: u64 = 500;
 const SOCKET_FILENAME: &str = "ostk.sock";
@@ -182,6 +190,18 @@ pub async fn fetch_projection(workspace: &Path, alias: &str) -> Option<KernelPro
     None
 }
 
+#[cfg(windows)]
+async fn fetch_projection_inner(
+    _socket_path: &Path,
+    _alias: &str,
+) -> Result<KernelProjection, String> {
+    // Windows: AF_UNIX socket federation is unavailable. Returning Err
+    // routes through the existing fall-through in fetch_projection, which
+    // logs the failure and yields None — standalone mode engages.
+    Err("federation unavailable on Windows: kernel daemon uses AF_UNIX sockets".to_string())
+}
+
+#[cfg(unix)]
 async fn fetch_projection_inner(
     socket_path: &Path,
     alias: &str,

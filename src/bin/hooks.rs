@@ -446,8 +446,13 @@ mod tests {
 
         let dispatch = temp.path().join("hooks").join("dispatch.sh");
         assert!(dispatch.exists());
-        let perms = fs::metadata(&dispatch).unwrap().permissions();
-        assert_eq!(perms.mode() & 0o777, 0o755);
+        // Permissions check is unix-only — Windows has no concept of POSIX
+        // mode bits, and install() already cfg(unix)-gates the chmod call.
+        #[cfg(unix)]
+        {
+            let perms = fs::metadata(&dispatch).unwrap().permissions();
+            assert_eq!(perms.mode() & 0o777, 0o755);
+        }
 
         let s: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
         let hooks = s.get("hooks").unwrap().as_object().unwrap();
