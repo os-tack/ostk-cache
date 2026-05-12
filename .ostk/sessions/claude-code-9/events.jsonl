@@ -1,1 +1,0 @@
-{"seq":0,"ts":"2026-05-11T23:27:01Z","type":"event","kind":"tool_call","data":{"tool":"fs_ops","input":"/Users/scottmeyer/projects/ostk-cache/src/config.rs","summary":"error: file:edit error: policy denied write to /Users/scottmeyer/projects/ostk-cache/src/config.rs: active pin denies write (matched: write-src)","success":false}}

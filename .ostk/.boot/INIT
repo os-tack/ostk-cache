@@ -1,8 +1,0 @@
-:identity ephemeral
-:kernel @prime
-:load .language
-
-:boot
-:refine
-:help
-:audit

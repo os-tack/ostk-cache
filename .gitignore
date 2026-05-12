@@ -1,1 +1,13 @@
 /target
+.DS_Store
+
+# OSTK kernel state
+.ostk/*
+!.ostk/.language
+!.ostk/.primefile
+!.ostk/HUMANFILE
+!.ostk/anchor.json
+
+# L1.5 integration logs
+.l1.5/*
+!.l1.5/workspace-id

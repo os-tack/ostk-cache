@@ -1,5 +1,0 @@
-read: .ostk/ .language /Users/scottmeyer/projects/ostk-cache/
-write: .ostk/store/default/ .ostk/needles/ .ostk/hay/ /tmp/ /workspace/ /Users/scottmeyer/projects/ostk-cache/
-execute: shell
-deny: write-kernel modify-governance
-allow: write-src

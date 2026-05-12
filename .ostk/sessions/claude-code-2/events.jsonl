@@ -1,9 +1,0 @@
-{"seq":0,"ts":"2026-05-11T21:54:36Z","type":"event","kind":"tool_call","data":{"tool":"help","input":"{}","summary":"ok","success":true}}
-{"seq":1,"ts":"2026-05-11T21:54:40Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"bash","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":2,"ts":"2026-05-11T21:54:44Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"tack","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":3,"ts":"2026-05-11T21:54:47Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"verb_load","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":4,"ts":"2026-05-11T21:54:49Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"dispatch","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":5,"ts":"2026-05-11T21:54:55Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"arrive","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":6,"ts":"2026-05-11T21:55:06Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"bash","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":7,"ts":"2026-05-11T21:58:03Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"bash","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
-{"seq":8,"ts":"2026-05-11T22:12:07Z","type":"event","kind":"tool_call","data":{"tool":"bash","input":"cargo test --lib config:: 2>&1 | tail -50","summary":"exit:124","success":true}}

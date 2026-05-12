@@ -1,8 +1,0 @@
-{
-  "mounted": true,
-  "owner": "daemon",
-  "owner_pid": 6581,
-  "mount_point": "/Users/scottmeyer/projects/ostk-cache/.ostk/vfs",
-  "federate": false,
-  "ts": "2026-05-11T23:21:11Z"
-}
