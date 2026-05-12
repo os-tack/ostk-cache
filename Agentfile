@@ -1,0 +1,9 @@
+# Agentfile — default scheduler agent
+FROM auto
+PROMPT "You are the scheduling intelligence for this project."
+TOOL shell
+TOOL file:read
+TOOL file:edit
+LIMIT tokens 200000
+BOOT ostk boot
+PIN default

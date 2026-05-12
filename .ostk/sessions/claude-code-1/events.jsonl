@@ -1,0 +1,4 @@
+{"seq":0,"ts":"2026-05-11T21:05:20Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"tack","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
+{"seq":1,"ts":"2026-05-11T21:53:49Z","type":"event","kind":"tool_call","data":{"tool":"help","input":"{}","summary":"ok","success":true}}
+{"seq":2,"ts":"2026-05-11T21:54:01Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"tack","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}
+{"seq":3,"ts":"2026-05-11T21:54:04Z","type":"event","kind":"lifecycle","data":{"transition":"init.restricted_mode_deny","attempted":"search","safety_verbs":["boot","refine","help","audit"],"override_env":"OSTK_OVERRIDE_RESTRICTED=1"}}

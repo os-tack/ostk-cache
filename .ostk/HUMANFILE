@@ -1,0 +1,16 @@
+# HUMANFILE — @scottmeyer (Scott Meyer <scotty2012@gmail.com>)
+
+# This file defines your identity, secrets, and autonomy grants.
+
+IDENTITY scottmeyer
+SIGN 1DC5BCD6B2792FFE
+
+MODEL claude-sonnet-4-5
+
+SECRET <<KEYS
+ANTHROPIC_API_KEY
+KEYS
+
+DRIVER fcp-rust
+DRIVER fcp-screen
+DRIVER fcp-web

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "hwm": 2947,
+  "per_source": {
+    "cache_amp": 2947,
+    "commit": 2947,
+    "decision": 2947,
+    "draft": 2947,
+    "embed": 2947,
+    "fleet_snapshot": 2947,
+    "hay": 2947,
+    "needle": 2947,
+    "spec": 2947,
+    "transcript": 2947
+  }
+}

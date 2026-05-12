@@ -1,0 +1,20 @@
+# ostk.toml — ostk-cache
+
+[project]
+name = "ostk-cache"
+
+[kernel]
+version = ">=6.0.0"
+boot_mode = "embedded-first"
+laws = ["invisible-write", "ephemeral", "filesystem", "OCC", "invisible-infra"]
+
+[pins.default]
+read = [".ostk/", ".language"]
+write = [".ostk/store/default/"]
+execute = "shell(readonly)"
+deny = ["write-kernel", "modify-governance"]
+
+[features]
+tui = true
+agents = true
+audit = true

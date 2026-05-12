@@ -7,13 +7,13 @@
 :digest      | 0 | service  | 20584| 1.00 | internal | () -> () | process + file annotations |  | 
 :dispatch    | 0 | service  | 0    | 1.00 | internal | () -> () | dispatch |  | core
 :elision     | 0 | service  | 20584| 1.00 | internal | () -> () | read optimization (304) |  | 
-:embeddings  | 0 | service  | 20584| 0.00 | internal | (text) -> (vector) | semantic similarity Burn GPU |  | 
+:embeddings  | 0 | service  | 20584| 1.00 | internal | (text) -> (vector) | semantic similarity Burn GPU |  | 
 :fs_ops      | 0 | service  | 0    | 1.00 | internal | () -> () | fs_ops |  | core
 :gen-table   | 0 | service  | 20584| 1.00 | internal | () -> () | file generation tracking |  | 
 :handoff     | 0 | service  | 0    | 1.00 | internal | () -> () | handoff |  | core
 :heartbeat   | 0 | service  | 20584| 1.00 | internal | () -> () | agent health monitoring |  | 
 :hotpr       | 0 | service  | 20584| 1.00 | internal | () -> () | conflict resolution |  | 
-:lifecycle   | 0 | service  | 20584| 0.00 | .ostk/fleet/ | () -> (state) | agent lifecycle state machine (replaces dying →1176) |  | 
+:lifecycle   | 0 | service  | 20584| 1.00 | .ostk/fleet/ | () -> (state) | agent lifecycle state machine (replaces dying →1176) |  | 
 :note        | 0 | service  | 0    | 1.00 | internal | () -> () | note |  | core
 :recovery    | 0 | service  | 20584| 1.00 | internal | () -> () | tool call logging |  | 
 :release_turns| 0 | service  | 20584| 1.00 | internal | (before_turn) -> (ack) | release processed turns — journal bookkeeping |  | core

@@ -1,0 +1,6 @@
+---BEGIN OSTK.PRIME KERNEL DECLARATION---
+
+KERNEL: @ostk.prime
+INSTANCE: generic-boot
+
+---END---
