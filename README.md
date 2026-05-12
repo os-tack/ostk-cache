@@ -40,7 +40,7 @@ cargo build --release --bins
 ```bash
 # 1. Start the proxy
 ANTHROPIC_API_KEY=sk-ant-... ostk-cache
-# ostk-cache 0.3.0 listening on 127.0.0.1:8080
+# ostk-cache 0.3.1 listening on 127.0.0.1:8080
 #   mode=mutate  soft-cap=30MB  tail=off
 #   rewrite=on  kernel-timeout=500ms
 
