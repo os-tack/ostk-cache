@@ -91,6 +91,21 @@ impl RewriteConfig {
             session_id,
         }
     }
+
+    /// Build a rewrite config from the proxy's resolved [`crate::config::Config`].
+    ///
+    /// Honours `cfg.rewrite_enabled` and `cfg.ostk_dir`; falls back to
+    /// the same cwd-based `.ostk/` discovery as `from_env` when the
+    /// resolved `ostk_dir` is `None`.
+    pub fn from_resolved(cfg: &crate::config::Config, session_id: String) -> Self {
+        let ostk_dir = cfg.ostk_dir.value.clone().unwrap_or_else(resolve_ostk_dir);
+        Self {
+            enabled: cfg.rewrite_enabled.value,
+            ostk_dir,
+            options: RewriteOptions::default(),
+            session_id,
+        }
+    }
 }
 
 /// One JSONL row appended per rewrite pass.
@@ -217,10 +232,11 @@ pub fn build_event_row(report: &RewriteReport, session: &str) -> RewriteEventRow
 // ---------------------------------------------------------------------------
 
 fn write_event_row(path: &Path, row: &RewriteEventRow) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -243,20 +259,20 @@ fn write_event_row(path: &Path, row: &RewriteEventRow) -> std::io::Result<()> {
 fn env_truthy_default_on(name: &str) -> bool {
     match std::env::var(name) {
         Err(_) => true,
-        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "no" | "off" => false,
-            _ => true,
-        },
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
     }
 }
 
 /// Resolve the `.ostk/` directory from environment + cwd. See
 /// [`RewriteConfig::from_env`] for the order.
 fn resolve_ostk_dir() -> PathBuf {
-    if let Ok(v) = std::env::var("OSTK_DIR") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
+    if let Ok(v) = std::env::var("OSTK_DIR")
+        && !v.is_empty()
+    {
+        return PathBuf::from(v);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     cwd.join(".ostk")

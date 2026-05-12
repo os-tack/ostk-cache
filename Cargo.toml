@@ -1,6 +1,6 @@
 [package]
 name = "ostk-cache"
-version = "0.2.7"
+version = "0.3.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/os-tack/ostk-cache"
@@ -37,6 +37,7 @@ axum = "0.7"
 async-stream = "0.3"
 clap = { version = "4.6.1", features = ["derive"] }
 flate2 = "1.0"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

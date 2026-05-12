@@ -96,10 +96,10 @@ fn default_wire_version() -> u32 {
 /// `~/projects/.ostk/ostk.sock`) be skipped in favour of the live socket
 /// at the workspace level (→1839).
 pub fn enumerate_socket_candidates(start: &Path) -> Vec<PathBuf> {
-    if let Ok(p) = std::env::var(SOCKET_ENV_OVERRIDE) {
-        if !p.is_empty() {
-            return vec![PathBuf::from(p)];
-        }
+    if let Ok(p) = std::env::var(SOCKET_ENV_OVERRIDE)
+        && !p.is_empty()
+    {
+        return vec![PathBuf::from(p)];
     }
     let mut candidates = Vec::new();
     let mut current: Option<&Path> = Some(start);
@@ -128,13 +128,40 @@ pub fn find_socket(start: &Path) -> Option<PathBuf> {
     enumerate_socket_candidates(start).into_iter().next()
 }
 
+/// Explicit overrides for [`fetch_projection_with`]. When all fields are
+/// `None`/default, behaves identically to [`fetch_projection`] (env-based).
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionOpts {
+    /// Pinned socket path. If `Some`, takes precedence over both
+    /// `OSTK_KERNEL_SOCKET` env and the cwd-walk candidates.
+    pub socket: Option<PathBuf>,
+    /// IPC timeout. `None` falls back to `OSTK_CACHE_KERNEL_TIMEOUT_MS` →
+    /// `DEFAULT_TIMEOUT_MS`.
+    pub timeout: Option<Duration>,
+}
+
 /// Fetch a fresh kernel projection over IPC.
 ///
 /// Returns `None` on any failure mode (no socket, connect refused,
 /// timeout, parse error, JSON-RPC error). Callers MUST fall back to
 /// standalone synthesis. Logs failures to stderr for diagnostics.
 pub async fn fetch_projection(workspace: &Path, alias: &str) -> Option<KernelProjection> {
-    let candidates = enumerate_socket_candidates(workspace);
+    fetch_projection_with(workspace, alias, ProjectionOpts::default()).await
+}
+
+/// Like [`fetch_projection`] but accepts explicit overrides. The proxy's
+/// resolved [`crate::config::Config`] uses this entry-point so CLI flags
+/// win over env vars.
+pub async fn fetch_projection_with(
+    workspace: &Path,
+    alias: &str,
+    opts: ProjectionOpts,
+) -> Option<KernelProjection> {
+    let candidates = if let Some(p) = opts.socket {
+        vec![p]
+    } else {
+        enumerate_socket_candidates(workspace)
+    };
     if candidates.is_empty() {
         eprintln!(
             "[proxy] kernel_client: no ostk.sock found from {} — falling back to standalone",
@@ -143,12 +170,14 @@ pub async fn fetch_projection(workspace: &Path, alias: &str) -> Option<KernelPro
         return None;
     }
 
-    let timeout_dur = Duration::from_millis(
-        std::env::var("OSTK_CACHE_KERNEL_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_TIMEOUT_MS),
-    );
+    let timeout_dur = opts.timeout.unwrap_or_else(|| {
+        Duration::from_millis(
+            std::env::var("OSTK_CACHE_KERNEL_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_TIMEOUT_MS),
+        )
+    });
 
     // Try each candidate in priority order. A stale socket high up the
     // tree (e.g. ~/projects/.ostk/ostk.sock) ECONNREFUSEs; we then fall
@@ -191,6 +220,7 @@ pub async fn fetch_projection(workspace: &Path, alias: &str) -> Option<KernelPro
 }
 
 #[cfg(windows)]
+#[allow(clippy::unused_async)]
 async fn fetch_projection_inner(
     _socket_path: &Path,
     _alias: &str,

@@ -7,12 +7,15 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, post},
 };
+use clap::Parser;
 use dashmap::DashMap;
+use ostk_cache::config::{CliArgs, Config, Mode};
 use ostk_cache::rebuild::{RebuildConfig, RebuildOutcome, apply_rebuild};
 use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome, apply_rewrite};
 use ostk_cache::{
-    AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind, InMemoryPageTable,
-    ProviderUsage, SessionId, account, persist_amp_row, project_hud,
+    AccountInput, AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind,
+    InMemoryPageTable, ProviderUsage, SessionId, SizeMetrics, account, fmt_bytes,
+    persist_amp_row, project_hud,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -35,24 +38,22 @@ type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 struct AppState {
     amp_store: AmpStore,
     hook_adapter: HookAdapterHandle,
-    passthrough: bool,
-}
-
-/// Returns true if the value parses as a truthy flag.
-///
-/// Truthy: any of "1", "true", "yes" case-insensitive (trimmed).
-/// Anything else (empty, "0", "false", or unset) returns false.
-fn env_truthy(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"),
-        Err(_) => false,
-    }
+    config: Arc<Config>,
 }
 
 #[tokio::main]
 async fn main() {
-    let port = std::env::var("PROXY_PORT").unwrap_or_else(|_| "8080".to_string());
-    let bind_addr = format!("127.0.0.1:{}", port);
+    let cli = CliArgs::parse();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let print_only = cli.print_config;
+    let config = Config::resolve(cli, &cwd);
+
+    if print_only {
+        println!("{}", config.print_table());
+        return;
+    }
+
+    let bind_addr = format!("127.0.0.1:{}", config.port.value);
     let listener = match TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -60,30 +61,21 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let passthrough = env_truthy("OSTK_CACHE_PASSTHROUGH");
-    let rebuild_cfg = ostk_cache::rebuild::RebuildConfig::from_env();
-    let tail_transcript = env_truthy("OSTK_CACHE_TAIL_TRANSCRIPT");
-    let mode = if passthrough {
-        "passthrough".to_string()
-    } else if rebuild_cfg.enabled {
-        rebuild_cfg.mode_tag.clone()
-    } else {
-        "mutate".to_string()
-    };
-    let mode_with_tail = if tail_transcript {
-        format!("{} + tail", mode)
-    } else {
-        mode
-    };
+
     println!(
-        "Capture Proxy running on {} (mode: {})",
-        bind_addr, mode_with_tail
+        "ostk-cache {} listening on {}",
+        env!("CARGO_PKG_VERSION"),
+        bind_addr
     );
+    println!("{}", config.banner());
+    if let Some(path) = &config.config_path {
+        println!("  config: {} (use --print-config for full resolution)", path.display());
+    }
 
     let state = AppState {
         amp_store: Arc::new(DashMap::new()),
         hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
-        passthrough,
+        config: Arc::new(config),
     };
 
     let app = Router::new()
@@ -92,7 +84,36 @@ async fn main() {
         .fallback(any(|| async { (StatusCode::NOT_FOUND, "Not Found") }))
         .with_state(state);
 
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    println!("[proxy] signal received, starting graceful shutdown");
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,8 +191,12 @@ async fn handle_anthropic_message(
     body_bytes: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
     let amp_store = state.amp_store.clone();
-    let passthrough = state.passthrough;
-    println!("--- INTERCEPTED REQUEST ---");
+    let config = state.config.clone();
+    let passthrough = matches!(config.mode.value, Mode::Passthrough);
+    if config.verbose.value {
+        println!("--- INTERCEPTED REQUEST ---");
+    }
+    let req_bytes_in = body_bytes.len() as u64;
 
     let api_key = headers
         .get("x-api-key")
@@ -210,29 +235,48 @@ async fn handle_anthropic_message(
     let mut firmware_len = 0;
     let mut state_len = 0;
     let mut rebuild_mode_tag: Option<String> = None;
+    let mut rebuild_report_capture: Option<ostk_cache::rebuild::RebuildReport> = None;
+    // Capture only the fields we need for the per-turn line; the full
+    // ostk_files_light::RewriteReport isn't re-exported.
+    let mut rewrite_stats_capture: Option<(u32, u64, u64)> = None;
+    let mut section_sizes_capture: Option<ostk_cache::rebuild::SectionSizes> = None;
+    let mut reduction_report_capture: Option<ostk_cache::rebuild::ReductionReport> = None;
+    let turn_started = std::time::Instant::now();
 
-    // Construct the rebuild config up front so we can decide whether to
-    // fetch a kernel projection over IPC before the sync rewrite block.
-    let mut rebuild_config = RebuildConfig::from_env();
+    // Build the rebuild config from the resolved Config; mode is the
+    // canonical source for enabled+tag (CLI > env > toml > default).
+    let mut rebuild_config = RebuildConfig::from_resolved(&config);
 
-    // Federated mode (OSTK_CACHE_REBUILD=kernel): fetch a fresh envelope
-    // from the kernel daemon over IPC. Any failure falls through to
-    // standalone synthesis (the rebuild module extracts an envelope from
-    // the request body's prior tool_results).
+    // Federated mode (mode=rebuild-kernel): fetch a fresh envelope from
+    // the kernel daemon over IPC. Any failure falls through to standalone
+    // synthesis (the rebuild module extracts an envelope from the request
+    // body's prior tool_results).
     if rebuild_config.enabled && rebuild_config.mode_tag == "rebuild_kernel" {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        if let Some(projection) =
-            ostk_cache::kernel_client::fetch_projection(&cwd, "ostk-cache").await
+        let opts = ostk_cache::kernel_client::ProjectionOpts {
+            socket: config.kernel_socket.value.clone(),
+            timeout: Some(std::time::Duration::from_millis(config.kernel_timeout_ms.value)),
+        };
+        if let Some(projection) = ostk_cache::kernel_client::fetch_projection_with(
+            &cwd,
+            "ostk-cache",
+            opts,
+        )
+        .await
         {
             rebuild_config.live_envelope_override = Some(projection.envelope);
-            println!(
-                "[proxy] rebuild: fetched live envelope from kernel (wire_version={})",
-                projection.wire_version
-            );
+            if config.verbose.value {
+                println!(
+                    "[proxy] rebuild: fetched live envelope from kernel (wire_version={})",
+                    projection.wire_version
+                );
+            }
         } else {
             // Demote to standalone for this request — kernel unavailable.
             rebuild_config.mode_tag = "rebuild_local".to_string();
-            println!("[proxy] rebuild: kernel projection unavailable, demoted to standalone");
+            if config.verbose.value {
+                println!("[proxy] rebuild: kernel projection unavailable, demoted to standalone");
+            }
         }
     }
 
@@ -245,20 +289,23 @@ async fn handle_anthropic_message(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let recent = ostk_cache::cycle_digest::read_recent(&cwd_for_digests, 5);
         if let Some(section) = ostk_cache::cycle_digest::render_recent_section(&recent) {
-            println!(
-                "[proxy] rebuild: composed {} recent assistant digests",
-                recent.len()
-            );
+            if config.verbose.value {
+                println!(
+                    "[proxy] rebuild: composed {} recent assistant digests",
+                    recent.len()
+                );
+            }
             rebuild_config.recent_assistant_digests = Some(section);
         }
     }
 
-    // Layer 3 Pattern A: transcript tail. When OSTK_CACHE_TAIL_TRANSCRIPT
-    // is set, locate the harness's session JSONL log and read the last
-    // K events for cross-session/cross-window activity awareness.
-    // Composes with both standalone and federated rebuild modes.
+    // Layer 3 Pattern A: transcript tail. When enabled (`tail.transcript`
+    // in config / `OSTK_CACHE_TAIL_TRANSCRIPT=1`), locate the harness's
+    // session JSONL log and read the last K events for cross-session/
+    // cross-window activity awareness. Composes with both standalone and
+    // federated rebuild modes.
     if rebuild_config.enabled {
-        let tail_config = ostk_cache::transcript_tail::TailConfig::from_env();
+        let tail_config = ostk_cache::transcript_tail::TailConfig::from_resolved(&config);
         if tail_config.enabled {
             let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             if let Some(session_path) = ostk_cache::transcript_tail::locate_session_file(
@@ -272,14 +319,16 @@ async fn handle_anthropic_message(
                 if let Some(summary) =
                     ostk_cache::transcript_tail::render_cross_session_summary(&events, None)
                 {
-                    println!(
-                        "[proxy] rebuild: transcript tail composed {} events from {}",
-                        events.len(),
-                        session_path.display()
-                    );
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] rebuild: transcript tail composed {} events from {}",
+                            events.len(),
+                            session_path.display()
+                        );
+                    }
                     rebuild_config.transcript_tail_summary = Some(summary);
                 }
-            } else {
+            } else if config.verbose.value {
                 eprintln!(
                     "[proxy] rebuild: transcript tail enabled but no session file found in {}",
                     tail_config.claude_projects_dir.display()
@@ -319,9 +368,11 @@ async fn handle_anthropic_message(
                 if rebuild_config.enabled
                     && ostk_cache::rebuild::append_kernel_orientation_to_system(&mut value)
                 {
-                    println!(
-                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl=1h)"
-                    );
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl=1h)"
+                        );
+                    }
                     mutated = true;
                 }
 
@@ -332,16 +383,19 @@ async fn handle_anthropic_message(
                 if rebuild_config.enabled {
                     match apply_rebuild(&mut value, &rebuild_config) {
                         RebuildOutcome::Applied(report) => {
-                            println!(
-                                "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}",
-                                report.turns_dropped,
-                                report.bytes_in,
-                                report.bytes_out,
-                                report.envelope_found,
-                                report.native_tool_calls_summarized,
-                                report.user_messages_summarized,
-                            );
+                            if config.verbose.value {
+                                println!(
+                                    "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}",
+                                    report.turns_dropped,
+                                    report.bytes_in,
+                                    report.bytes_out,
+                                    report.envelope_found,
+                                    report.native_tool_calls_summarized,
+                                    report.user_messages_summarized,
+                                );
+                            }
                             rebuild_mode_tag = Some(rebuild_config.mode_tag.clone());
+                            rebuild_report_capture = Some(report.clone());
                             mutated = true;
                             // Standalone-mode bookkeeping: append the
                             // activation to ~/.ostk-cache/state/<hash>/
@@ -356,7 +410,9 @@ async fn handle_anthropic_message(
                             );
                         }
                         RebuildOutcome::Skipped(reason) => {
-                            eprintln!("[proxy] rebuild skipped: {}", reason);
+                            if config.verbose.value {
+                                eprintln!("[proxy] rebuild skipped: {}", reason);
+                            }
                             // Even when rebuild skips, claude-code's
                             // history can contain orphaned tool_result
                             // blocks (interrupt artifacts). Strip them
@@ -367,10 +423,12 @@ async fn handle_anthropic_message(
                                 let orphans =
                                     ostk_cache::rebuild::repair_orphaned_tool_results(messages);
                                 if orphans > 0 {
-                                    eprintln!(
-                                        "[proxy] rebuild_skip: stripped {} orphaned tool_result blocks",
-                                        orphans
-                                    );
+                                    if config.verbose.value {
+                                        eprintln!(
+                                            "[proxy] rebuild_skip: stripped {} orphaned tool_result blocks",
+                                            orphans
+                                        );
+                                    }
                                     mutated = true;
                                 }
                             }
@@ -380,18 +438,25 @@ async fn handle_anthropic_message(
                 }
 
                 // Pass 2: file-handle rewrite.
-                let rewrite_config = RewriteConfig::from_env(session_id.clone());
+                let rewrite_config = RewriteConfig::from_resolved(&config, session_id.clone());
                 match apply_rewrite(&mut value, &rewrite_config) {
                     RewriteOutcome::Applied(report) => {
                         if report.rewrites_applied > 0 {
-                            println!(
-                                "[proxy] rewrite: applied={} bytes_in={} bytes_out={} hits={} misses={}",
+                            if config.verbose.value {
+                                println!(
+                                    "[proxy] rewrite: applied={} bytes_in={} bytes_out={} hits={} misses={}",
+                                    report.rewrites_applied,
+                                    report.bytes_in,
+                                    report.bytes_out,
+                                    report.hits,
+                                    report.misses,
+                                );
+                            }
+                            rewrite_stats_capture = Some((
                                 report.rewrites_applied,
                                 report.bytes_in,
                                 report.bytes_out,
-                                report.hits,
-                                report.misses,
-                            );
+                            ));
                             mutated = true;
                         }
                     }
@@ -402,6 +467,74 @@ async fn handle_anthropic_message(
                             err
                         );
                     }
+                }
+
+                // Pass 3: soft-cap enforcement. Runs only if a positive
+                // cap is configured and the post-rewrite serialized body
+                // exceeds it. Tiers A→C trim the request; Tier D leaves
+                // the body untouched and signals irreducible so we 413
+                // below.
+                let soft_cap_bytes =
+                    config.soft_cap_mb.value.saturating_mul(1024 * 1024);
+                let reduction = ostk_cache::rebuild::enforce_soft_cap(&mut value, soft_cap_bytes);
+                if reduction.applied_any() {
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] soft-cap: {}→{} tier_a={}({}) tier_b={} tier_c={} irreducible={}",
+                            fmt_bytes(reduction.bytes_before),
+                            fmt_bytes(reduction.bytes_after),
+                            reduction.tier_a_ejected,
+                            fmt_bytes(reduction.tier_a_bytes_recovered),
+                            reduction.tier_b_pairs_pruned,
+                            reduction.tier_c_tools_dropped,
+                            reduction.irreducible,
+                        );
+                    }
+                    reduction_report_capture = Some(reduction.clone());
+                    if reduction.tier_a_ejected > 0
+                        || reduction.tier_b_pairs_pruned > 0
+                        || reduction.tier_c_tools_dropped > 0
+                    {
+                        mutated = true;
+                    }
+                }
+                let must_413 = reduction.irreducible;
+
+                // Capture post-rewrite + post-reduction section sizes
+                // for telemetry. synthetic_present iff rebuild::Applied
+                // this turn.
+                section_sizes_capture = Some(ostk_cache::rebuild::section_sizes(
+                    &value,
+                    rebuild_report_capture.is_some(),
+                ));
+
+                if must_413 {
+                    let (dominant_name, dominant_bytes) = section_sizes_capture
+                        .map(|s| s.dominant())
+                        .unwrap_or(("?", 0));
+                    let body = serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "request_too_large",
+                            "message": format!(
+                                "ostk-cache: post-reduction size {} exceeds soft cap {}. Largest section: {} ({}). Suggest /compact or trimming MCP servers.",
+                                fmt_bytes(reduction.bytes_after),
+                                fmt_bytes(soft_cap_bytes),
+                                dominant_name,
+                                fmt_bytes(dominant_bytes),
+                            ),
+                            "reduction": {
+                                "bytes_before": reduction.bytes_before,
+                                "bytes_after": reduction.bytes_after,
+                                "tier_a_ejected": reduction.tier_a_ejected,
+                                "tier_a_bytes_recovered": reduction.tier_a_bytes_recovered,
+                                "tier_b_pairs_pruned": reduction.tier_b_pairs_pruned,
+                                "tier_c_tools_dropped": reduction.tier_c_tools_dropped,
+                            },
+                        },
+                    })
+                    .to_string();
+                    return Ok((StatusCode::PAYLOAD_TOO_LARGE, body).into_response());
                 }
 
                 if mutated {
@@ -548,9 +681,7 @@ async fn handle_anthropic_message(
     }
 
     let client = reqwest::Client::new();
-    let base_url = std::env::var("ANTHROPIC_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-    let url = format!("{}/v1/messages", base_url);
+    let url = format!("{}/v1/messages", config.upstream.value);
     let mut req_builder = client.post(url);
 
     let hop_by_hop = [
@@ -567,6 +698,7 @@ async fn handle_anthropic_message(
     req_builder = req_builder.header("content-type", "application/json");
     req_builder = req_builder.header("accept-encoding", "identity");
 
+    let req_bytes_out = payload.len() as u64;
     let mut response = match req_builder.body(payload).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -612,6 +744,12 @@ async fn handle_anthropic_message(
     // in the sync prelude); a single bool is enough to disambiguate
     // the `rebuild_skip` ledger row.
     let rebuild_enabled_capture = rebuild_config.enabled;
+    let verbose_capture = config.verbose.value;
+    let rebuild_report_for_line = rebuild_report_capture.clone();
+    let rewrite_stats_for_line = rewrite_stats_capture;
+    let section_sizes_for_line = section_sizes_capture;
+    let soft_cap_bytes_for_line = config.soft_cap_mb.value.saturating_mul(1024 * 1024);
+    let reduction_for_line = reduction_report_capture.clone();
 
     let stream = stream! {
         let mut accumulated = Vec::<u8>::new();
@@ -623,6 +761,8 @@ async fn handle_anthropic_message(
             accumulated.extend_from_slice(&chunk);
             yield Ok::<_, std::io::Error>(chunk);
         }
+
+        let resp_bytes_total = accumulated.len() as u64;
 
         let parsed_usage = if is_sse {
             parse_usage_from_sse(&accumulated)
@@ -646,12 +786,14 @@ async fn handle_anthropic_message(
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             match ostk_cache::cycle_digest::write_digest(&cwd_for_digest, &digest) {
                 Ok(()) => {
-                    println!(
-                        "[proxy] rebuild: harvested cycle digest (intent={:?}, outcome={:?}, artifacts={})",
-                        digest.intent.as_deref().unwrap_or("?"),
-                        digest.outcome.as_deref().unwrap_or("?"),
-                        digest.artifacts.len(),
-                    );
+                    if verbose_capture {
+                        println!(
+                            "[proxy] rebuild: harvested cycle digest (intent={:?}, outcome={:?}, artifacts={})",
+                            digest.intent.as_deref().unwrap_or("?"),
+                            digest.outcome.as_deref().unwrap_or("?"),
+                            digest.artifacts.len(),
+                        );
+                    }
                 }
                 Err(e) => {
                     eprintln!("[proxy] cycle_digest write error: {}", e);
@@ -659,44 +801,204 @@ async fn handle_anthropic_message(
             }
         }
 
-        if let Some(usage) = parsed_usage {
+        let mode_str: &str = if let Some(tag) = rebuild_mode_tag.as_deref() {
+            tag
+        } else if rebuild_enabled_capture {
+            "rebuild_skip"
+        } else if passthrough {
+            "passthrough"
+        } else {
+            "mutate"
+        };
+
+        if let Some(usage) = &parsed_usage {
             let prior_amp_for_write = prior_amp.clone();
-            let mode_str: &str = if let Some(tag) = rebuild_mode_tag.as_deref() {
-                tag
-            } else if rebuild_enabled_capture {
-                // Rebuild was configured but couldn't apply this turn
-                // (first-turn request, no real user message, etc.).
-                // Body was forwarded unmodified — distinct from
-                // `passthrough` (where rebuild was never on).
-                "rebuild_skip"
-            } else if passthrough {
-                "passthrough"
-            } else {
-                "mutate"
+            let sizes = SizeMetrics {
+                req_bytes_in: Some(req_bytes_in),
+                req_bytes_out: Some(req_bytes_out),
+                resp_bytes: Some(resp_bytes_total),
             };
-            let row = account(
-                &usage, 
-                session_id_clone.clone(),
-                workspace.priority_hash.clone(),
-                firmware_len,
-                state_len,
-                prior_amp_for_write.hot_count,
-                mode_str,
-            );
+            let row = account(AccountInput {
+                usage,
+                session: session_id_clone.clone(),
+                workspace_id: workspace.priority_hash.clone(),
+                firmware_bytes: firmware_len,
+                state_bytes: state_len,
+                hot_count: prior_amp_for_write.hot_count,
+                mode: mode_str,
+                sizes,
+                sections: section_sizes_capture,
+                reduction: None,
+            });
             if let Err(e) = persist_amp_row(&row) {
                 eprintln!("[proxy] persist_amp_row error: {}", e);
             }
 
-            let mut acc = amp_store.entry(session_id_clone).or_default();
+            if let Some(reduction) = &reduction_report_capture
+                && reduction.applied_any()
+            {
+                let reduce_row = account(AccountInput {
+                    usage: &ProviderUsage {
+                        input_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_create_tokens: 0,
+                    },
+                    session: session_id_clone.clone(),
+                    workspace_id: workspace.priority_hash.clone(),
+                    firmware_bytes: 0,
+                    state_bytes: 0,
+                    hot_count: 0,
+                    mode: "reduce",
+                    sizes: SizeMetrics::default(),
+                    sections: None,
+                    reduction: Some(reduction.clone()),
+                });
+                if let Err(e) = persist_amp_row(&reduce_row) {
+                    eprintln!("[proxy] persist_amp_row (reduce) error: {}", e);
+                }
+            }
+
+            let mut acc = amp_store.entry(session_id_clone.clone()).or_default();
             let n = acc.turns_seen as f64;
             acc.cumulative_amp_mean = (acc.cumulative_amp_mean * n + row.amp_ratio) / (n + 1.0);
             acc.turns_seen += 1;
             acc.stored_count = acc.turns_seen as usize;
         }
+
+        // Per-turn one-liner: single compact line summarizing the
+        // round-trip. Replaces the multi-line spew in default mode;
+        // --verbose keeps the per-pass detail above plus this line.
+        let elapsed = turn_started.elapsed();
+        emit_turn_line(
+            &session_id_clone,
+            mode_str,
+            req_bytes_in,
+            req_bytes_out,
+            resp_bytes_total,
+            parsed_usage.as_ref(),
+            rebuild_report_for_line.as_ref(),
+            rewrite_stats_for_line,
+            section_sizes_for_line,
+            soft_cap_bytes_for_line,
+            reduction_for_line.as_ref(),
+            elapsed,
+        );
     };
 
     let body = Body::from_stream(stream);
     Ok(resp_builder.body(body).unwrap())
+}
+
+/// Short session prefix (first 6 chars) for the per-turn line. Sessions
+/// in the wild are 80+ char `<workspace>:<api-hash>` composites; the
+/// full string isn't useful in a tail-able log.
+fn short_session(s: &str) -> &str {
+    let end = s.char_indices().nth(6).map(|(i, _)| i).unwrap_or(s.len());
+    &s[..end]
+}
+
+/// Emit the compact per-turn telemetry line.
+///
+/// Format (one line, no markdown):
+///   [turn s=… mode=… req=A→B resp=C tok_in=N tok_out=M cache_r=K% drop=T/X→Y elapsed=Zs]
+///
+/// Sections present only when relevant: `drop=…` only when rebuild
+/// applied this turn; `rewrite=…` only when a file-handle swap fired.
+/// Threshold (bytes) at which `emit_turn_line` adds an indented section
+/// breakdown: any single section above this triggers the second line.
+const SECTION_BREAKDOWN_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024;
+
+#[allow(clippy::too_many_arguments)]
+fn emit_turn_line(
+    session: &str,
+    mode: &str,
+    req_in: u64,
+    req_out: u64,
+    resp: u64,
+    usage: Option<&ProviderUsage>,
+    rebuild: Option<&ostk_cache::rebuild::RebuildReport>,
+    rewrite_stats: Option<(u32, u64, u64)>,
+    sections: Option<ostk_cache::rebuild::SectionSizes>,
+    soft_cap_bytes: u64,
+    reduction: Option<&ostk_cache::rebuild::ReductionReport>,
+    elapsed: std::time::Duration,
+) {
+    let mut out = String::new();
+    out.push_str("[turn s=");
+    out.push_str(short_session(session));
+    out.push_str(" mode=");
+    out.push_str(mode);
+    out.push_str(" req=");
+    out.push_str(&fmt_bytes(req_in));
+    out.push('→');
+    out.push_str(&fmt_bytes(req_out));
+    out.push_str(" resp=");
+    out.push_str(&fmt_bytes(resp));
+
+    if let Some(u) = usage {
+        let total_in = u.input_tokens + u.cache_read_tokens + u.cache_create_tokens;
+        out.push_str(&format!(" tok_in={}", total_in));
+        if total_in > 0 {
+            let pct = (u.cache_read_tokens as f64 / total_in as f64) * 100.0;
+            out.push_str(&format!(" cache_r={:.0}%", pct));
+        }
+    }
+
+    if let Some(r) = rebuild {
+        out.push_str(&format!(
+            " drop={}/{}→{}",
+            r.turns_dropped,
+            fmt_bytes(r.bytes_in as u64),
+            fmt_bytes(r.bytes_out as u64),
+        ));
+    }
+
+    if let Some((n, b_in, b_out)) = rewrite_stats {
+        out.push_str(&format!(
+            " rewrite={}:{}→{}",
+            n,
+            fmt_bytes(b_in),
+            fmt_bytes(b_out),
+        ));
+    }
+
+    if let Some(r) = reduction.filter(|r| r.applied_any()) {
+        out.push_str(&format!(
+            " reduce={}→{} ej={}({}) prune={} tools={}",
+            fmt_bytes(r.bytes_before),
+            fmt_bytes(r.bytes_after),
+            r.tier_a_ejected,
+            fmt_bytes(r.tier_a_bytes_recovered),
+            r.tier_b_pairs_pruned,
+            r.tier_c_tools_dropped,
+        ));
+        if r.irreducible {
+            out.push_str(" [413]");
+        }
+    }
+
+    out.push_str(&format!(" elapsed={:.2}s]", elapsed.as_secs_f64()));
+    println!("{}", out);
+
+    // Indented section breakdown — only when something is bloated.
+    // Triggers: any single section > 5MiB OR total > 80% of soft cap.
+    if let Some(s) = sections {
+        let any_big = s.system >= SECTION_BREAKDOWN_THRESHOLD_BYTES
+            || s.tools >= SECTION_BREAKDOWN_THRESHOLD_BYTES
+            || s.synthetic >= SECTION_BREAKDOWN_THRESHOLD_BYTES
+            || s.in_flight >= SECTION_BREAKDOWN_THRESHOLD_BYTES;
+        let near_cap = soft_cap_bytes > 0 && req_out * 5 >= soft_cap_bytes * 4;
+        if any_big || near_cap {
+            println!(
+                "  └─ sys={} tools={} synthetic={} in_flight={} (dominant: {})",
+                fmt_bytes(s.system),
+                fmt_bytes(s.tools),
+                fmt_bytes(s.synthetic),
+                fmt_bytes(s.in_flight),
+                s.dominant().0,
+            );
+        }
+    }
 }
 
 fn parse_usage_from_json(body: &[u8]) -> Option<ProviderUsage> {

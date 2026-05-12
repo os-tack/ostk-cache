@@ -73,6 +73,15 @@ impl TailConfig {
             claude_projects_dir,
         }
     }
+
+    /// Build a tail config from the proxy's resolved [`crate::config::Config`].
+    pub fn from_resolved(cfg: &crate::config::Config) -> Self {
+        Self {
+            enabled: cfg.tail_transcript.value,
+            tail_limit: cfg.tail_limit.value,
+            claude_projects_dir: cfg.claude_projects_dir.value.clone(),
+        }
+    }
 }
 
 /// Summary of a single transcript event observed at the tail.
@@ -132,7 +141,7 @@ pub fn locate_session_file(projects_dir: &Path, workspace_cwd: &Path) -> Option<
         }
     }
 
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
 
     let workspace_str = workspace_cwd.to_string_lossy();
     for (path, _) in &candidates {
@@ -314,14 +323,13 @@ pub fn render_cross_session_summary(events: &[TailEvent], current_session_marker
 
     let mut count = 0usize;
     for ev in events {
-        if let Some(marker) = current_session_marker {
-            if ev
+        if let Some(marker) = current_session_marker
+            && ev
                 .timestamp
                 .as_deref()
                 .is_some_and(|ts| ts >= marker)
-            {
-                continue;
-            }
+        {
+            continue;
         }
 
         let kind_label = match &ev.kind {

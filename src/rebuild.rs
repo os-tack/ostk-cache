@@ -173,6 +173,30 @@ impl RebuildConfig {
             recent_assistant_digests: None,
         }
     }
+
+    /// Build a rebuild config from the proxy's resolved [`crate::config::Config`].
+    ///
+    /// Mirrors `from_env`'s shape but pulls enabled+mode_tag from the
+    /// already-resolved `mode` field (which has CLI > env > toml > default
+    /// precedence applied). Mode `passthrough` and `mutate` disable rebuild;
+    /// `rebuild` / `rebuild-kernel` enable with the corresponding ledger tag.
+    pub fn from_resolved(cfg: &crate::config::Config) -> Self {
+        use crate::config::Mode;
+        let (enabled, mode_tag) = match cfg.mode.value {
+            Mode::Rebuild => (true, "rebuild_local"),
+            Mode::RebuildKernel => (true, "rebuild_kernel"),
+            Mode::Passthrough | Mode::Mutate => (false, "rebuild_local"),
+        };
+        Self {
+            enabled,
+            mode_tag: mode_tag.to_string(),
+            max_native_tool_summary: 50,
+            max_user_intent_thread: 10,
+            live_envelope_override: None,
+            transcript_tail_summary: None,
+            recent_assistant_digests: None,
+        }
+    }
 }
 
 /// Outcome of [`apply_rebuild`].
@@ -318,6 +342,333 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
 ///
 /// Idempotent. Pure data transform. Safe to run on any messages array,
 /// including byte-passthrough modes.
+/// Outcome of [`enforce_soft_cap`]. Captures which reduction tiers fired
+/// and how many bytes each recovered.
+///
+/// Tier A — ejected tool_result content above the per-result threshold.
+/// Tier B — pruned oldest in-flight tool_use/tool_result pairs as a unit.
+/// Tier C — dropped tool definitions not referenced by any in-flight `tool_use`.
+/// Tier D — exhausted: caller should return 413 with the reduction log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReductionReport {
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// Number of `tool_result` content bodies ejected in Tier A.
+    pub tier_a_ejected: usize,
+    /// Total bytes recovered by Tier A ejections.
+    pub tier_a_bytes_recovered: u64,
+    /// Number of in-flight pair tuples (tool_use + tool_result) pruned in Tier B.
+    pub tier_b_pairs_pruned: usize,
+    /// Number of unreferenced tool definitions dropped in Tier C.
+    pub tier_c_tools_dropped: usize,
+    /// True when the cap could not be reached. Caller should 413.
+    pub irreducible: bool,
+}
+
+impl ReductionReport {
+    pub fn applied_any(&self) -> bool {
+        self.tier_a_ejected > 0
+            || self.tier_b_pairs_pruned > 0
+            || self.tier_c_tools_dropped > 0
+            || self.irreducible
+    }
+}
+
+/// Ejection threshold: only `tool_result` content bodies above this size
+/// are candidates for Tier A. Smaller results stay inline so the model
+/// doesn't lose useful context on small payloads.
+pub const TIER_A_EJECTION_THRESHOLD: usize = 100 * 1024;
+
+/// Progressive reduction pipeline: trim a request body until it fits
+/// under `soft_cap_bytes`. Runs four tiers (see [`ReductionReport`]) in
+/// order, stopping as soon as the body is under the cap.
+///
+/// The function MUST preserve Anthropic's `tool_use` → `tool_result`
+/// pairing invariant on the in-flight chain. Tier A replaces content
+/// bytes but keeps the `tool_use_id` link. Tier B removes pair tuples
+/// together so neither side is orphaned. Tier C only drops `tools[]`
+/// entries with names not referenced by any in-flight `tool_use` block.
+///
+/// When `soft_cap_bytes == 0` the cap is disabled and this function
+/// returns a no-op report immediately.
+pub fn enforce_soft_cap(value: &mut Value, soft_cap_bytes: u64) -> ReductionReport {
+    let mut report = ReductionReport::default();
+    report.bytes_before = current_body_size(value);
+    report.bytes_after = report.bytes_before;
+    if soft_cap_bytes == 0 || report.bytes_before <= soft_cap_bytes {
+        return report;
+    }
+
+    // ── Tier A — eject large tool_result content bodies ────────────────
+    eject_large_tool_results(value, soft_cap_bytes, &mut report);
+    report.bytes_after = current_body_size(value);
+    if report.bytes_after <= soft_cap_bytes {
+        return report;
+    }
+
+    // ── Tier B — prune oldest in-flight tool_use/tool_result pairs ─────
+    prune_oldest_inflight_pairs(value, soft_cap_bytes, &mut report);
+    report.bytes_after = current_body_size(value);
+    if report.bytes_after <= soft_cap_bytes {
+        return report;
+    }
+
+    // ── Tier C — drop unreferenced tool definitions ────────────────────
+    drop_unreferenced_tools(value, &mut report);
+    report.bytes_after = current_body_size(value);
+    if report.bytes_after <= soft_cap_bytes {
+        return report;
+    }
+
+    // ── Tier D — surrender. Caller MUST 413. ───────────────────────────
+    report.irreducible = true;
+    report
+}
+
+fn current_body_size(value: &Value) -> u64 {
+    serde_json::to_string(value).map(|s| s.len()).unwrap_or(0) as u64
+}
+
+fn eject_large_tool_results(value: &mut Value, soft_cap_bytes: u64, report: &mut ReductionReport) {
+    // Collect (msg_idx, block_idx, size) for every tool_result content
+    // body above the ejection threshold, sorted descending by size.
+    let mut candidates: Vec<(usize, usize, usize)> = Vec::new();
+    if let Some(msgs) = value.get("messages").and_then(|m| m.as_array()) {
+        for (mi, msg) in msgs.iter().enumerate() {
+            let Some(arr) = msg.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for (bi, block) in arr.iter().enumerate() {
+                if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                    continue;
+                }
+                let content_size = block
+                    .get("content")
+                    .map(|c| serde_json::to_string(c).map(|s| s.len()).unwrap_or(0))
+                    .unwrap_or(0);
+                if content_size >= TIER_A_EJECTION_THRESHOLD {
+                    candidates.push((mi, bi, content_size));
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.2));
+
+    for (mi, bi, original_size) in candidates {
+        if current_body_size(value) <= soft_cap_bytes {
+            break;
+        }
+        let stub_text = format!(
+            "[ejected by ostk-cache soft-cap: {} → 60b. Re-run the call if needed.]",
+            crate::fmt_bytes(original_size as u64)
+        );
+        let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            break;
+        };
+        let Some(msg) = messages.get_mut(mi) else { break };
+        let Some(arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
+            continue;
+        };
+        let Some(block) = arr.get_mut(bi) else { continue };
+        let Some(obj) = block.as_object_mut() else { continue };
+        obj.insert(
+            "content".to_string(),
+            serde_json::json!([{"type": "text", "text": stub_text}]),
+        );
+        report.tier_a_ejected += 1;
+        report.tier_a_bytes_recovered += original_size as u64;
+    }
+}
+
+fn prune_oldest_inflight_pairs(
+    value: &mut Value,
+    soft_cap_bytes: u64,
+    report: &mut ReductionReport,
+) {
+    // Iterate from the second assistant message forward, dropping
+    // (assistant tool_use msg, paired user tool_result msg) tuples
+    // together. Keep the last pair so the model has at least one
+    // round-trip of in-flight context.
+    loop {
+        if current_body_size(value) <= soft_cap_bytes {
+            break;
+        }
+        let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+            break;
+        };
+
+        // Find the first assistant-tool-use → user-tool-result pair.
+        // Skip the first message (synthetic / real user message) and
+        // skip the LAST pair to retain context for the model.
+        let mut prune_idx: Option<usize> = None;
+        let len = messages.len();
+        for i in 1..len.saturating_sub(2) {
+            let is_assistant_tool_use = messages
+                .get(i)
+                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                == Some("assistant")
+                && message_contains_tool_use(&messages[i]);
+            let is_user_tool_result = messages
+                .get(i + 1)
+                .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+                == Some("user")
+                && message_only_tool_results(&messages[i + 1]);
+            if is_assistant_tool_use && is_user_tool_result {
+                prune_idx = Some(i);
+                break;
+            }
+        }
+        let Some(i) = prune_idx else { break };
+        messages.drain(i..=i + 1);
+        report.tier_b_pairs_pruned += 1;
+    }
+}
+
+fn message_contains_tool_use(msg: &Value) -> bool {
+    msg.get("content")
+        .and_then(|c| c.as_array())
+        .map(|arr| {
+            arr.iter()
+                .any(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+        })
+        .unwrap_or(false)
+}
+
+fn message_only_tool_results(msg: &Value) -> bool {
+    match msg.get("content") {
+        Some(Value::Array(arr)) if !arr.is_empty() => arr.iter().all(|b| {
+            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+        }),
+        _ => false,
+    }
+}
+
+fn drop_unreferenced_tools(value: &mut Value, report: &mut ReductionReport) {
+    // Collect tool names actually invoked by any in-flight assistant
+    // `tool_use` block. Conservative: never drop tools that appear in
+    // active calls. If `tools` is absent or not an array, no-op.
+    let referenced: std::collections::HashSet<String> = value
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|msgs| {
+            let mut set = std::collections::HashSet::new();
+            for msg in msgs {
+                let Some(arr) = msg.get("content").and_then(|c| c.as_array()) else {
+                    continue;
+                };
+                for block in arr {
+                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                        && let Some(name) = block.get("name").and_then(|n| n.as_str())
+                    {
+                        set.insert(name.to_string());
+                    }
+                }
+            }
+            set
+        })
+        .unwrap_or_default();
+
+    let Some(tools) = value.get_mut("tools").and_then(|t| t.as_array_mut()) else {
+        return;
+    };
+    let before = tools.len();
+    tools.retain(|t| {
+        t.get("name")
+            .and_then(|n| n.as_str())
+            .map(|n| referenced.contains(n))
+            .unwrap_or(true) // unnamed tools (shouldn't happen) → keep
+    });
+    let after = tools.len();
+    report.tier_c_tools_dropped = before.saturating_sub(after);
+}
+
+/// Per-section byte sizes of a `/v1/messages` request body. Returned by
+/// [`section_sizes`] for the per-turn telemetry line and for soft-cap
+/// diagnostics.
+///
+/// `synthetic` is the size of the first user message in the messages
+/// array (which, post-rebuild, holds the synthesized kernel-projection
+/// context). When rebuild didn't apply this turn, `synthetic` is 0 and
+/// its bytes are folded into `in_flight`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SectionSizes {
+    pub system: u64,
+    pub tools: u64,
+    pub synthetic: u64,
+    pub in_flight: u64,
+}
+
+impl SectionSizes {
+    pub fn total(&self) -> u64 {
+        self.system + self.tools + self.synthetic + self.in_flight
+    }
+
+    /// Largest section name + size — used by the soft-cap 413 hint
+    /// and the indented breakdown when one section dominates.
+    pub fn dominant(&self) -> (&'static str, u64) {
+        let mut max = ("system", self.system);
+        for (n, v) in [
+            ("tools", self.tools),
+            ("synthetic", self.synthetic),
+            ("in_flight", self.in_flight),
+        ] {
+            if v > max.1 {
+                max = (n, v);
+            }
+        }
+        max
+    }
+}
+
+/// Compute byte sizes of the four major sections of an Anthropic
+/// `/v1/messages` request body.
+///
+/// `synthetic_present` should be true iff rebuild applied this turn
+/// (the first message in `messages[]` is the synthesized context).
+/// When false, the first message is a normal user turn and contributes
+/// to `in_flight`.
+///
+/// Implementation: re-serializes each section to JSON to get its
+/// wire-level size. This matches what gets sent upstream. The proxy
+/// pays this serialization cost once per turn, on a value tree it
+/// already parsed — net negligible.
+pub fn section_sizes(value: &Value, synthetic_present: bool) -> SectionSizes {
+    let system = value
+        .get("system")
+        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+        .unwrap_or(0) as u64;
+    let tools = value
+        .get("tools")
+        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+        .unwrap_or(0) as u64;
+    let (synthetic, in_flight) = match value.get("messages").and_then(|m| m.as_array()) {
+        Some(msgs) if !msgs.is_empty() && synthetic_present => {
+            let syn = serde_json::to_string(&msgs[0])
+                .map(|s| s.len())
+                .unwrap_or(0) as u64;
+            let rest: u64 = msgs[1..]
+                .iter()
+                .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0) as u64)
+                .sum();
+            (syn, rest)
+        }
+        Some(msgs) => {
+            let rest: u64 = msgs
+                .iter()
+                .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0) as u64)
+                .sum();
+            (0u64, rest)
+        }
+        None => (0, 0),
+    };
+    SectionSizes {
+        system,
+        tools,
+        synthetic,
+        in_flight,
+    }
+}
+
 pub fn repair_orphaned_tool_results(messages: &mut Vec<Value>) -> usize {
     let mut stripped: usize = 0;
 
@@ -798,7 +1149,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     let mut out: String = s.chars().take(max_chars).collect();
-    out.push_str("…");
+    out.push('…');
     out
 }
 
@@ -845,24 +1196,24 @@ fn compose_synthetic_context(
         out.push('\n');
     }
 
-    if let Some(digests) = recent_assistant_digests {
-        if !digests.trim().is_empty() {
-            out.push_str(digests);
-            if !digests.ends_with('\n') {
-                out.push('\n');
-            }
+    if let Some(digests) = recent_assistant_digests
+        && !digests.trim().is_empty()
+    {
+        out.push_str(digests);
+        if !digests.ends_with('\n') {
             out.push('\n');
         }
+        out.push('\n');
     }
 
-    if let Some(tail) = transcript_tail_summary {
-        if !tail.trim().is_empty() {
-            out.push_str(tail);
-            if !tail.ends_with('\n') {
-                out.push('\n');
-            }
+    if let Some(tail) = transcript_tail_summary
+        && !tail.trim().is_empty()
+    {
+        out.push_str(tail);
+        if !tail.ends_with('\n') {
             out.push('\n');
         }
+        out.push('\n');
     }
 
     out.push_str("## Current cycle\n\nYour user's latest message follows immediately, along with any in-flight tool_use/tool_result chain from your response so far. Treat the projection above as authoritative state; do not assume content beyond it without recalling it.\n");
@@ -873,6 +1224,145 @@ fn compose_synthetic_context(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn section_sizes_breaks_down_request() {
+        let req = json!({
+            "system": [{"type": "text", "text": "SYS"}],
+            "tools": [{"name": "Bash"}, {"name": "Read"}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "synthetic projection"}]},
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            ],
+        });
+        let s = section_sizes(&req, true);
+        assert!(s.system > 0);
+        assert!(s.tools > 0);
+        assert!(s.synthetic > 0);
+        assert!(s.in_flight > 0);
+        assert_eq!(s.total(), s.system + s.tools + s.synthetic + s.in_flight);
+    }
+
+    #[test]
+    fn section_sizes_no_synthetic_folds_into_in_flight() {
+        let req = json!({
+            "system": "s",
+            "messages": [
+                {"role": "user", "content": "user msg"},
+                {"role": "assistant", "content": "reply"},
+            ],
+        });
+        let s = section_sizes(&req, false);
+        assert_eq!(s.synthetic, 0);
+        assert!(s.in_flight > 0);
+    }
+
+    #[test]
+    fn enforce_soft_cap_noop_when_under_cap() {
+        let mut req = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let r = enforce_soft_cap(&mut req, 10 * 1024 * 1024);
+        assert!(!r.applied_any());
+        assert_eq!(r.tier_a_ejected, 0);
+        assert_eq!(r.tier_b_pairs_pruned, 0);
+        assert!(!r.irreducible);
+    }
+
+    #[test]
+    fn enforce_soft_cap_noop_when_cap_zero() {
+        // Cap 0 means disabled — never trigger reductions even on huge bodies.
+        let blob = "x".repeat(2 * 1024 * 1024);
+        let mut req = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "tu_big",
+                    "content": [{"type": "text", "text": blob}]
+                }]
+            }],
+        });
+        let r = enforce_soft_cap(&mut req, 0);
+        assert!(!r.applied_any());
+    }
+
+    #[test]
+    fn tier_a_ejects_largest_tool_result_first() {
+        let big = "x".repeat(2 * 1024 * 1024); // 2MB
+        let medium = "y".repeat(512 * 1024); // 512KB — also above 100KB threshold
+        let small = "z".repeat(50 * 1024); // 50KB — below threshold
+
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "kick"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_big", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "tu_med", "name": "Read", "input": {}},
+                    {"type": "tool_use", "id": "tu_small", "name": "Read", "input": {}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_big",
+                        "content": [{"type": "text", "text": big}]},
+                    {"type": "tool_result", "tool_use_id": "tu_med",
+                        "content": [{"type": "text", "text": medium}]},
+                    {"type": "tool_result", "tool_use_id": "tu_small",
+                        "content": [{"type": "text", "text": small}]},
+                ]},
+            ],
+        });
+
+        // Soft cap 1MB → must eject "big" (and likely "medium" too) but
+        // preserve "small". Even after ejecting, pairings stay intact.
+        let r = enforce_soft_cap(&mut req, 1024 * 1024);
+        assert!(r.tier_a_ejected >= 1, "expected ≥1 ejection, got {}", r.tier_a_ejected);
+        assert!(!r.irreducible, "should not be irreducible after Tier A");
+        assert!(r.tier_a_bytes_recovered >= 2 * 1024 * 1024);
+
+        // Find the big result and verify it's a stub now.
+        let msgs = req["messages"].as_array().unwrap();
+        let big_result = msgs[2]["content"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            big_result.starts_with("[ejected"),
+            "tu_big should be ejected, got: {}",
+            &big_result[..big_result.len().min(80)]
+        );
+        // Small result stayed inline.
+        let small_result = msgs[2]["content"][2]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(small_result.len(), 50 * 1024);
+    }
+
+    #[test]
+    fn tier_a_preserves_tool_use_id_pairing() {
+        let blob = "x".repeat(500 * 1024);
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "kick"}]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_42", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_42",
+                        "content": [{"type": "text", "text": blob}]}
+                ]},
+            ],
+        });
+        let _r = enforce_soft_cap(&mut req, 50 * 1024);
+        let ejected_id = req["messages"][2]["content"][0]["tool_use_id"].as_str().unwrap();
+        assert_eq!(ejected_id, "tu_42", "tool_use_id must survive Tier A");
+    }
+
+    #[test]
+    fn tier_d_irreducible_on_oversized_system() {
+        // System prompt is not reducible. Even after Tier A/B/C fail to
+        // help, enforce_soft_cap should return irreducible=true.
+        let sys = "S".repeat(2 * 1024 * 1024);
+        let mut req = json!({
+            "system": sys,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let r = enforce_soft_cap(&mut req, 100 * 1024);
+        assert!(r.irreducible, "huge system prompt should be irreducible");
+    }
 
     #[test]
     fn finds_cycle_boundary_at_last_real_user_message() {
@@ -2051,5 +2541,32 @@ mod tests {
         let ttls = vec!["5m".to_string(), "1h".to_string(), "5m".to_string()];
         // last_1h = 1, first_5m = 0 → 1 >= 0 → Err.
         assert!(verify_ttl_ordering(&ttls).is_err());
+    }
+
+    #[test]
+    fn test_tier_c_drops_unreferenced_tools() {
+        let mut value = serde_json::json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "use tool1"},
+                        {"type": "tool_use", "id": "u1", "name": "tool1", "input": {}}
+                    ]
+                }
+            ],
+            "tools": [
+                {"name": "tool1", "description": "desc1", "input_schema": {}},
+                {"name": "tool2", "description": "desc2", "input_schema": {}}
+            ]
+        });
+
+        let mut report = ReductionReport::default();
+        drop_unreferenced_tools(&mut value, &mut report);
+
+        let tools = value["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "tool1");
+        assert_eq!(report.tier_c_tools_dropped, 1);
     }
 }

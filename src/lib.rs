@@ -1,3 +1,4 @@
+pub mod config;
 pub mod cycle_digest;
 pub mod kernel_client;
 pub mod rebuild;
@@ -380,6 +381,23 @@ pub fn default_amp_mode() -> String {
     "mutate".to_string()
 }
 
+/// Wire-level size measurements for one request/response round-trip.
+///
+/// Captured at three points in the proxy:
+/// - `req_bytes_in`: raw inbound request body (handler entry)
+/// - `req_bytes_out`: post-rewrite outbound body (right before forward)
+/// - `resp_bytes`: accumulated response body bytes from upstream
+///
+/// `None` means "not captured" (rare — only on accounting paths that
+/// run before the size is known); old ledger rows persisted before
+/// these fields existed deserialize as `None` via serde default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SizeMetrics {
+    pub req_bytes_in: Option<u64>,
+    pub req_bytes_out: Option<u64>,
+    pub resp_bytes: Option<u64>,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct AmpRow {
     pub session: SessionId,
@@ -405,21 +423,64 @@ pub struct AmpRow {
     /// without this field default to "mutate" via `default_amp_mode`.
     #[serde(default = "default_amp_mode")]
     pub mode: String,
+    /// Raw inbound request body size in bytes. `None` on rows written
+    /// before the size-metrics columns existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_bytes_in: Option<u64>,
+    /// Outbound request body size in bytes (after rebuild/rewrite/reduce
+    /// passes). `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_bytes_out: Option<u64>,
+    /// Accumulated upstream response body size in bytes. `None` on
+    /// legacy rows or stream-failed turns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resp_bytes: Option<u64>,
+    /// Byte size of the system prompt section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_bytes: Option<u64>,
+    /// Byte size of the tools definitions section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_bytes: Option<u64>,
+    /// Byte size of the synthetic cycle state section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthetic_bytes: Option<u64>,
+    /// Byte size of the in-flight user thread section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight_bytes: Option<u64>,
+    /// Number of tool_result content bodies ejected in Tier A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_a_ejected: Option<usize>,
+    /// Number of in-flight pair tuples pruned in Tier B.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_b_pairs_pruned: Option<usize>,
+    /// Number of unreferenced tool definitions dropped in Tier C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_c_tools_dropped: Option<usize>,
+    /// True when the cap could not be reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irreducible: Option<bool>,
 }
 
-pub fn account(
-    usage: &ProviderUsage,
-    session: SessionId,
-    workspace_id: String,
-    firmware_bytes: usize,
-    state_bytes: usize,
-    hot_count: usize,
-    mode: &str,
-) -> AmpRow {
-    let amp_ratio = if usage.input_tokens == 0 {
+/// Inputs for accounting a single request/response turn.
+pub struct AccountInput<'a> {
+    pub usage: &'a ProviderUsage,
+    pub session: SessionId,
+    pub workspace_id: String,
+    pub firmware_bytes: usize,
+    pub state_bytes: usize,
+    pub hot_count: usize,
+    pub mode: &'a str,
+    pub sizes: SizeMetrics,
+    pub sections: Option<rebuild::SectionSizes>,
+    pub reduction: Option<rebuild::ReductionReport>,
+}
+
+pub fn account(input: AccountInput) -> AmpRow {
+    let amp_ratio = if input.usage.input_tokens == 0 {
         1.0
     } else {
-        (usage.cache_read_tokens + usage.input_tokens) as f64 / usage.input_tokens as f64
+        (input.usage.cache_read_tokens + input.usage.input_tokens) as f64
+            / input.usage.input_tokens as f64
     };
 
     let timestamp = std::time::SystemTime::now()
@@ -428,17 +489,28 @@ pub fn account(
         .as_secs();
 
     AmpRow {
-        session,
-        workspace_id,
-        input_tokens_total: usage.input_tokens,
-        cache_read_tokens: usage.cache_read_tokens,
-        cache_create_tokens: usage.cache_create_tokens,
+        session: input.session,
+        workspace_id: input.workspace_id,
+        input_tokens_total: input.usage.input_tokens,
+        cache_read_tokens: input.usage.cache_read_tokens,
+        cache_create_tokens: input.usage.cache_create_tokens,
         amp_ratio,
-        firmware_bytes,
-        state_bytes,
-        hot_count,
+        firmware_bytes: input.firmware_bytes,
+        state_bytes: input.state_bytes,
+        hot_count: input.hot_count,
         timestamp,
-        mode: mode.to_string(),
+        mode: input.mode.to_string(),
+        req_bytes_in: input.sizes.req_bytes_in,
+        req_bytes_out: input.sizes.req_bytes_out,
+        resp_bytes: input.sizes.resp_bytes,
+        system_bytes: input.sections.map(|s| s.system),
+        tools_bytes: input.sections.map(|s| s.tools),
+        synthetic_bytes: input.sections.map(|s| s.synthetic),
+        in_flight_bytes: input.sections.map(|s| s.in_flight),
+        tier_a_ejected: input.reduction.as_ref().map(|r| r.tier_a_ejected),
+        tier_b_pairs_pruned: input.reduction.as_ref().map(|r| r.tier_b_pairs_pruned),
+        tier_c_tools_dropped: input.reduction.as_ref().map(|r| r.tier_c_tools_dropped),
+        irreducible: input.reduction.as_ref().map(|r| r.irreducible),
     }
 }
 
@@ -625,6 +697,22 @@ impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
     }
 }
 
+/// Render a byte count as a short, eyeballable string.
+///
+/// Examples: `512b`, `4.7KB`, `1.7MB`, `33.1MB`. Threshold at 10 KiB
+/// for KB vs raw bytes; threshold at 1 MiB for MB.
+pub fn fmt_bytes(n: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if (n as f64) >= MB {
+        format!("{:.1}MB", n as f64 / MB)
+    } else if n >= 10 * 1024 {
+        format!("{:.1}KB", n as f64 / KB)
+    } else {
+        format!("{}b", n)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,15 +808,18 @@ mod tests {
             cache_read_tokens: 200,
             cache_create_tokens: 50,
         };
-        let row = account(
-            &usage,
-            "sess_1".to_string(),
-            "ws_1".to_string(),
-            10,
-            20,
-            5,
-            "mutate",
-        );
+        let row = account(AccountInput {
+            usage: &usage,
+            session: "sess_1".to_string(),
+            workspace_id: "ws_1".to_string(),
+            firmware_bytes: 10,
+            state_bytes: 20,
+            hot_count: 5,
+            mode: "mutate",
+            sizes: SizeMetrics::default(),
+            sections: None,
+            reduction: None,
+        });
         assert_eq!(row.session, "sess_1");
         assert_eq!(row.workspace_id, "ws_1");
         assert_eq!(row.input_tokens_total, 100);
@@ -746,15 +837,18 @@ mod tests {
             cache_read_tokens: 200,
             cache_create_tokens: 50,
         };
-        let row = account(
-            &usage,
-            "sess_2".to_string(),
-            "ws_2".to_string(),
-            15,
-            25,
-            2,
-            "passthrough",
-        );
+        let row = account(AccountInput {
+            usage: &usage,
+            session: "sess_2".to_string(),
+            workspace_id: "ws_2".to_string(),
+            firmware_bytes: 15,
+            state_bytes: 25,
+            hot_count: 2,
+            mode: "passthrough",
+            sizes: SizeMetrics::default(),
+            sections: None,
+            reduction: None,
+        });
         assert_eq!(row.session, "sess_2");
         assert_eq!(row.workspace_id, "ws_2");
         assert_eq!(row.input_tokens_total, 0);
@@ -779,6 +873,93 @@ mod tests {
         let row: AmpRow = serde_json::from_str(legacy).expect("legacy row parses");
         assert_eq!(row.mode, "mutate");
         assert_eq!(row.session, "sess_legacy");
+    }
+
+    #[test]
+    fn test_amp_row_legacy_row_lacks_byte_columns() {
+        // Pre-size-metrics rows (no req_bytes_in / req_bytes_out /
+        // resp_bytes) must still parse. New columns deserialize as None.
+        let legacy = r#"{
+            "session": "sess_pre_bytes",
+            "workspace_id": "ws_pre",
+            "input_tokens_total": 5,
+            "cache_read_tokens": 0,
+            "cache_create_tokens": 0,
+            "amp_ratio": 1.0,
+            "firmware_bytes": 0,
+            "state_bytes": 0,
+            "hot_count": 0,
+            "timestamp": 1700000000,
+            "mode": "rebuild_local"
+        }"#;
+        let row: AmpRow = serde_json::from_str(legacy).expect("pre-bytes row parses");
+        assert!(row.req_bytes_in.is_none());
+        assert!(row.req_bytes_out.is_none());
+        assert!(row.resp_bytes.is_none());
+        assert!(row.system_bytes.is_none());
+    }
+
+    #[test]
+    fn test_amp_row_new_row_carries_byte_columns_round_trip() {
+        let row = account(AccountInput {
+            usage: &ProviderUsage {
+                input_tokens: 50,
+                cache_read_tokens: 4_000,
+                cache_create_tokens: 100,
+            },
+            session: "sess_new".to_string(),
+            workspace_id: "ws_new".to_string(),
+            firmware_bytes: 0,
+            state_bytes: 0,
+            hot_count: 0,
+            mode: "rebuild_local",
+            sizes: SizeMetrics {
+                req_bytes_in: Some(123_456),
+                req_bytes_out: Some(11_111),
+                resp_bytes: Some(7_777),
+            },
+            sections: Some(rebuild::SectionSizes {
+                system: 1000,
+                tools: 2000,
+                synthetic: 3000,
+                in_flight: 4000,
+            }),
+            reduction: Some(rebuild::ReductionReport {
+                bytes_before: 10000,
+                bytes_after: 5000,
+                tier_a_ejected: 1,
+                tier_a_bytes_recovered: 2000,
+                tier_b_pairs_pruned: 2,
+                tier_c_tools_dropped: 3,
+                irreducible: false,
+            }),
+        });
+        // skip_serializing_if = "Option::is_none" — values present must
+        // serialize, and parse round-trips back to Some(_).
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains("\"req_bytes_in\":123456"));
+        assert!(json.contains("\"req_bytes_out\":11111"));
+        assert!(json.contains("\"resp_bytes\":7777"));
+        assert!(json.contains("\"system_bytes\":1000"));
+        assert!(json.contains("\"tools_bytes\":2000"));
+        assert!(json.contains("\"synthetic_bytes\":3000"));
+        assert!(json.contains("\"in_flight_bytes\":4000"));
+        assert!(json.contains("\"tier_a_ejected\":1"));
+        assert!(json.contains("\"tier_b_pairs_pruned\":2"));
+        assert!(json.contains("\"tier_c_tools_dropped\":3"));
+        assert!(json.contains("\"irreducible\":false"));
+        let back: AmpRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.req_bytes_in, Some(123_456));
+        assert_eq!(back.req_bytes_out, Some(11_111));
+        assert_eq!(back.resp_bytes, Some(7_777));
+        assert_eq!(back.system_bytes, Some(1000));
+        assert_eq!(back.tools_bytes, Some(2000));
+        assert_eq!(back.synthetic_bytes, Some(3000));
+        assert_eq!(back.in_flight_bytes, Some(4000));
+        assert_eq!(back.tier_a_ejected, Some(1));
+        assert_eq!(back.tier_b_pairs_pruned, Some(2));
+        assert_eq!(back.tier_c_tools_dropped, Some(3));
+        assert_eq!(back.irreducible, Some(false));
     }
 
     fn git_init(dir: &Path) {

@@ -24,6 +24,7 @@ struct Args {
     /// - "rebuild_local" — Layer 1 standalone request rebuild.
     /// - "rebuild_kernel" — Layer 2 federated kernel-projection rebuild.
     /// - "all" — no filter (default).
+    ///
     /// Old rows persisted before the mode field existed parse as
     /// "mutate" via serde default.
     #[arg(long, default_value = "all")]
@@ -44,6 +45,16 @@ struct SessionStats {
     firmware_bytes: usize,
     state_bytes_sum: usize,
     last_hot_count: usize,
+    /// Sum of inbound request bytes across turns with the column populated.
+    bytes_in_total_sum: u64,
+    /// Sum of outbound request bytes (post-rewrite) across turns.
+    bytes_out_total_sum: u64,
+    /// Sum of upstream response bytes across turns.
+    resp_bytes_total_sum: u64,
+    /// Turns that carried byte columns. Used to compute
+    /// `bytes_reduction_ratio` (avg req_out / req_in over rows that have
+    /// both). Distinct from `turns` because old rows lack these fields.
+    bytes_turns: usize,
 }
 
 fn main() {
@@ -135,6 +146,15 @@ fn main() {
                 
                 entry.firmware_bytes = row.firmware_bytes;
                 entry.state_bytes_sum += row.state_bytes;
+
+                if let (Some(bi), Some(bo)) = (row.req_bytes_in, row.req_bytes_out) {
+                    entry.bytes_in_total_sum += bi;
+                    entry.bytes_out_total_sum += bo;
+                    entry.bytes_turns += 1;
+                }
+                if let Some(rb) = row.resp_bytes {
+                    entry.resp_bytes_total_sum += rb;
+                }
             }
     }
 
@@ -186,6 +206,12 @@ fn main() {
         let cache_create_f = stats.cache_create_total_sum as f64;
         let tokens_saved_input_eq = 0.9 * cache_read_f - 0.25 * cache_create_f;
 
+        let bytes_reduction_ratio = if stats.bytes_in_total_sum > 0 {
+            stats.bytes_out_total_sum as f64 / stats.bytes_in_total_sum as f64
+        } else {
+            1.0
+        };
+
         let result = serde_json::json!({
             "workspace_id": stats.workspace_id,
             "session_id": stats.session_id,
@@ -202,7 +228,12 @@ fn main() {
             "hot_pages_max": stats.hot_pages_max,
             "evictions": stats.evictions,
             "firmware_bytes": stats.firmware_bytes,
-            "state_bytes_mean": state_bytes_mean
+            "state_bytes_mean": state_bytes_mean,
+            "bytes_in_total": stats.bytes_in_total_sum,
+            "bytes_out_total": stats.bytes_out_total_sum,
+            "resp_bytes_total": stats.resp_bytes_total_sum,
+            "bytes_reduction_ratio": bytes_reduction_ratio,
+            "bytes_turns": stats.bytes_turns,
         });
 
         results.push(result);
@@ -214,10 +245,10 @@ fn main() {
         }
     } else if args.format == "csv"
         && !results.is_empty() {
-            println!("workspace_id,session_id,mode,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,cache_read_tokens_total,cache_create_tokens_total,input_tokens_total,tokens_saved_input_eq,hot_pages_max,evictions,firmware_bytes,state_bytes_mean");
+            println!("workspace_id,session_id,mode,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,cache_read_tokens_total,cache_create_tokens_total,input_tokens_total,tokens_saved_input_eq,hot_pages_max,evictions,firmware_bytes,state_bytes_mean,bytes_in_total,bytes_out_total,resp_bytes_total,bytes_reduction_ratio,bytes_turns");
             for res in results {
                 let obj = res.as_object().unwrap();
-                println!("{},{},{},{},{:.2},{:.2},{:.2},{:.4},{},{},{},{:.0},{},{},{},{:.2}",
+                println!("{},{},{},{},{:.2},{:.2},{:.2},{:.4},{},{},{},{:.0},{},{},{},{:.2},{},{},{},{:.4},{}",
                     obj["workspace_id"].as_str().unwrap_or(""),
                     obj["session_id"].as_str().unwrap_or(""),
                     obj["mode"].as_str().unwrap_or(""),
@@ -233,7 +264,12 @@ fn main() {
                     obj["hot_pages_max"],
                     obj["evictions"],
                     obj["firmware_bytes"],
-                    obj["state_bytes_mean"].as_f64().unwrap_or(0.0)
+                    obj["state_bytes_mean"].as_f64().unwrap_or(0.0),
+                    obj["bytes_in_total"],
+                    obj["bytes_out_total"],
+                    obj["resp_bytes_total"],
+                    obj["bytes_reduction_ratio"].as_f64().unwrap_or(1.0),
+                    obj["bytes_turns"],
                 );
             }
         }
