@@ -1,8 +1,8 @@
 # ostk-cache
 
-Drop-in **L1.5 caching proxy** for the Anthropic `/v1/messages` API. Sits between any Anthropic API client and `api.anthropic.com`, anchors long-lived context (system prompts, tool definitions, kernel orientation) into stable byte-boundaries that hit Anthropic's prompt cache, and ledgers per-turn cache efficiency for A/B analysis.
+Drop-in **L1.5 caching proxy** for Anthropic `/v1/messages`, with an OpenAI GPT adapter for `/v1/responses`. The Anthropic adapter anchors long-lived context (system prompts, tool definitions, kernel orientation) into stable byte-boundaries that hit Anthropic's prompt cache; the GPT adapter applies OpenAI prompt-cache routing knobs while preserving the provider-specific wire shape.
 
-Works with **any surface that lets you set `ANTHROPIC_BASE_URL`** — Claude Code, Codex, Cursor, custom MCP servers, internal harnesses, anything that speaks Anthropic's API. The proxy is transparent at the protocol layer (chunked HTTP, SSE streaming, multipart file uploads all forward verbatim where appropriate); only request bodies are rewritten for cache placement.
+Works with **any surface that lets you set a provider base URL** — Claude Code, Codex, Cursor, custom MCP servers, internal harnesses. The proxy is transparent at the protocol layer (chunked HTTP, SSE streaming, multipart file uploads all forward verbatim where appropriate); request-body rewrites are adapter-specific.
 
 ## Install
 
@@ -41,8 +41,8 @@ cargo build --release --bins
 # 1. Start the proxy
 ANTHROPIC_API_KEY=sk-ant-... ostk-cache
 # ostk-cache 0.3.1 listening on 127.0.0.1:8080
-#   mode=mutate  soft-cap=30MB  tail=off
-#   rewrite=on  kernel-timeout=500ms
+#   provider=anthropic  mode=mutate  soft-cap=30MB  tail=off
+#   rewrite=on  capture=off  kernel-timeout=500ms
 
 # 2. Point your agent surface at it
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8080
@@ -55,6 +55,7 @@ Common operator flags (see `ostk-cache --help` for the full list):
 
 ```bash
 ostk-cache --mode rebuild-kernel --soft-cap-mb 28 --tail-transcript
+ostk-cache --provider gpt --upstream https://api.openai.com
 ostk-cache --print-config           # show resolved config + source attribution
 ```
 
@@ -62,10 +63,12 @@ Every turn appends an `AmpRow` to `.ostk/memory/ledger.jsonl` in the proxy's cwd
 
 ## Modes
 
-The proxy has four mutation strategies, selected by `--mode` (or
+The Anthropic adapter has four mutation strategies, selected by `--mode` (or
 `OSTK_CACHE_REBUILD` / `OSTK_CACHE_PASSTHROUGH` env legacy, or the
 `mode = "…"` key in `.ostk/cache.toml`). All four ledger their
-accounting; only the request-body rewrite differs.
+accounting; only the Anthropic request-body rewrite differs. The GPT adapter
+uses `mode="gpt"` in the ledger and applies OpenAI prompt-cache parameters to
+`/v1/responses` requests.
 
 | `--mode`         | Ledger tag         | What it does to `messages[]`                                         |
 |------------------|--------------------|----------------------------------------------------------------------|
@@ -97,6 +100,7 @@ debugging "why is my flag being ignored?":
 
 ```
 port                       = 8089          (toml)
+provider                   = anthropic     (default)
 mode                       = rebuild-kernel(cli)
 soft_cap                   = 28MB          (toml)
 tail.transcript            = true          (env)
@@ -107,6 +111,7 @@ kernel.timeout_ms          = 250           (toml)
 A workspace `.ostk/cache.toml` looks like:
 
 ```toml
+provider = "anthropic"
 mode = "rebuild-kernel"
 port = 8089
 soft_cap_mb = 28
@@ -120,6 +125,10 @@ enabled = true
 
 [kernel]
 timeout_ms = 250
+
+[capture]
+http = false
+# dir = ".ostk/http-capture"
 ```
 
 ## Observability
@@ -142,6 +151,12 @@ Run with `--verbose` to keep the legacy multi-line per-pass output in
 addition to the one-liner.
 
 Ledger columns added: `req_bytes_in`, `req_bytes_out`, `resp_bytes`, `system_bytes`, `tools_bytes`, `synthetic_bytes`, `in_flight_bytes` (all `Option<u64>` — old rows without them deserialize as `null`). `ostk-cache-stats` aggregates them into `bytes_in_total`, `bytes_out_total`, `resp_bytes_total`, and `bytes_reduction_ratio`, providing a section-level view of where the bytes are spent across the entire session.
+
+For wire-body investigations, run with `--capture-http` to write one directory per proxied request under `.ostk/http-capture` by default. Each capture contains `request-in.body`, `request-out.body`, `response.body`, and `metadata.json` with status, byte counts, SHA-256 hashes, route path, and redacted auth headers. This is off by default; the normal proxy path only records byte/token metadata.
+
+## GPT adapter
+
+Run `ostk-cache --provider gpt` and point OpenAI-compatible clients at `/v1/responses` through the proxy. The GPT adapter preserves the caller's request shape, adds `prompt_cache_key` when absent, and adds `prompt_cache_retention = "24h"` for `gpt-5.5` requests when absent. Usage accounting reads OpenAI `usage.input_tokens_details.cached_tokens` into the shared ledger so cache hit rate can be compared with Anthropic runs.
 
 ## Soft cap
 
@@ -214,7 +229,9 @@ when set):
 | Variable                          | Default     | Purpose                                                |
 |-----------------------------------|-------------|--------------------------------------------------------|
 | `ANTHROPIC_API_KEY`               | *(required)*| Forwarded as `x-api-key` upstream.                     |
-| `ANTHROPIC_BASE_URL`              | `https://api.anthropic.com` | Upstream override (matches `--upstream`).|
+| `ANTHROPIC_BASE_URL`              | `https://api.anthropic.com` | Anthropic upstream override (matches `--upstream`).|
+| `OPENAI_BASE_URL`                 | `https://api.openai.com` | GPT upstream override when `--provider gpt`.       |
+| `OSTK_PROVIDER`                   | `anthropic`  | `anthropic` or `gpt` adapter selection.             |
 | `PROXY_PORT`                      | `8080`      | TCP port the proxy binds (matches `--port`).           |
 | `OSTK_CACHE_PASSTHROUGH`          | unset       | `1`/`true`/`yes` → byte-identical forward.             |
 | `OSTK_CACHE_REBUILD`              | unset       | `1` → standalone rebuild; `kernel` → federated.        |
@@ -224,6 +241,8 @@ when set):
 | `OSTK_CACHE_CLAUDE_PROJECTS_DIR`  | `~/.claude/projects` | Override transcript-tail source directory.    |
 | `OSTK_KERNEL_SOCKET`              | unset       | Pin explicit kernel socket path (skip cwd-walk).       |
 | `OSTK_REWRITE_ENABLED`            | `1`         | `0`/`false` → disable file-handle rewrite pass.        |
+| `OSTK_CAPTURE_HTTP`               | unset       | `1`/`true`/`yes` → capture request/response bodies.    |
+| `OSTK_CAPTURE_HTTP_DIR`           | `<cwd>/.ostk/http-capture` | Override capture output directory.       |
 | `OSTK_DIR`                        | `<cwd>/.ostk` if exists | Workspace `.ostk/` for file-handle cache.  |
 
 ## Workspace identity
@@ -241,6 +260,12 @@ The first 16 hex chars become the workspace_id used in `hooks.jsonl` rows.
 ```
 .ostk/memory/
   ledger.jsonl              append-only AmpRow log (cache hits, token usage, mode tag)
+.ostk/http-capture/
+  <request-id>/             opt-in full-body capture (`--capture-http`)
+    request-in.body
+    request-out.body
+    response.body
+    metadata.json
 .l1.5/
   workspace-id              optional explicit workspace identifier
   hooks.jsonl               session lifecycle events (rotated hourly to .gz)

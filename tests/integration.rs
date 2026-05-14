@@ -360,6 +360,34 @@ async fn write_usage_response(stream: &mut tokio::net::TcpStream, input_tokens: 
     let _ = stream.shutdown().await;
 }
 
+async fn write_openai_usage_response(
+    stream: &mut tokio::net::TcpStream,
+    input_tokens: u64,
+    cached_tokens: u64,
+) {
+    let body = json!({
+        "id": "resp_test",
+        "object": "response",
+        "status": "completed",
+        "model": "gpt-5.5",
+        "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}],
+        "usage": {
+            "input_tokens": input_tokens,
+            "output_tokens": 1,
+            "total_tokens": input_tokens + 1,
+            "input_tokens_details": {"cached_tokens": cached_tokens}
+        }
+    })
+    .to_string();
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(resp.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
 /// Spawn the proxy binary with the given env, optional cwd, and wait briefly
 /// for it to be listening. Caller must kill/wait on the returned Child.
 ///
@@ -370,10 +398,22 @@ fn spawn_proxy(
     upstream_url: &str,
     cwd: Option<&std::path::Path>,
 ) -> std::process::Child {
+    spawn_proxy_with_env(proxy_port, upstream_url, cwd, &[])
+}
+
+fn spawn_proxy_with_env(
+    proxy_port: u16,
+    upstream_url: &str,
+    cwd: Option<&std::path::Path>,
+    envs: &[(&str, &str)],
+) -> std::process::Child {
     let bin = env!("CARGO_BIN_EXE_ostk-cache");
     let mut cmd = Command::new(bin);
     cmd.env("PROXY_PORT", proxy_port.to_string())
         .env("ANTHROPIC_BASE_URL", upstream_url);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     if let Some(p) = cwd {
         cmd.current_dir(p);
     }
@@ -392,6 +432,172 @@ async fn wait_for_proxy(port: u16, timeout_ms: u64) {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
+}
+
+#[tokio::test]
+async fn gpt_adapter_adds_cache_knobs_and_records_cached_usage() {
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let proxy_port = 8108;
+    let mut proxy = spawn_proxy_with_env(
+        proxy_port,
+        &upstream_url,
+        Some(tmp.path()),
+        &[("OSTK_PROVIDER", "gpt"), ("OPENAI_BASE_URL", &upstream_url)],
+    );
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let proxy_url = format!("http://127.0.0.1:{}/v1/responses", proxy_port);
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&proxy_url)
+            .header("authorization", "Bearer secret")
+            .header("x-client-request-id", "gpt-session")
+            .json(&json!({
+                "model": "gpt-5.5",
+                "input": [{"role": "user", "content": "hello"}]
+            }))
+            .send()
+            .await
+            .expect("send gpt request");
+        let status = resp.status();
+        let _ = resp.bytes().await;
+        status
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let upstream_req = read_full_http_request(&mut up).await;
+    write_openai_usage_response(&mut up, 2006, 1920).await;
+    let status = req_task.await.unwrap();
+    assert_eq!(status.as_u16(), 200);
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let body_idx = find_subseq(&upstream_req, b"\r\n\r\n").expect("upstream req has body") + 4;
+    let body: serde_json::Value = serde_json::from_slice(&upstream_req[body_idx..]).unwrap();
+    assert_eq!(body["model"], json!("gpt-5.5"));
+    assert_eq!(body["prompt_cache_retention"], json!("24h"));
+    assert_eq!(
+        body["prompt_cache_key"].as_str().unwrap().starts_with("ostk:gpt:"),
+        true,
+        "prompt_cache_key should be generated from workspace identity: {}",
+        body
+    );
+
+    let ledger_path = tmp.path().join(".ostk/memory/ledger.jsonl");
+    let content = std::fs::read_to_string(&ledger_path)
+        .expect("ledger.jsonl should exist after completed gpt request");
+    let row: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert_eq!(row["session"], json!("gpt-session"));
+    assert_eq!(row["mode"], json!("gpt"));
+    assert_eq!(row["input_tokens_total"], json!(86));
+    assert_eq!(row["cache_read_tokens"], json!(1920));
+}
+
+#[tokio::test]
+async fn capture_http_writes_request_response_bodies_and_redacted_metadata() {
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let capture_dir = tmp.path().join("captures");
+    let capture_dir_str = capture_dir.to_string_lossy().to_string();
+    let proxy_port = 8107;
+    let mut proxy = spawn_proxy_with_env(
+        proxy_port,
+        &upstream_url,
+        Some(tmp.path()),
+        &[
+            ("OSTK_CAPTURE_HTTP", "1"),
+            ("OSTK_CAPTURE_HTTP_DIR", &capture_dir_str),
+            ("OSTK_CACHE_PASSTHROUGH", "1"),
+        ],
+    );
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let req_body = serde_json::to_vec(&json!({
+        "system": "capture system",
+        "messages": [{"role": "user", "content": "capture me"}]
+    }))
+    .unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}/v1/messages", proxy_port);
+    let req_body_for_client = req_body.clone();
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&proxy_url)
+            .header("x-api-key", "secret-key")
+            .header("anthropic-session-id", "capture-session")
+            .header("content-type", "application/json")
+            .body(req_body_for_client)
+            .send()
+            .await
+            .expect("send capture request");
+        let status = resp.status();
+        let _ = resp.bytes().await;
+        status
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let upstream_req = read_full_http_request(&mut up).await;
+    write_usage_response(&mut up, 12).await;
+    let status = req_task.await.unwrap();
+    assert_eq!(status.as_u16(), 200);
+
+    let mut metadata_path = None;
+    for _ in 0..100 {
+        if let Ok(entries) = std::fs::read_dir(&capture_dir) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("metadata.json");
+                if candidate.exists() {
+                    metadata_path = Some(candidate);
+                    break;
+                }
+            }
+        }
+        if metadata_path.is_some() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let metadata_path = metadata_path.expect("capture metadata should be written");
+    let capture_request_dir = metadata_path.parent().unwrap();
+    assert_eq!(
+        std::fs::read(capture_request_dir.join("request-in.body")).unwrap(),
+        req_body
+    );
+    assert_eq!(
+        std::fs::read(capture_request_dir.join("request-out.body")).unwrap(),
+        req_body,
+        "passthrough capture should preserve the exact outbound body"
+    );
+    let response_body = std::fs::read_to_string(capture_request_dir.join("response.body")).unwrap();
+    assert!(response_body.contains("\"usage\""), "response body should be captured: {}", response_body);
+
+    let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(metadata["session"], json!("capture-session"));
+    assert_eq!(metadata["status"], json!(200));
+    assert_eq!(metadata["request_in"]["bytes"], json!(req_body.len() as u64));
+    assert!(
+        metadata["request_headers"].as_array().unwrap().iter().any(|h| {
+            h["name"] == json!("x-api-key") && h["value"] == json!("[redacted]")
+        }),
+        "x-api-key must be redacted in metadata: {}",
+        metadata
+    );
+
+    let body_idx = find_subseq(&upstream_req, b"\r\n\r\n").expect("upstream req has body") + 4;
+    assert_eq!(&upstream_req[body_idx..], req_body.as_slice());
 }
 
 // ---------------------------------------------------------------------------

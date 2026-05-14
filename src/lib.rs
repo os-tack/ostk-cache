@@ -1,11 +1,13 @@
 pub mod config;
 pub mod cycle_digest;
+pub mod http_capture;
 pub mod kernel_client;
 pub mod rebuild;
 pub mod rewrite_middleware;
 pub mod standalone;
 pub mod transcript_tail;
 
+pub use ostk_cache_core::usage::ProviderUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Digest;
@@ -366,12 +368,6 @@ pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
     }
 
     fallback
-}
-
-pub struct ProviderUsage {
-    pub input_tokens: usize,
-    pub cache_read_tokens: usize,
-    pub cache_create_tokens: usize,
 }
 
 /// Default value for `AmpRow.mode` when deserializing rows persisted before

@@ -5,6 +5,9 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/os-tack/ostk-cache"
 
+[workspace]
+members = ["crates/ostk-cache-core"]
+
 [dependencies]
 # Membrane crates from os-tack/haystack (private repo). Resolved via git-dep
 # pinned to per-crate tags so a CI runner without a local haystack checkout
@@ -23,6 +26,7 @@ ostk-page = { git = "https://github.com/os-tack/haystack.git", package = "ostk-p
 # membrane — kernel and ostk-cache both reach the same numbers when
 # deciding whether to add a cache breakpoint.
 ostk-abi = { git = "https://github.com/os-tack/haystack.git", package = "ostk-abi", tag = "ostk-abi-v1.2.0" }
+ostk-cache-core = { path = "crates/ostk-cache-core" }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["full"] }

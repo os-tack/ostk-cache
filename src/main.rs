@@ -2,7 +2,7 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{OriginalUri, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, post},
@@ -16,6 +16,10 @@ use ostk_cache::{
     AccountInput, AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind,
     InMemoryPageTable, ProviderUsage, SessionId, SizeMetrics, account, fmt_bytes,
     persist_amp_row, project_hud,
+};
+use ostk_cache_core::{
+    http::{is_hop_by_hop_request_header, is_sse_content_type, should_forward_response_header},
+    usage::{UsageDialect, parse_usage},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -80,6 +84,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/v1/messages", post(handle_anthropic_message))
+        .route("/v1/responses", post(handle_openai_response))
         .route("/hook/event", post(handle_hook_event))
         .fallback(any(|| async { (StatusCode::NOT_FOUND, "Not Found") }))
         .with_state(state);
@@ -242,6 +247,14 @@ async fn handle_anthropic_message(
     let mut section_sizes_capture: Option<ostk_cache::rebuild::SectionSizes> = None;
     let mut reduction_report_capture: Option<ostk_cache::rebuild::ReductionReport> = None;
     let turn_started = std::time::Instant::now();
+    let mut http_capture = ostk_cache::http_capture::HttpCapture::maybe_start(
+        config.capture_http.value,
+        &config.capture_http_dir.value,
+        &session_id,
+        "/v1/messages",
+        &headers,
+        &body_bytes,
+    );
 
     // Build the rebuild config from the resolved Config; mode is the
     // canonical source for enabled+tag (CLI > env > toml > default).
@@ -534,6 +547,15 @@ async fn handle_anthropic_message(
                         },
                     })
                     .to_string();
+                    if let Some(capture) = http_capture.take() {
+                        capture.finish(
+                            StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                            false,
+                            &HeaderMap::new(),
+                            body.as_bytes(),
+                            turn_started.elapsed(),
+                        );
+                    }
                     return Ok((StatusCode::PAYLOAD_TOO_LARGE, body).into_response());
                 }
 
@@ -669,29 +691,29 @@ async fn handle_anthropic_message(
     };
 
     if parse_failed {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            json!({
-                "type": "error",
-                "error": {"type": "invalid_request_error", "message": "invalid JSON request body"}
-            })
-            .to_string(),
-        )
-            .into_response());
+        let body = json!({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "invalid JSON request body"}
+        })
+        .to_string();
+        if let Some(capture) = http_capture.take() {
+            capture.finish(
+                StatusCode::BAD_REQUEST.as_u16(),
+                false,
+                &HeaderMap::new(),
+                body.as_bytes(),
+                turn_started.elapsed(),
+            );
+        }
+        return Ok((StatusCode::BAD_REQUEST, body).into_response());
     }
 
     let client = reqwest::Client::new();
     let url = format!("{}/v1/messages", config.upstream.value);
     let mut req_builder = client.post(url);
 
-    let hop_by_hop = [
-        "host", "content-length", "transfer-encoding", "connection",
-        "keep-alive", "te", "trailer", "upgrade", "proxy-authorization",
-        "proxy-authenticate", "content-type", "accept-encoding",
-    ];
-
     for (k, v) in headers.iter() {
-        if !hop_by_hop.contains(&k.as_str()) {
+        if !is_hop_by_hop_request_header(k) {
             req_builder = req_builder.header(k, v);
         }
     }
@@ -699,18 +721,27 @@ async fn handle_anthropic_message(
     req_builder = req_builder.header("accept-encoding", "identity");
 
     let req_bytes_out = payload.len() as u64;
+    if let Some(capture) = http_capture.as_mut() {
+        capture.record_outbound(payload.as_bytes());
+    }
     let mut response = match req_builder.body(payload).send().await {
         Ok(r) => r,
         Err(e) => {
-            return Ok((
-                StatusCode::BAD_GATEWAY,
-                json!({
-                    "type": "error",
-                    "error": {"type": "upstream_error", "message": format!("{}", e)}
-                })
-                .to_string(),
-            )
-                .into_response());
+            let body = json!({
+                "type": "error",
+                "error": {"type": "upstream_error", "message": format!("{}", e)}
+            })
+            .to_string();
+            if let Some(capture) = http_capture.take() {
+                capture.finish(
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    false,
+                    &HeaderMap::new(),
+                    body.as_bytes(),
+                    turn_started.elapsed(),
+                );
+            }
+            return Ok((StatusCode::BAD_GATEWAY, body).into_response());
         }
     };
 
@@ -720,23 +751,17 @@ async fn handle_anthropic_message(
     let mut is_sse = false;
 
     for (k, v) in response.headers().iter() {
-        let key_lower = k.as_str().to_lowercase();
-        if key_lower == "transfer-encoding"
-            || key_lower == "connection"
-            || key_lower == "content-length"
-        {
+        if !should_forward_response_header(k) {
             continue;
         }
-        if key_lower == "content-type"
-            && v.to_str()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("text/event-stream")
+        if k.as_str().eq_ignore_ascii_case("content-type")
+            && is_sse_content_type(v)
         {
             is_sse = true;
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
+    let response_headers_capture = response.headers().clone();
 
     let session_id_clone = session_id.clone();
     // Capture rebuild-enabled state for the stream-side accounting
@@ -763,12 +788,17 @@ async fn handle_anthropic_message(
         }
 
         let resp_bytes_total = accumulated.len() as u64;
+        if let Some(capture) = http_capture.take() {
+            capture.finish(
+                status.as_u16(),
+                is_sse,
+                &response_headers_capture,
+                &accumulated,
+                turn_started.elapsed(),
+            );
+        }
 
-        let parsed_usage = if is_sse {
-            parse_usage_from_sse(&accumulated)
-        } else {
-            parse_usage_from_json(&accumulated)
-        };
+        let parsed_usage = parse_usage(UsageDialect::Anthropic, is_sse, &accumulated);
 
         // Layer 1 cycle digest harvest: scan the completed assistant
         // response for a `<turn-digest>{...}</turn-digest>` fence and
@@ -889,6 +919,221 @@ async fn handle_anthropic_message(
     Ok(resp_builder.body(body).unwrap())
 }
 
+async fn handle_openai_response(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
+    let amp_store = state.amp_store.clone();
+    let config = state.config.clone();
+    let req_bytes_in = body_bytes.len() as u64;
+    let turn_started = std::time::Instant::now();
+
+    let workspace = ostk_cache::Workspace::from_path(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    )
+    .unwrap_or_else(|_| ostk_cache::Workspace {
+        priority_hash: "unknown".to_string(),
+        source: ostk_cache::WorkspaceSource::Cwd,
+    });
+
+    let session_id = headers
+        .get("openai-session-id")
+        .or_else(|| headers.get("x-client-request-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let mut h = sha2::Sha256::new();
+            h.update(auth.as_bytes());
+            format!("{}:{}", workspace.priority_hash, &format!("{:x}", h.finalize())[..12])
+        });
+
+    let prior_amp = amp_store
+        .get(&session_id)
+        .map(|r| r.clone())
+        .unwrap_or_default();
+    let path = uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/v1/responses");
+    let mut http_capture = ostk_cache::http_capture::HttpCapture::maybe_start(
+        config.capture_http.value,
+        &config.capture_http_dir.value,
+        &session_id,
+        path,
+        &headers,
+        &body_bytes,
+    );
+
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let (payload, parse_failed) = optimize_openai_payload(&body_str, &workspace.priority_hash);
+    if parse_failed {
+        let body = json!({
+            "error": {"type": "invalid_request_error", "message": "invalid JSON request body"}
+        })
+        .to_string();
+        if let Some(capture) = http_capture.take() {
+            capture.finish(
+                StatusCode::BAD_REQUEST.as_u16(),
+                false,
+                &HeaderMap::new(),
+                body.as_bytes(),
+                turn_started.elapsed(),
+            );
+        }
+        return Ok((StatusCode::BAD_REQUEST, body).into_response());
+    }
+
+    let client = reqwest::Client::new();
+    let url = format!("{}{}", config.upstream.value, path);
+    let mut req_builder = client.post(url);
+    for (k, v) in headers.iter() {
+        if !is_hop_by_hop_request_header(k) {
+            req_builder = req_builder.header(k, v);
+        }
+    }
+    req_builder = req_builder.header("content-type", "application/json");
+    req_builder = req_builder.header("accept-encoding", "identity");
+
+    let req_bytes_out = payload.len() as u64;
+    if let Some(capture) = http_capture.as_mut() {
+        capture.record_outbound(payload.as_bytes());
+    }
+    let mut response = match req_builder.body(payload).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let body = json!({"error": {"type": "upstream_error", "message": format!("{}", e)}})
+                .to_string();
+            if let Some(capture) = http_capture.take() {
+                capture.finish(
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    false,
+                    &HeaderMap::new(),
+                    body.as_bytes(),
+                    turn_started.elapsed(),
+                );
+            }
+            return Ok((StatusCode::BAD_GATEWAY, body).into_response());
+        }
+    };
+
+    let status = response.status();
+    let mut resp_builder = Response::builder().status(status.as_u16());
+    let mut is_sse = false;
+    for (k, v) in response.headers().iter() {
+        if !should_forward_response_header(k) {
+            continue;
+        }
+        if k.as_str().eq_ignore_ascii_case("content-type") && is_sse_content_type(v) {
+            is_sse = true;
+        }
+        resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
+    }
+    let response_headers_capture = response.headers().clone();
+    let session_id_clone = session_id.clone();
+    let workspace_id = workspace.priority_hash.clone();
+
+    let stream = stream! {
+        let mut accumulated = Vec::<u8>::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if chunk.is_empty() {
+                continue;
+            }
+            accumulated.extend_from_slice(&chunk);
+            yield Ok::<_, std::io::Error>(chunk);
+        }
+
+        let resp_bytes_total = accumulated.len() as u64;
+        if let Some(capture) = http_capture.take() {
+            capture.finish(
+                status.as_u16(),
+                is_sse,
+                &response_headers_capture,
+                &accumulated,
+                turn_started.elapsed(),
+            );
+        }
+
+        let parsed_usage = parse_usage(UsageDialect::OpenAi, is_sse, &accumulated);
+        if let Some(usage) = &parsed_usage {
+            let row = account(AccountInput {
+                usage,
+                session: session_id_clone.clone(),
+                workspace_id: workspace_id.clone(),
+                firmware_bytes: 0,
+                state_bytes: 0,
+                hot_count: prior_amp.hot_count,
+                mode: "gpt",
+                sizes: SizeMetrics {
+                    req_bytes_in: Some(req_bytes_in),
+                    req_bytes_out: Some(req_bytes_out),
+                    resp_bytes: Some(resp_bytes_total),
+                },
+                sections: None,
+                reduction: None,
+            });
+            if let Err(e) = persist_amp_row(&row) {
+                eprintln!("[proxy] persist_amp_row error: {}", e);
+            }
+
+            let mut acc = amp_store.entry(session_id_clone.clone()).or_default();
+            let n = acc.turns_seen as f64;
+            acc.cumulative_amp_mean = (acc.cumulative_amp_mean * n + row.amp_ratio) / (n + 1.0);
+            acc.turns_seen += 1;
+            acc.stored_count = acc.turns_seen as usize;
+        }
+
+        emit_turn_line(
+            &session_id_clone,
+            "gpt",
+            req_bytes_in,
+            req_bytes_out,
+            resp_bytes_total,
+            parsed_usage.as_ref(),
+            None,
+            None,
+            None,
+            0,
+            None,
+            turn_started.elapsed(),
+        );
+    };
+
+    Ok(resp_builder.body(Body::from_stream(stream)).unwrap())
+}
+
+fn optimize_openai_payload(body: &str, workspace_hash: &str) -> (String, bool) {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (body.to_string(), true);
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return (body.to_string(), true);
+    };
+
+    let model = obj.get("model").and_then(|m| m.as_str()).unwrap_or("");
+    let is_gpt55 = model == "gpt-5.5" || model.starts_with("gpt-5.5-");
+    if is_gpt55 && !obj.contains_key("prompt_cache_retention") {
+        obj.insert("prompt_cache_retention".to_string(), json!("24h"));
+    }
+    if !obj.contains_key("prompt_cache_key") {
+        let short_workspace = &workspace_hash[..workspace_hash.len().min(16)];
+        obj.insert(
+            "prompt_cache_key".to_string(),
+            json!(format!("ostk:gpt:{}", short_workspace)),
+        );
+    }
+
+    match serde_json::to_string(&value) {
+        Ok(s) => (s, false),
+        Err(_) => (body.to_string(), false),
+    }
+}
+
 /// Short session prefix (first 6 chars) for the per-turn line. Sessions
 /// in the wild are 80+ char `<workspace>:<api-hash>` composites; the
 /// full string isn't useful in a tail-able log.
@@ -1001,72 +1246,3 @@ fn emit_turn_line(
     }
 }
 
-fn parse_usage_from_json(body: &[u8]) -> Option<ProviderUsage> {
-    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let usage = v.get("usage")?;
-    Some(ProviderUsage {
-        input_tokens: usage
-            .get("input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as usize,
-        cache_read_tokens: usage
-            .get("cache_read_input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as usize,
-        cache_create_tokens: usage
-            .get("cache_creation_input_tokens")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as usize,
-    })
-}
-
-fn parse_usage_from_sse(body: &[u8]) -> Option<ProviderUsage> {
-    let text = std::str::from_utf8(body).ok()?;
-    let mut current_event: Option<&str> = None;
-    let mut input_tokens = 0u64;
-    let mut cache_read = 0u64;
-    let mut cache_create = 0u64;
-    let mut found = false;
-
-    for line in text.lines() {
-        let line = line.trim_end_matches('\r');
-        if line.is_empty() {
-            current_event = None;
-        } else if let Some(rest) = line.strip_prefix("event: ") {
-            current_event = Some(rest);
-        } else if let Some(rest) = line.strip_prefix("data: ") {
-            let event = current_event.unwrap_or("");
-            if (event == "message_start" || event == "message_delta")
-                && let Ok(v) = serde_json::from_str::<serde_json::Value>(rest)
-            {
-                let usage = v
-                    .get("usage")
-                    .or_else(|| v.get("message").and_then(|m| m.get("usage")));
-                if let Some(u) = usage {
-                    if let Some(it) = u.get("input_tokens").and_then(|x| x.as_u64()) {
-                        input_tokens += it;
-                    }
-                    if let Some(cr) = u.get("cache_read_input_tokens").and_then(|x| x.as_u64()) {
-                        cache_read += cr;
-                    }
-                    if let Some(cc) = u
-                        .get("cache_creation_input_tokens")
-                        .and_then(|x| x.as_u64())
-                    {
-                        cache_create += cc;
-                    }
-                    found = true;
-                }
-            }
-        }
-    }
-    if found {
-        Some(ProviderUsage {
-            input_tokens: input_tokens as usize,
-            cache_read_tokens: cache_read as usize,
-            cache_create_tokens: cache_create as usize,
-        })
-    } else {
-        None
-    }
-}

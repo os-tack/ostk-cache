@@ -38,6 +38,22 @@ pub enum Mode {
     RebuildKernel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Provider {
+    Anthropic,
+    Gpt,
+}
+
+impl std::fmt::Display for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Provider::Anthropic => "anthropic",
+            Provider::Gpt => "gpt",
+        })
+    }
+}
+
 impl Mode {
     /// The legacy `AmpRow.mode` tag for this mode. Stable values written
     /// to `ledger.jsonl` — do NOT rename without a back-compat plan.
@@ -108,7 +124,7 @@ impl<T> Resolved<T> {
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "ostk-cache",
-    about = "Drop-in L1.5 caching proxy for the Anthropic /v1/messages API",
+    about = "L1.5 caching proxy for Anthropic /v1/messages and OpenAI /v1/responses APIs",
     long_about = None,
     version,
 )]
@@ -120,6 +136,10 @@ pub struct CliArgs {
     /// Upstream Anthropic API base URL.
     #[arg(long)]
     pub upstream: Option<String>,
+
+    /// Provider adapter to optimize for.
+    #[arg(long, value_enum)]
+    pub provider: Option<Provider>,
 
     /// Proxy operation mode. Default: mutate.
     #[arg(long, value_enum)]
@@ -165,6 +185,14 @@ pub struct CliArgs {
     #[arg(long, conflicts_with = "soft_cap_mb")]
     pub no_soft_cap: bool,
 
+    /// Capture full inbound request, outbound request, and upstream response bodies.
+    #[arg(long)]
+    pub capture_http: bool,
+
+    /// Directory for --capture-http output. Default: <cwd>/.ostk/http-capture.
+    #[arg(long)]
+    pub capture_http_dir: Option<PathBuf>,
+
     /// Verbose per-turn logging (multi-line breakdown instead of the
     /// single `[turn ...]` line).
     #[arg(long, short = 'v')]
@@ -188,6 +216,7 @@ pub struct CliArgs {
 struct FileConfig {
     port: Option<u16>,
     upstream: Option<String>,
+    provider: Option<Provider>,
     mode: Option<Mode>,
     soft_cap_mb: Option<u64>,
     #[serde(default)]
@@ -196,6 +225,8 @@ struct FileConfig {
     rewrite: RewriteFile,
     #[serde(default)]
     kernel: KernelFile,
+    #[serde(default)]
+    capture: CaptureFile,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -220,6 +251,13 @@ struct KernelFile {
     timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureFile {
+    http: Option<bool>,
+    dir: Option<PathBuf>,
+}
+
 fn load_file_config(path: &Path) -> Option<FileConfig> {
     let raw = std::fs::read_to_string(path).ok()?;
     match toml::from_str::<FileConfig>(&raw) {
@@ -241,6 +279,8 @@ fn load_file_config(path: &Path) -> Option<FileConfig> {
 
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_UPSTREAM: &str = "https://api.anthropic.com";
+pub const DEFAULT_OPENAI_UPSTREAM: &str = "https://api.openai.com";
+pub const DEFAULT_PROVIDER: Provider = Provider::Anthropic;
 pub const DEFAULT_MODE: Mode = Mode::Mutate;
 pub const DEFAULT_TAIL_LIMIT: usize = 50;
 pub const DEFAULT_KERNEL_TIMEOUT_MS: u64 = 500;
@@ -260,6 +300,7 @@ fn default_claude_projects_dir() -> PathBuf {
 pub struct Config {
     pub port: Resolved<u16>,
     pub upstream: Resolved<String>,
+    pub provider: Resolved<Provider>,
     pub mode: Resolved<Mode>,
     pub tail_transcript: Resolved<bool>,
     pub tail_limit: Resolved<usize>,
@@ -269,6 +310,8 @@ pub struct Config {
     pub kernel_socket: Resolved<Option<PathBuf>>,
     pub kernel_timeout_ms: Resolved<u64>,
     pub soft_cap_mb: Resolved<u64>,
+    pub capture_http: Resolved<bool>,
+    pub capture_http_dir: Resolved<PathBuf>,
     pub verbose: Resolved<bool>,
     pub config_path: Option<PathBuf>,
 }
@@ -303,12 +346,37 @@ impl Config {
             DEFAULT_PORT,
         );
 
+        // ---- provider --------------------------------------------------
+        let provider = {
+            let from_env = env_str("OSTK_PROVIDER").and_then(|v| {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "anthropic" => Some(Provider::Anthropic),
+                    "gpt" | "openai" => Some(Provider::Gpt),
+                    _ => None,
+                }
+            });
+            pick_value(
+                cli.provider,
+                from_env,
+                file.and_then(|f| f.provider),
+                DEFAULT_PROVIDER,
+            )
+        };
+
         // ---- upstream --------------------------------------------------
+        let upstream_env = match provider.value {
+            Provider::Anthropic => env_str("ANTHROPIC_BASE_URL"),
+            Provider::Gpt => env_str("OPENAI_BASE_URL").or_else(|| env_str("ANTHROPIC_BASE_URL")),
+        };
+        let upstream_default = match provider.value {
+            Provider::Anthropic => DEFAULT_UPSTREAM,
+            Provider::Gpt => DEFAULT_OPENAI_UPSTREAM,
+        };
         let upstream = pick_value(
             cli.upstream.clone(),
-            env_str("ANTHROPIC_BASE_URL"),
+            upstream_env,
             file.and_then(|f| f.upstream.clone()),
-            DEFAULT_UPSTREAM.to_string(),
+            upstream_default.to_string(),
         );
 
         // ---- mode (env reconstructs from legacy two-var combination) --
@@ -400,6 +468,20 @@ impl Config {
             DEFAULT_SOFT_CAP_MB,
         );
 
+        let capture_http = pick_value(
+            if cli.capture_http { Some(true) } else { None },
+            env_truthy("OSTK_CAPTURE_HTTP"),
+            file.and_then(|f| f.capture.http),
+            false,
+        );
+
+        let capture_http_dir = pick_value(
+            cli.capture_http_dir.clone(),
+            env_str("OSTK_CAPTURE_HTTP_DIR").map(PathBuf::from),
+            file.and_then(|f| f.capture.dir.clone()),
+            crate::http_capture::default_capture_dir(cwd),
+        );
+
         let verbose = pick_value(
             if cli.verbose { Some(true) } else { None },
             None,
@@ -410,6 +492,7 @@ impl Config {
         Self {
             port,
             upstream,
+            provider,
             mode,
             tail_transcript,
             tail_limit,
@@ -419,6 +502,8 @@ impl Config {
             kernel_socket,
             kernel_timeout_ms,
             soft_cap_mb,
+            capture_http,
+            capture_http_dir,
             verbose,
             config_path,
         }
@@ -435,6 +520,7 @@ impl Config {
         out.push_str(&cfg_line);
         out.push('\n');
         out.push_str(&row("port", &self.port.value, self.port.source));
+        out.push_str(&row("provider", &self.provider.value, self.provider.source));
         out.push_str(&row("upstream", &self.upstream.value, self.upstream.source));
         out.push_str(&row("mode", &self.mode.value, self.mode.source));
         out.push_str(&row(
@@ -474,6 +560,16 @@ impl Config {
             format!("{}MB", self.soft_cap_mb.value)
         };
         out.push_str(&row("soft_cap", &cap, self.soft_cap_mb.source));
+        out.push_str(&row(
+            "capture.http",
+            &self.capture_http.value,
+            self.capture_http.source,
+        ));
+        out.push_str(&row(
+            "capture.dir",
+            &self.capture_http_dir.value.display(),
+            self.capture_http_dir.source,
+        ));
         out.push_str(&row("verbose", &self.verbose.value, self.verbose.source));
         out
     }
@@ -490,12 +586,19 @@ impl Config {
         } else {
             "off".to_string()
         };
+        let capture = if self.capture_http.value {
+            format!("on ({})", self.capture_http_dir.value.display())
+        } else {
+            "off".to_string()
+        };
         format!(
-            "  mode={}  soft-cap={}  tail={}\n  rewrite={}  kernel-timeout={}ms",
+            "  provider={}  mode={}  soft-cap={}  tail={}\n  rewrite={}  capture={}  kernel-timeout={}ms",
+            self.provider.value,
             self.mode.value,
             cap,
             tail,
             if self.rewrite_enabled.value { "on" } else { "off" },
+            capture,
             self.kernel_timeout_ms.value,
         )
     }
@@ -555,6 +658,8 @@ mod tests {
         for k in [
             "PROXY_PORT",
             "ANTHROPIC_BASE_URL",
+            "OPENAI_BASE_URL",
+            "OSTK_PROVIDER",
             "OSTK_CACHE_PASSTHROUGH",
             "OSTK_CACHE_REBUILD",
             "OSTK_CACHE_TAIL_TRANSCRIPT",
@@ -564,6 +669,8 @@ mod tests {
             "OSTK_DIR",
             "OSTK_KERNEL_SOCKET",
             "OSTK_CACHE_KERNEL_TIMEOUT_MS",
+            "OSTK_CAPTURE_HTTP",
+            "OSTK_CAPTURE_HTTP_DIR",
         ] {
             unsafe { std::env::remove_var(k) };
         }
@@ -573,6 +680,7 @@ mod tests {
         CliArgs {
             port: None,
             upstream: None,
+            provider: None,
             mode: None,
             tail_transcript: false,
             no_tail_transcript: false,
@@ -584,6 +692,8 @@ mod tests {
             no_rewrite: false,
             soft_cap_mb: None,
             no_soft_cap: false,
+            capture_http: false,
+            capture_http_dir: None,
             verbose: false,
             config: None,
             print_config: false,
@@ -677,6 +787,21 @@ enabled = false
         assert_eq!(cfg.port.source, Source::Cli);
         assert_eq!(cfg.mode.value, Mode::Passthrough);
         assert_eq!(cfg.soft_cap_mb.value, 0);
+        clear_env();
+    }
+
+    #[test]
+    fn gpt_provider_uses_openai_upstream_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        unsafe { std::env::set_var("OSTK_PROVIDER", "gpt") };
+        unsafe { std::env::set_var("OPENAI_BASE_URL", "http://openai.test") };
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert_eq!(cfg.provider.value, Provider::Gpt);
+        assert_eq!(cfg.provider.source, Source::Env);
+        assert_eq!(cfg.upstream.value, "http://openai.test");
+        assert_eq!(cfg.upstream.source, Source::Env);
         clear_env();
     }
 
