@@ -374,17 +374,21 @@ async fn handle_anthropic_message(
                 let mut mutated = false;
 
                 // Pass A: strip Claude Code's volatile per-turn
-                // `cch=<hex>;` billing token from the system block
-                // (→1856 P1.B diagnostic). The token lives INSIDE
-                // the cache_control:1h ephemeral region and changes
-                // every turn, defeating prefix cache hits on
-                // everything downstream. Unconditional — applies to
-                // every mode. See src/billing_strip.rs for the full
-                // diagnostic narrative.
-                if ostk_cache::billing_strip::strip_volatile_billing_token(&mut value) {
+                // `cch=<hex>;` billing token from every string in the
+                // request body (→1856 P1.B diagnostic + Issue #40652
+                // full fix). The token lives INSIDE cache_control:1h
+                // ephemeral on system AND can be embedded in
+                // historical tool_result content the CLI rewrites
+                // every turn. Recursive walk covers both. Unconditional
+                // — applies to every mode. See src/billing_strip.rs
+                // for the full narrative.
+                let cch_stripped =
+                    ostk_cache::billing_strip::strip_volatile_billing_tokens(&mut value);
+                if cch_stripped > 0 {
                     if config.verbose.value {
                         println!(
-                            "[proxy] cch-strip: removed volatile per-turn billing token from system"
+                            "[proxy] cch-strip: removed {} volatile billing token(s) from request body",
+                            cch_stripped
                         );
                     }
                     mutated = true;
