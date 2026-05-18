@@ -286,6 +286,175 @@ async fn fetch_projection_inner(
         .map_err(|e| format!("decode KernelProjection: {}", e))
 }
 
+// ── →1856 P1.C: kernel/templates ───────────────────────────────────────
+
+/// A single inferred template returned by `kernel/templates`.
+///
+/// Mirrors haystack's `TemplateInstance` from the `ostk-template`
+/// crate. We don't depend on `ostk-template` directly here — the
+/// type surface is tiny and keeping the wire shape local lets
+/// haystack evolve its internal types without breaking us.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelTemplate {
+    /// Whitespace-joined token sequence with wildcards at variable
+    /// positions, e.g. `"Compiling <*> <*>"`.
+    pub template: String,
+    /// One entry per wildcard position. Empty when every merged line
+    /// was identical.
+    #[serde(default)]
+    pub slots: Vec<KernelTemplateSlot>,
+    /// Original line indices (into the caller-supplied `lines` array)
+    /// that merged into this template.
+    pub source_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelTemplateSlot {
+    pub index: usize,
+    pub values: Vec<String>,
+}
+
+/// Response payload from `kernel/templates`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelTemplates {
+    pub wire_version: u32,
+    pub templates: Vec<KernelTemplate>,
+}
+
+/// Options for [`fetch_templates`]. Mirrors haystack's `InferOpts`
+/// but only fields the caller cares to override are exposed; the
+/// rest default to haystack's primitive defaults.
+#[derive(Debug, Clone, Default)]
+pub struct TemplatesOpts {
+    pub sim_threshold: Option<f64>,
+    pub min_cluster_size: Option<usize>,
+    pub wildcard: Option<String>,
+}
+
+/// Issue a `kernel/templates` request and parse the response.
+///
+/// Federation discipline (same as `fetch_projection`): any failure
+/// returns `None`. Templates are an ADDITIVE optimization — if the
+/// kernel daemon is down, predates the verb, or returns an error,
+/// the caller continues with its existing projection synthesis as
+/// if templates were never requested.
+///
+/// `lines` is the corpus to cluster; typically extracted from the
+/// request's messages history.
+pub async fn fetch_templates(
+    workspace: &Path,
+    lines: Vec<String>,
+    opts: TemplatesOpts,
+) -> Option<KernelTemplates> {
+    if lines.is_empty() {
+        return None;
+    }
+    let candidates = enumerate_socket_candidates(workspace);
+    if candidates.is_empty() {
+        return None;
+    }
+    let timeout_dur = std::time::Duration::from_millis(500);
+    for socket_path in &candidates {
+        match timeout(timeout_dur, fetch_templates_inner(socket_path, &lines, &opts)).await {
+            Ok(Ok(t)) => return Some(t),
+            Ok(Err(reason)) => {
+                eprintln!(
+                    "[proxy] kernel_client: kernel/templates failed on {}: {}",
+                    socket_path.display(),
+                    reason
+                );
+            }
+            Err(_) => {
+                eprintln!(
+                    "[proxy] kernel_client: kernel/templates timed out after {}ms on {}",
+                    timeout_dur.as_millis(),
+                    socket_path.display()
+                );
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+#[allow(clippy::unused_async)]
+async fn fetch_templates_inner(
+    _socket_path: &Path,
+    _lines: &[String],
+    _opts: &TemplatesOpts,
+) -> Result<KernelTemplates, String> {
+    Err("federation unavailable on Windows: kernel daemon uses AF_UNIX sockets".to_string())
+}
+
+#[cfg(unix)]
+async fn fetch_templates_inner(
+    socket_path: &Path,
+    lines: &[String],
+    opts: &TemplatesOpts,
+) -> Result<KernelTemplates, String> {
+    let mut stream = UnixStream::connect(socket_path)
+        .await
+        .map_err(|e| format!("connect {}: {}", socket_path.display(), e))?;
+
+    let mut params = json!({"lines": lines});
+    if let Some(t) = opts.sim_threshold {
+        params["sim_threshold"] = json!(t);
+    }
+    if let Some(m) = opts.min_cluster_size {
+        params["min_cluster_size"] = json!(m);
+    }
+    if let Some(w) = &opts.wildcard {
+        params["wildcard"] = json!(w);
+    }
+
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "kernel/templates",
+        "params": params,
+    });
+
+    let mut wire = serde_json::to_vec(&request).map_err(|e| format!("serialize: {}", e))?;
+    wire.push(b'\n');
+
+    stream
+        .write_all(&wire)
+        .await
+        .map_err(|e| format!("write: {}", e))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("flush: {}", e))?;
+
+    let (read_half, _write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    let n = reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| format!("read: {}", e))?;
+    if n == 0 {
+        return Err("empty response from kernel".into());
+    }
+
+    let response: serde_json::Value =
+        serde_json::from_str(&line).map_err(|e| format!("parse response: {}", e))?;
+
+    if let Some(err) = response.get("error") {
+        // Method-not-found from an older daemon → caller falls back
+        // to legacy projection synthesis. Distinguish that from real
+        // errors with a recognizable message but pass through both.
+        return Err(format!("kernel returned JSON-RPC error: {}", err));
+    }
+
+    let result = response
+        .get("result")
+        .ok_or_else(|| "response missing 'result' field".to_string())?;
+
+    serde_json::from_value::<KernelTemplates>(result.clone())
+        .map_err(|e| format!("decode KernelTemplates: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -284,6 +284,49 @@ async fn handle_anthropic_message(
                     projection.wire_version
                 );
             }
+
+            // →1856 P1.C: ALSO call kernel/templates with the request's
+            // messages-history text. Templates returned are telemetry-only
+            // in this MVP — we log counts but don't yet splice them into
+            // the projection synthesis (that's the follow-up). The call
+            // proves the verb plumbing end-to-end and gives us live data
+            // on cluster sizes to decide where the templates pay off.
+            //
+            // Graceful fallback: if the haystack daemon predates the verb,
+            // it returns a JSON-RPC method-not-found which fetch_templates
+            // translates to None — no behavioral change to the proxy.
+            let history_lines = extract_history_text_lines(&body_str, 200);
+            if !history_lines.is_empty() {
+                let templates_opts = ostk_cache::kernel_client::TemplatesOpts {
+                    min_cluster_size: Some(2),
+                    ..Default::default()
+                };
+                if let Some(kt) =
+                    ostk_cache::kernel_client::fetch_templates(&cwd, history_lines, templates_opts)
+                        .await
+                {
+                    let cluster_sum: usize = kt
+                        .templates
+                        .iter()
+                        .map(|t| t.source_indices.len())
+                        .sum();
+                    let biggest = kt
+                        .templates
+                        .iter()
+                        .map(|t| t.source_indices.len())
+                        .max()
+                        .unwrap_or(0);
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] rebuild: kernel/templates returned {} cluster(s) covering {} line(s), biggest={} (wire_version={})",
+                            kt.templates.len(),
+                            cluster_sum,
+                            biggest,
+                            kt.wire_version
+                        );
+                    }
+                }
+            }
         } else {
             // Demote to standalone for this request — kernel unavailable.
             rebuild_config.mode_tag = "rebuild_local".to_string();
@@ -1161,6 +1204,123 @@ fn optimize_openai_payload(body: &str, workspace_hash: &str) -> (String, bool) {
 fn short_session(s: &str) -> &str {
     let end = s.char_indices().nth(6).map(|(i, _)| i).unwrap_or(s.len());
     &s[..end]
+}
+
+/// →1856 P1.C: extract recent text content from a request body's
+/// `messages` array for feeding to `kernel/templates`.
+///
+/// Walks the JSON parse of `body_str`, collecting every `text` field
+/// found under any nested `content` block in `messages[*]`. Splits
+/// each text on newlines and keeps the last `limit` non-empty lines
+/// so the template inferrer sees recent activity, not the whole
+/// (potentially very large) conversation history. The 200-line
+/// default keeps the wire request small and the inferrer fast.
+///
+/// Failure-tolerant: any parse error returns an empty vec — the
+/// templates call then no-ops and the proxy proceeds with its
+/// existing rebuild path.
+fn extract_history_text_lines(body_str: &str, limit: usize) -> Vec<String> {
+    let v: serde_json::Value = match serde_json::from_str(body_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(msgs) = v.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            collect_text_lines_into(msg, &mut lines);
+        }
+    }
+    // Trim to last `limit` non-empty lines.
+    lines.retain(|s| !s.trim().is_empty());
+    if lines.len() > limit {
+        lines.drain(0..lines.len() - limit);
+    }
+    lines
+}
+
+fn collect_text_lines_into(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Block of the shape {"type":"text","text":"..."} —
+            // split the text on newlines and append.
+            if obj.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(text) = obj.get("text").and_then(|t| t.as_str())
+            {
+                for line in text.lines() {
+                    out.push(line.to_string());
+                }
+            }
+            for (_, v) in obj.iter() {
+                collect_text_lines_into(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                collect_text_lines_into(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod history_extract_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_text_lines_from_user_messages() {
+        let body = r#"{
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello\nworld"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "hi there"}]}
+            ]
+        }"#;
+        let lines = extract_history_text_lines(body, 100);
+        assert_eq!(lines, vec!["hello", "world", "hi there"]);
+    }
+
+    #[test]
+    fn caps_lines_at_limit() {
+        let body = r#"{
+            "messages": [{"role": "user", "content": [{"type": "text",
+                "text": "a\nb\nc\nd\ne\nf\ng\nh\ni\nj"}]}]
+        }"#;
+        let lines = extract_history_text_lines(body, 3);
+        assert_eq!(lines, vec!["h", "i", "j"]);
+    }
+
+    #[test]
+    fn empty_for_unparseable_or_no_messages() {
+        assert!(extract_history_text_lines("not-json", 100).is_empty());
+        assert!(extract_history_text_lines(r#"{"foo":"bar"}"#, 100).is_empty());
+    }
+
+    #[test]
+    fn walks_into_nested_tool_result_content() {
+        let body = r#"{
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "content": [
+                        {"type": "text", "text": "+ exit:0\nstdout line one\nstdout line two"}
+                    ]
+                }]
+            }]
+        }"#;
+        let lines = extract_history_text_lines(body, 100);
+        assert_eq!(lines, vec!["+ exit:0", "stdout line one", "stdout line two"]);
+    }
+
+    #[test]
+    fn drops_blank_lines() {
+        let body = r#"{
+            "messages": [{"role": "user", "content": [{"type": "text",
+                "text": "real\n\n\nalso real"}]}]
+        }"#;
+        let lines = extract_history_text_lines(body, 100);
+        assert_eq!(lines, vec!["real", "also real"]);
+    }
 }
 
 /// Emit the compact per-turn telemetry line.
