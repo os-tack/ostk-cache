@@ -373,6 +373,23 @@ async fn handle_anthropic_message(
             Ok(mut value) => {
                 let mut mutated = false;
 
+                // Pass A: strip Claude Code's volatile per-turn
+                // `cch=<hex>;` billing token from the system block
+                // (→1856 P1.B diagnostic). The token lives INSIDE
+                // the cache_control:1h ephemeral region and changes
+                // every turn, defeating prefix cache hits on
+                // everything downstream. Unconditional — applies to
+                // every mode. See src/billing_strip.rs for the full
+                // diagnostic narrative.
+                if ostk_cache::billing_strip::strip_volatile_billing_token(&mut value) {
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] cch-strip: removed volatile per-turn billing token from system"
+                        );
+                    }
+                    mutated = true;
+                }
+
                 // Pass 0: kernel orientation in system tier (→1830).
                 // Append the firmware-class discipline preamble to
                 // req.system with cache_control:1h so it cache-hits on
