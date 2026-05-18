@@ -147,6 +147,13 @@ pub struct RebuildConfig {
     /// main.rs when prior digests exist. None → no digests yet (e.g.
     /// fresh state dir or assistant hasn't started emitting fences).
     pub recent_assistant_digests: Option<String>,
+    /// Pre-rendered `## Recent activity templates` section (→1856
+    /// P1.E v0.3.4 splice): summary of `kernel/templates` clusters
+    /// over the request's history text. Populated by main.rs when
+    /// federated mode successfully fetches templates from the kernel
+    /// daemon. None → templates unavailable (standalone mode, kernel
+    /// down, daemon predates the verb, or no clusters formed).
+    pub templates_summary: Option<String>,
 }
 
 impl RebuildConfig {
@@ -171,6 +178,7 @@ impl RebuildConfig {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         }
     }
 
@@ -195,6 +203,7 @@ impl RebuildConfig {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         }
     }
 }
@@ -282,6 +291,7 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         &user_thread,
         config.transcript_tail_summary.as_deref(),
         config.recent_assistant_digests.as_deref(),
+        config.templates_summary.as_deref(),
     );
     let bytes_out = synthetic.len();
 
@@ -1159,6 +1169,7 @@ fn compose_synthetic_context(
     user_thread: &[String],
     transcript_tail_summary: Option<&str>,
     recent_assistant_digests: Option<&str>,
+    templates_summary: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push_str("# Kernel projection — current cycle state\n\n");
@@ -1184,6 +1195,16 @@ fn compose_synthetic_context(
         out.push_str("## Recent tool activity (paged from prior turns)\n\n");
         for call in native_summary {
             out.push_str(&format!("- {}\n", render_tool_signature(call)));
+        }
+        out.push('\n');
+    }
+
+    if let Some(tpl) = templates_summary
+        && !tpl.trim().is_empty()
+    {
+        out.push_str(tpl);
+        if !tpl.ends_with('\n') {
+            out.push('\n');
         }
         out.push('\n');
     }
@@ -1464,6 +1485,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -1503,6 +1525,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -1534,6 +1557,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Disabled));
@@ -1552,6 +1576,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -1570,6 +1595,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -1828,6 +1854,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         apply_rebuild(&mut req, &config);
         let messages = req.get("messages").unwrap().as_array().unwrap();
@@ -2031,6 +2058,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         apply_rebuild(&mut req, &config);
         let synthetic_block = req.get("messages").unwrap().as_array().unwrap()[0]
@@ -2078,6 +2106,7 @@ mod tests {
             recent_assistant_digests: Some(
                 "## Recent assistant turns (digest)\n\n- **[t-0]** [agreed] did the thing [a.rs]\n".into(),
             ),
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2130,6 +2159,7 @@ mod tests {
             live_envelope_override: Some(kernel_envelope.to_string()),
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -2168,6 +2198,7 @@ mod tests {
                 "## Cross-session activity (from harness transcript)\n\n- foo\n".into(),
             ),
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2401,6 +2432,7 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: None,
+            templates_summary: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(

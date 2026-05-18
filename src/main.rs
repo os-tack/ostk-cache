@@ -325,6 +325,17 @@ async fn handle_anthropic_message(
                             kt.wire_version
                         );
                     }
+                    // →1856 P1.D splice: render the clusters as a markdown
+                    // section the rebuild module drops into the synthetic
+                    // projection right after "Recent tool activity". Only
+                    // attach when we have clusters with >1 source line —
+                    // singletons add noise without compressing anything.
+                    if !kt.templates.is_empty() {
+                        let section = render_templates_section(&kt.templates);
+                        if !section.is_empty() {
+                            rebuild_config.templates_summary = Some(section);
+                        }
+                    }
                 }
             }
         } else {
@@ -1206,6 +1217,83 @@ fn short_session(s: &str) -> &str {
     &s[..end]
 }
 
+/// →1856 P2: a template "has signal" when it meets all three:
+///
+///   1. ≥3 *informative* tokens. A token is informative when it
+///      isn't `<*>`, is at least two chars long, and contains at
+///      least one alphanumeric char. Patterns like `<*> fn <*> {`
+///      pass the old single-anchor rule but carry too little of
+///      *what* the cluster is to be worth a slot.
+///   2. Fraction of `<*>` tokens is < 50%. Templates that wildcard
+///      half their tokens or more (e.g. `<*> | gen <*> | <*>`)
+///      have lost the data and kept only the scaffolding.
+///   3. Does not start with a kernel envelope prefix (`[procs]`,
+///      `[loadavg]`, `[meminfo]`, `[ctx]`, `[files]`). The live
+///      envelope at the top of the projection re-renders those
+///      fresh every cycle, so historical copies clustered in the
+///      templates section are pure echo, not signal.
+fn template_has_signal(template: &str) -> bool {
+    const ENVELOPE_PREFIXES: &[&str] =
+        &["[procs]", "[loadavg]", "[meminfo]", "[ctx]", "[files]"];
+    let trimmed = template.trim_start();
+    if ENVELOPE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+        return false;
+    }
+    let tokens: Vec<&str> = template.split_whitespace().collect();
+    if tokens.is_empty() {
+        return false;
+    }
+    let placeholders = tokens.iter().filter(|t| **t == "<*>").count();
+    if placeholders * 2 >= tokens.len() {
+        return false;
+    }
+    let informative = tokens
+        .iter()
+        .filter(|t| {
+            **t != "<*>"
+                && t.len() >= 2
+                && t.chars().any(|c| c.is_alphanumeric())
+        })
+        .count();
+    informative >= 3
+}
+
+/// →1856 P1.D: render kernel/templates clusters as a markdown section
+/// the rebuild module drops into the synthetic projection right after
+/// "Recent tool activity". Skips singleton clusters (no compression
+/// value), drops low-signal clusters via [`template_has_signal`], and
+/// caps the result at 12 entries.
+fn render_templates_section(
+    templates: &[ostk_cache::kernel_client::KernelTemplate],
+) -> String {
+    let mut multi: Vec<&ostk_cache::kernel_client::KernelTemplate> = templates
+        .iter()
+        .filter(|t| t.source_indices.len() >= 2)
+        .filter(|t| template_has_signal(&t.template))
+        .collect();
+    if multi.is_empty() {
+        return String::new();
+    }
+    multi.sort_by(|a, b| b.source_indices.len().cmp(&a.source_indices.len()));
+    multi.truncate(12);
+    let shown_sum: usize = multi.iter().map(|t| t.source_indices.len()).sum();
+    let mut out = String::new();
+    out.push_str(&format!(
+        "## Inferred templates (paged from prior turns)\n\n_Compressed {} repeated line(s) into {} cluster(s)._\n\n",
+        shown_sum,
+        multi.len()
+    ));
+    for t in multi {
+        out.push_str(&format!(
+            "- ×{} `{}`\n",
+            t.source_indices.len(),
+            t.template
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 /// →1856 P1.C: extract recent text content from a request body's
 /// `messages` array for feeding to `kernel/templates`.
 ///
@@ -1320,6 +1408,107 @@ mod history_extract_tests {
         }"#;
         let lines = extract_history_text_lines(body, 100);
         assert_eq!(lines, vec!["real", "also real"]);
+    }
+}
+
+#[cfg(test)]
+mod template_signal_tests {
+    use super::*;
+    use ostk_cache::kernel_client::KernelTemplate;
+
+    #[test]
+    fn drops_pure_wildcard_and_punctuation_only_templates() {
+        // None of these say *what* the cluster is — drop them.
+        assert!(!template_has_signal("<*>"));
+        assert!(!template_has_signal("<*> <*>"));
+        assert!(!template_has_signal("<*> <*> <*> <*> <*> <*>"));
+        assert!(!template_has_signal("<*> }"));
+        assert!(!template_has_signal("<*> <*> <*> {"));
+        assert!(!template_has_signal("<*> => <*>"));
+    }
+
+    #[test]
+    fn keeps_templates_with_three_informative_anchors() {
+        // ≥3 informative tokens, <50% wildcards, no envelope prefix.
+        assert!(template_has_signal("test result: ok. all passed clean"));
+        assert!(template_has_signal("alpha beta gamma <*> delta"));
+        assert!(template_has_signal("collect_text_lines_into helper called twice"));
+        assert!(template_has_signal("fn render_templates_section() returns String"));
+    }
+
+    #[test]
+    fn drops_envelope_prefix_templates() {
+        // Live envelope re-renders these fresh — keeping templated
+        // copies is pure echo, not signal.
+        assert!(!template_has_signal(
+            "[procs] count:2 active:1 stale:1 dead:0 ctx_p95:0 concern:stale"
+        ));
+        assert!(!template_has_signal(
+            "[loadavg] needles: 0 open (0 P0) | fleet: 0/0 alive | nudges: 0"
+        ));
+        assert!(!template_has_signal("[meminfo] ctx: 0% 0k/800k Buffers:0k <*>"));
+        assert!(!template_has_signal(
+            "[ctx] Δ4t:13m | audit:+114 | needles:3 | fleet:2/2 | nudge:0"
+        ));
+        assert!(!template_has_signal("[files]"));
+    }
+
+    #[test]
+    fn drops_high_placeholder_ratio_templates() {
+        // ≥50% wildcards → the cluster is structure without content.
+        assert!(!template_has_signal("<*> | gen <*> | <*>")); // 3/5
+        assert!(!template_has_signal("<*> fn <*> {")); // 2/4
+        assert!(!template_has_signal("<*> let <*> = <*>")); // 3/5
+        assert!(!template_has_signal("<*> use <*>")); // 2/3
+        assert!(!template_has_signal("<*> mod <*> {")); // 2/4
+    }
+
+    #[test]
+    fn drops_too_few_informative_tokens() {
+        // 1-2 informative tokens — pattern shape, not enough *what*.
+        assert!(!template_has_signal("M src/main.rs")); // `M` len 1
+        assert!(!template_has_signal("+ exit:0 <*>")); // only `exit:0`
+        assert!(!template_has_signal("<*> #[test]")); // only `#[test]`, ratio also kills
+        assert!(!template_has_signal("fn run() {")); // `fn` + `run()` = 2
+    }
+
+    fn tpl(s: &str, count: usize) -> KernelTemplate {
+        KernelTemplate {
+            template: s.to_string(),
+            slots: Vec::new(),
+            source_indices: (0..count).collect(),
+        }
+    }
+
+    #[test]
+    fn render_drops_singletons_and_noise_keeps_signal() {
+        let templates = vec![
+            tpl("<*> }", 18),                                  // noise
+            tpl("<*> <*> <*> <*> <*> <*>", 6),                 // all wildcard
+            tpl("[procs] count:2 active:1 <*>", 6),            // envelope, drop
+            tpl("<*> | gen <*> | <*>", 20),                    // 60% wildcards
+            tpl("alone with three keywords", 1),               // singleton
+            tpl("alpha beta gamma delta", 3),                  // 4 inform → keep
+            tpl("test result: ok. all passed clean", 5),       // keep
+        ];
+        let out = render_templates_section(&templates);
+        assert!(out.contains("alpha beta gamma delta"));
+        assert!(out.contains("test result: ok. all passed clean"));
+        assert!(!out.contains("[procs]"));
+        assert!(!out.contains("gen <*>"));
+        assert!(!out.contains("alone with three keywords"));
+        // shown_sum: 5 + 3 == 8, cluster count == 2
+        assert!(out.contains("Compressed 8 repeated line(s) into 2 cluster(s)"));
+    }
+
+    #[test]
+    fn render_returns_empty_when_everything_is_noise() {
+        let templates = vec![
+            tpl("<*>", 9),
+            tpl("<*> }", 12),
+            tpl("<*> <*> <*> {", 8),
+        ];
+        assert_eq!(render_templates_section(&templates), "");
     }
 }
 
