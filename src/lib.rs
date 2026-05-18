@@ -6,6 +6,7 @@ pub mod kernel_client;
 pub mod rebuild;
 pub mod rewrite_middleware;
 pub mod standalone;
+pub mod system_reminder_strip;
 pub mod transcript_tail;
 
 pub use ostk_cache_core::usage::ProviderUsage;

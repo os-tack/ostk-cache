@@ -448,6 +448,31 @@ async fn handle_anthropic_message(
                     mutated = true;
                 }
 
+                // Pass A.5: strip <system-reminder>...</system-reminder>
+                // blocks from past user turns. Anthropic/Claude Code
+                // inject these out-of-band into user messages; they
+                // accumulate in conversation history and bill against
+                // input tokens every turn. The current user turn is
+                // preserved (a load-bearing reminder may need to be
+                // acted on this turn). See src/system_reminder_strip.rs
+                // for the full narrative. Unconditional — applies to
+                // every mode.
+                let sr_stats =
+                    ostk_cache::system_reminder_strip::strip_system_reminders_from_past_turns(
+                        &mut value,
+                    );
+                if !sr_stats.is_empty() {
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] sr-strip: removed {} past-turn system-reminder block(s), ~{} bytes (~{} tokens)",
+                            sr_stats.blocks_removed,
+                            sr_stats.bytes_removed,
+                            sr_stats.tokens_estimate()
+                        );
+                    }
+                    mutated = true;
+                }
+
                 // Pass 0: kernel orientation in system tier (→1830).
                 // Append the firmware-class discipline preamble to
                 // req.system with cache_control:1h so it cache-hits on
