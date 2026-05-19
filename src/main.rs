@@ -621,6 +621,16 @@ async fn handle_anthropic_message(
                     rebuild_report_capture.is_some(),
                 ));
 
+                // Diagnostic: per-content-type breakdown of the final
+                // wire body (text / tool_use / tool_result / images).
+                // SectionSizes tells you WHERE bytes live structurally;
+                // this tells you WHAT they are. Verbose-only — pure
+                // observability.
+                if config.verbose.value {
+                    let bd = ostk_cache::body_breakdown::measure_body(&value);
+                    println!("[proxy] body: {}", bd.summarize());
+                }
+
                 if must_413 {
                     let (dominant_name, dominant_bytes) = section_sizes_capture
                         .map(|s| s.dominant())
