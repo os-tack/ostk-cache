@@ -31,7 +31,8 @@
 //! outbound requests, not the raw transcript content. Same trust
 //! boundary as the kernel reading `.ostk/journal.jsonl`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -311,6 +312,84 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Truncate at the last whitespace within `max` chars so messages don't
+/// get chopped mid-word. Falls back to a hard char cut if no whitespace
+/// is found in the second half of the window.
+fn truncate_at_word_boundary(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let prefix: String = s.chars().take(max).collect();
+    let cut = prefix
+        .rfind(char::is_whitespace)
+        .filter(|i| *i > max / 2)
+        .unwrap_or(prefix.len());
+    let mut out = prefix[..cut].trim_end().to_string();
+    out.push('\u{2026}');
+    out
+}
+
+/// Read user-role text events from the transcript JSONL and return them
+/// in chronological order, word-boundary-truncated at `per_msg_chars`.
+///
+/// Drops the most recent user-text event under the assumption it is the
+/// current cycle's trigger (which the rebuild keeps in the in-flight
+/// chain and re-renders separately under `## Current cycle`). Skips
+/// tool_result wrapper events (`type:"user"` whose content is entirely
+/// `tool_result` blocks) — those carry no user intent text.
+///
+/// Caller caps by K (last-N turns) on its side; this function only
+/// handles the per-message budget. Returns an empty Vec on any
+/// read/parse error.
+pub fn read_recent_user_messages(path: &Path, per_msg_chars: usize) -> Vec<String> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+
+    let mut texts: Vec<String> = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let raw: RawEvent = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if raw.type_.as_deref() != Some("user") {
+            continue;
+        }
+        if is_tool_result_user_event(&raw.message) {
+            continue;
+        }
+        if let Some(t) = extract_message_text(&raw.message) {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                texts.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if !texts.is_empty() {
+        texts.pop();
+    }
+
+    texts
+        .into_iter()
+        .map(|t| truncate_at_word_boundary(&t, per_msg_chars))
+        .collect()
+}
+
+fn is_tool_result_user_event(message: &Option<serde_json::Value>) -> bool {
+    let Some(m) = message else { return false };
+    let Some(arr) = m.get("content").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    if arr.is_empty() {
+        return false;
+    }
+    arr.iter()
+        .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+}
+
 /// Compose a cross-session activity summary from tail events. Returns
 /// None if there's nothing useful to report.
 pub fn render_cross_session_summary(events: &[TailEvent], current_session_marker: Option<&str>) -> Option<String> {
@@ -348,6 +427,155 @@ pub fn render_cross_session_summary(events: &[TailEvent], current_session_marker
         return None;
     }
     Some(out)
+}
+
+/// Locator for a tool_result body in the transcript JSONL.
+///
+/// Byte offsets are relative to the start of the file and point at the
+/// raw JSONL line — callers can `seek + read_exact` to recover the
+/// exact bytes, then parse the line and pull `.message.content[…].content`
+/// out of it. Line index is 0-based and meant for human debugging.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolBodyLocator {
+    pub tool_use_id: String,
+    pub line_index: u64,
+    pub byte_offset: u64,
+    pub byte_len: u64,
+    pub is_error: bool,
+    pub tool_name: Option<String>,
+}
+
+/// Result of a single tail-scan pass over a transcript JSONL.
+///
+/// The proxy builds this once per inbound request when `tail.transcript`
+/// is on, then feeds three slots into the projection:
+/// - `events` → the cross-session activity summary (existing path)
+/// - `user_turns` → less-lossy prior-user-intent thread (no 240 chop)
+/// - `by_tool_id` → handle-resolve interface for tool_result bodies
+///
+/// `path` is preserved so a resolve_handle verb can seek+read by
+/// `byte_offset/byte_len` without re-scanning.
+#[derive(Debug, Clone)]
+pub struct TailIndex {
+    pub path: PathBuf,
+    pub events: Vec<TailEvent>,
+    pub user_turns: Vec<String>,
+    pub by_tool_id: HashMap<String, ToolBodyLocator>,
+}
+
+/// Single-pass scan over the JSONL: tracks byte offsets for each line,
+/// retains the last `limit` events (preserving the existing `read_tail_events`
+/// semantics), accumulates ALL user turns (full text, untruncated), and
+/// indexes EVERY tool_result observed by `tool_use_id`.
+///
+/// The user-turn and tool-id slots are intentionally NOT tail-limited:
+/// they're cheap (string clones and a small struct), and a session-wide
+/// view makes the index useful for resolving handles older than `limit`.
+pub fn build_tail_index(path: &Path, limit: usize) -> TailIndex {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => {
+            return TailIndex {
+                path: path.to_path_buf(),
+                events: Vec::new(),
+                user_turns: Vec::new(),
+                by_tool_id: HashMap::new(),
+            };
+        }
+    };
+    let reader = BufReader::new(file);
+
+    let mut events: Vec<TailEvent> = Vec::new();
+    let mut user_turns: Vec<String> = Vec::new();
+    let mut by_tool_id: HashMap<String, ToolBodyLocator> = HashMap::new();
+
+    let mut byte_offset: u64 = 0;
+    let mut line_index: u64 = 0;
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        // BufRead::lines strips the trailing \n. Round-trip length back
+        // for the offset cursor.
+        let raw_len = line.len() as u64 + 1;
+
+        if let Some(ev) = parse_event(&line) {
+            // Full-text user turn (no truncation). parse_event truncates
+            // the summary to 240; re-extract from raw for fidelity.
+            if matches!(ev.kind, TailEventKind::User)
+                && let Ok(raw_val) = serde_json::from_str::<serde_json::Value>(&line)
+                && let Some(text) =
+                    extract_message_text(&raw_val.get("message").cloned())
+            {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    user_turns.push(trimmed.to_string());
+                }
+            }
+
+            if matches!(ev.kind, TailEventKind::ToolResult)
+                && let Some(id) = ev.tool_use_id.clone()
+            {
+                let is_error = serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("message")
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_array())
+                            .and_then(|arr| {
+                                arr.iter().find_map(|b| {
+                                    b.get("is_error").and_then(|e| e.as_bool())
+                                })
+                            })
+                    })
+                    .unwrap_or(false);
+                by_tool_id.insert(
+                    id.clone(),
+                    ToolBodyLocator {
+                        tool_use_id: id,
+                        line_index,
+                        byte_offset,
+                        byte_len: line.len() as u64,
+                        is_error,
+                        tool_name: ev.tool_name.clone(),
+                    },
+                );
+            }
+
+            events.push(ev);
+        }
+
+        byte_offset += raw_len;
+        line_index += 1;
+    }
+
+    // Apply tail limit ONLY to the events slot — it's what feeds the
+    // cross-session summary. user_turns + by_tool_id stay session-wide.
+    if events.len() > limit {
+        let drop_n = events.len() - limit;
+        events.drain(..drop_n);
+    }
+
+    TailIndex {
+        path: path.to_path_buf(),
+        events,
+        user_turns,
+        by_tool_id,
+    }
+}
+
+/// Short tag for a tool_use_id — last 8 hex chars, lowercased. The
+/// transcript ids are claude-code's `toolu_<base32-ish>` strings; the
+/// suffix is sufficiently unique within a session and addressable by
+/// eye.
+pub fn short_tag(tool_use_id: &str) -> String {
+    let len = tool_use_id.chars().count();
+    let tail: String = tool_use_id
+        .chars()
+        .skip(len.saturating_sub(8))
+        .collect();
+    tail.to_lowercase()
 }
 
 #[cfg(test)]
@@ -477,5 +705,67 @@ mod tests {
             render_cross_session_summary(&events, Some("2026-05-07T12:00:00Z")).unwrap();
         assert!(out.contains("old"));
         assert!(!out.contains("new"));
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_keeps_whole_short_strings() {
+        assert_eq!(truncate_at_word_boundary("hi there", 20), "hi there");
+    }
+
+    #[test]
+    fn truncate_at_word_boundary_cuts_at_whitespace() {
+        let s = "alpha beta gamma delta epsilon";
+        let out = truncate_at_word_boundary(s, 15);
+        assert!(out.ends_with('\u{2026}'));
+        assert!(!out.contains("gamm"), "should not chop mid-word: {out}");
+        assert!(out.starts_with("alpha beta"));
+    }
+
+    #[test]
+    fn read_recent_user_messages_drops_last_and_skips_tool_results() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        write_jsonl(
+            &f,
+            &[
+                r#"{"type":"user","message":{"content":"first user turn"}}"#,
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"ack"}]}}"#,
+                r#"{"type":"user","message":{"content":[{"type":"tool_result","content":"ignored wrapper"}]}}"#,
+                r#"{"type":"user","message":{"content":"second user turn"}}"#,
+                r#"{"type":"user","message":{"content":"current cycle trigger"}}"#,
+            ],
+        );
+
+        let msgs = read_recent_user_messages(&f, 1000);
+        assert_eq!(msgs.len(), 2, "got: {:?}", msgs);
+        assert_eq!(msgs[0], "first user turn");
+        assert_eq!(msgs[1], "second user turn");
+    }
+
+    #[test]
+    fn read_recent_user_messages_applies_word_boundary_budget() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("s.jsonl");
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        write_jsonl(
+            &f,
+            &[
+                &format!(
+                    r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
+                    long
+                ),
+                r#"{"type":"user","message":{"content":"current cycle trigger"}}"#,
+            ],
+        );
+
+        let msgs = read_recent_user_messages(&f, 20);
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].ends_with('\u{2026}'));
+        assert!(
+            !msgs[0].contains("kappa"),
+            "long message should be truncated: {}",
+            msgs[0]
+        );
+        assert!(msgs[0].starts_with("alpha"));
     }
 }

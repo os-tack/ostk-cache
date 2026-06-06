@@ -146,6 +146,7 @@ pub struct CliArgs {
     pub mode: Option<Mode>,
 
     /// Enable cross-session transcript-tail enrichment (rebuild modes only).
+    /// Default: on. Use --no-tail-transcript to disable.
     #[arg(long)]
     pub tail_transcript: bool,
 
@@ -409,7 +410,7 @@ impl Config {
             tail_cli,
             env_truthy("OSTK_CACHE_TAIL_TRANSCRIPT"),
             file.and_then(|f| f.tail.transcript),
-            false,
+            true,
         );
 
         let tail_limit = pick_value(

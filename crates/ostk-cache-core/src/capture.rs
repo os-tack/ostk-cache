@@ -2,6 +2,8 @@
 
 use serde::Serialize;
 use sha2::Digest;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +14,7 @@ const REQUEST_IN_BODY: &str = "request-in.body";
 const REQUEST_OUT_BODY: &str = "request-out.body";
 const RESPONSE_BODY: &str = "response.body";
 const METADATA_JSON: &str = "metadata.json";
+const UPSTREAM_ERRORS_FILE: &str = "upstream-errors.jsonl";
 
 #[derive(Debug, Clone)]
 pub struct HttpCapture {
@@ -54,6 +57,7 @@ impl HttpCapture {
         enabled: bool,
         root: &Path,
         session: &str,
+        method: &str,
         path: &str,
         request_headers: &http::HeaderMap,
         request_body: &[u8],
@@ -72,7 +76,7 @@ impl HttpCapture {
                     id,
                     ts: iso8601_utc_now(),
                     session: session.to_string(),
-                    method: "POST".to_string(),
+                    method: method.to_string(),
                     path: path.to_string(),
                     status: None,
                     is_sse: None,
@@ -90,6 +94,11 @@ impl HttpCapture {
                 None
             }
         }
+    }
+
+    /// Capture id (filename-safe). Useful for cross-referencing audit logs.
+    pub fn id(&self) -> &str {
+        &self.meta.id
     }
 
     pub fn record_outbound(&mut self, payload: &[u8]) {
@@ -208,4 +217,85 @@ fn redact_headers(headers: &http::HeaderMap) -> Vec<CapturedHeader> {
             }
         })
         .collect()
+}
+
+/// Structured row written to `upstream-errors.jsonl` when an upstream provider
+/// returns 4xx/5xx. The fields are deliberately small and grep-friendly so an
+/// operator can spot failures without opening individual capture dirs.
+#[derive(Debug, Clone, Serialize)]
+pub struct UpstreamErrorRow {
+    pub ts: String,
+    pub session: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub req_bytes_in: u64,
+    pub req_bytes_out: u64,
+    pub resp_bytes: Option<u64>,
+    pub capture_id: Option<String>,
+    pub elapsed_ms: u128,
+}
+
+impl UpstreamErrorRow {
+    pub fn new(
+        session: &str,
+        method: &str,
+        path: &str,
+        status: u16,
+        req_bytes_in: u64,
+        req_bytes_out: u64,
+        elapsed: std::time::Duration,
+    ) -> Self {
+        Self {
+            ts: iso8601_utc_now(),
+            session: session.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
+            status,
+            req_bytes_in,
+            req_bytes_out,
+            resp_bytes: None,
+            capture_id: None,
+            elapsed_ms: elapsed.as_millis(),
+        }
+    }
+
+    pub fn with_capture_id(mut self, id: impl Into<String>) -> Self {
+        self.capture_id = Some(id.into());
+        self
+    }
+
+    pub fn with_resp_bytes(mut self, n: u64) -> Self {
+        self.resp_bytes = Some(n);
+        self
+    }
+}
+
+/// Append an upstream error row to `<capture_root>/../upstream-errors.jsonl`
+/// (alongside `.ostk/http-capture/`). Creates the parent directory if needed.
+/// Best-effort: errors are logged to stderr but never propagate.
+pub fn log_upstream_error(capture_root: &Path, row: &UpstreamErrorRow) {
+    let parent = capture_root.parent().unwrap_or(capture_root);
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!("[proxy] upstream-error log mkdir failed: {}", e);
+        return;
+    }
+    let path = parent.join(UPSTREAM_ERRORS_FILE);
+    let line = match serde_json::to_string(row) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[proxy] upstream-error log serialize failed: {}", e);
+            return;
+        }
+    };
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{}", line) {
+                eprintln!("[proxy] upstream-error log write failed: {}", e);
+            }
+        }
+        Err(e) => {
+            eprintln!("[proxy] upstream-error log open failed: {}", e);
+        }
+    }
 }

@@ -3,9 +3,9 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{OriginalUri, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{any, post},
+    routing::post,
 };
 use clap::Parser;
 use dashmap::DashMap;
@@ -86,7 +86,7 @@ async fn main() {
         .route("/v1/messages", post(handle_anthropic_message))
         .route("/v1/responses", post(handle_openai_response))
         .route("/hook/event", post(handle_hook_event))
-        .fallback(any(|| async { (StatusCode::NOT_FOUND, "Not Found") }))
+        .fallback(handle_catchall)
         .with_state(state);
 
     axum::serve(listener, app)
@@ -251,6 +251,7 @@ async fn handle_anthropic_message(
         config.capture_http.value,
         &config.capture_http_dir.value,
         &session_id,
+        "POST",
         "/v1/messages",
         &headers,
         &body_bytes,
@@ -395,6 +396,27 @@ async fn handle_anthropic_message(
                     }
                     rebuild_config.transcript_tail_summary = Some(summary);
                 }
+
+                // →1812/→1813 follow-on: also source the "prior user
+                // intent thread" from the transcript JSONL. The
+                // in-process `extract_user_intent_thread` chops at 240
+                // chars mid-word; reading the raw user turns lets us
+                // truncate at a word boundary with a roomier per-msg
+                // budget. The K-tail cap is applied inside the rebuild
+                // when this override is honored.
+                let user_msgs = ostk_cache::transcript_tail::read_recent_user_messages(
+                    &session_path,
+                    1000,
+                );
+                if !user_msgs.is_empty() {
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] rebuild: transcript-sourced prior-user-thread ({} turns)",
+                            user_msgs.len()
+                        );
+                    }
+                    rebuild_config.prior_user_turns_override = Some(user_msgs);
+                }
             } else if config.verbose.value {
                 eprintln!(
                     "[proxy] rebuild: transcript tail enabled but no session file found in {}",
@@ -464,10 +486,12 @@ async fn handle_anthropic_message(
                 if !sr_stats.is_empty() {
                     if config.verbose.value {
                         println!(
-                            "[proxy] sr-strip: removed {} past-turn system-reminder block(s), ~{} bytes (~{} tokens)",
+                            "[proxy] sr-strip: removed {} past-turn system-reminder block(s), ~{} bytes (~{} tokens); pruned {} empty text block(s), inserted {} placeholder(s)",
                             sr_stats.blocks_removed,
                             sr_stats.bytes_removed,
-                            sr_stats.tokens_estimate()
+                            sr_stats.tokens_estimate(),
+                            sr_stats.empty_blocks_pruned,
+                            sr_stats.placeholders_inserted
                         );
                     }
                     mutated = true;
@@ -842,6 +866,7 @@ async fn handle_anthropic_message(
                 "error": {"type": "upstream_error", "message": format!("{}", e)}
             })
             .to_string();
+            let capture_id = http_capture.as_ref().map(|c| c.id().to_string());
             if let Some(capture) = http_capture.take() {
                 capture.finish(
                     StatusCode::BAD_GATEWAY.as_u16(),
@@ -851,6 +876,23 @@ async fn handle_anthropic_message(
                     turn_started.elapsed(),
                 );
             }
+            let mut row = ostk_cache::http_capture::UpstreamErrorRow::new(
+                &session_id,
+                "POST",
+                "/v1/messages",
+                StatusCode::BAD_GATEWAY.as_u16(),
+                req_bytes_in,
+                req_bytes_out,
+                turn_started.elapsed(),
+            )
+            .with_resp_bytes(body.len() as u64);
+            if let Some(id) = capture_id {
+                row = row.with_capture_id(id);
+            }
+            ostk_cache::http_capture::log_upstream_error(
+                &config.capture_http_dir.value,
+                &row,
+            );
             return Ok((StatusCode::BAD_GATEWAY, body).into_response());
         }
     };
@@ -885,6 +927,8 @@ async fn handle_anthropic_message(
     let section_sizes_for_line = section_sizes_capture;
     let soft_cap_bytes_for_line = config.soft_cap_mb.value.saturating_mul(1024 * 1024);
     let reduction_for_line = reduction_report_capture.clone();
+    let capture_root_for_stream = config.capture_http_dir.value.clone();
+    let capture_id_for_stream = http_capture.as_ref().map(|c| c.id().to_string());
 
     let stream = stream! {
         let mut accumulated = Vec::<u8>::new();
@@ -906,6 +950,23 @@ async fn handle_anthropic_message(
                 &accumulated,
                 turn_started.elapsed(),
             );
+        }
+
+        if status.as_u16() >= 400 {
+            let mut row = ostk_cache::http_capture::UpstreamErrorRow::new(
+                &session_id_clone,
+                "POST",
+                "/v1/messages",
+                status.as_u16(),
+                req_bytes_in,
+                req_bytes_out,
+                turn_started.elapsed(),
+            )
+            .with_resp_bytes(resp_bytes_total);
+            if let Some(id) = capture_id_for_stream.clone() {
+                row = row.with_capture_id(id);
+            }
+            ostk_cache::http_capture::log_upstream_error(&capture_root_for_stream, &row);
         }
 
         let parsed_usage = parse_usage(UsageDialect::Anthropic, is_sse, &accumulated);
@@ -1075,6 +1136,7 @@ async fn handle_openai_response(
         config.capture_http.value,
         &config.capture_http_dir.value,
         &session_id,
+        "POST",
         path,
         &headers,
         &body_bytes,
@@ -1114,6 +1176,9 @@ async fn handle_openai_response(
     if let Some(capture) = http_capture.as_mut() {
         capture.record_outbound(payload.as_bytes());
     }
+    let capture_root = config.capture_http_dir.value.clone();
+    let path_owned = path.to_string();
+    let capture_id_pre = http_capture.as_ref().map(|c| c.id().to_string());
     let mut response = match req_builder.body(payload).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -1128,6 +1193,20 @@ async fn handle_openai_response(
                     turn_started.elapsed(),
                 );
             }
+            let mut row = ostk_cache::http_capture::UpstreamErrorRow::new(
+                &session_id,
+                "POST",
+                &path_owned,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                req_bytes_in,
+                req_bytes_out,
+                turn_started.elapsed(),
+            )
+            .with_resp_bytes(body.len() as u64);
+            if let Some(id) = capture_id_pre {
+                row = row.with_capture_id(id);
+            }
+            ostk_cache::http_capture::log_upstream_error(&capture_root, &row);
             return Ok((StatusCode::BAD_GATEWAY, body).into_response());
         }
     };
@@ -1147,6 +1226,9 @@ async fn handle_openai_response(
     let response_headers_capture = response.headers().clone();
     let session_id_clone = session_id.clone();
     let workspace_id = workspace.priority_hash.clone();
+    let path_for_stream = path_owned.clone();
+    let capture_id_for_stream = capture_id_pre.clone();
+    let capture_root_for_stream = capture_root.clone();
 
     let stream = stream! {
         let mut accumulated = Vec::<u8>::new();
@@ -1167,6 +1249,23 @@ async fn handle_openai_response(
                 &accumulated,
                 turn_started.elapsed(),
             );
+        }
+
+        if status.as_u16() >= 400 {
+            let mut row = ostk_cache::http_capture::UpstreamErrorRow::new(
+                &session_id_clone,
+                "POST",
+                &path_for_stream,
+                status.as_u16(),
+                req_bytes_in,
+                req_bytes_out,
+                turn_started.elapsed(),
+            )
+            .with_resp_bytes(resp_bytes_total);
+            if let Some(id) = capture_id_for_stream.clone() {
+                row = row.with_capture_id(id);
+            }
+            ostk_cache::http_capture::log_upstream_error(&capture_root_for_stream, &row);
         }
 
         let parsed_usage = parse_usage(UsageDialect::OpenAi, is_sse, &accumulated);
@@ -1212,6 +1311,180 @@ async fn handle_openai_response(
             None,
             turn_started.elapsed(),
         );
+    };
+
+    Ok(resp_builder.body(Body::from_stream(stream)).unwrap())
+}
+
+/// Fallback handler for any path the proxy doesn't recognise. We still capture
+/// + forward to upstream verbatim (no payload optimisation) so operators have
+/// a record of what the client sent. Captures any 4xx/5xx into
+/// `upstream-errors.jsonl` for grep-friendly triage.
+async fn handle_catchall(
+    State(state): State<AppState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Result<Response, StatusCode> {
+    let config = state.config.clone();
+    let req_bytes_in = body_bytes.len() as u64;
+    let req_bytes_out = req_bytes_in;
+    let turn_started = std::time::Instant::now();
+
+    let workspace = ostk_cache::Workspace::from_path(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    )
+    .unwrap_or_else(|_| ostk_cache::Workspace {
+        priority_hash: "unknown".to_string(),
+        source: ostk_cache::WorkspaceSource::Cwd,
+    });
+
+    let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let method_str = method.as_str().to_string();
+
+    let session_id = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("openai-session-id"))
+        .or_else(|| headers.get("x-client-request-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let mut h = sha2::Sha256::new();
+            h.update(auth.as_bytes());
+            h.update(b":catchall");
+            format!(
+                "{}:{}",
+                workspace.priority_hash,
+                &format!("{:x}", h.finalize())[..12]
+            )
+        });
+
+    let mut http_capture = ostk_cache::http_capture::HttpCapture::maybe_start(
+        config.capture_http.value,
+        &config.capture_http_dir.value,
+        &session_id,
+        &method_str,
+        path,
+        &headers,
+        &body_bytes,
+    );
+
+    let capture_root = config.capture_http_dir.value.clone();
+    let path_owned = path.to_string();
+
+    let client = reqwest::Client::new();
+    let url = format!("{}{}", config.upstream.value, path);
+    let mut req_builder = client.request(method.clone(), url);
+    for (k, v) in headers.iter() {
+        if !is_hop_by_hop_request_header(k) {
+            req_builder = req_builder.header(k, v);
+        }
+    }
+    req_builder = req_builder.header("accept-encoding", "identity");
+
+    if !body_bytes.is_empty() {
+        if let Some(capture) = http_capture.as_mut() {
+            capture.record_outbound(&body_bytes);
+        }
+        req_builder = req_builder.body(body_bytes.to_vec());
+    }
+
+    let capture_id_pre = http_capture.as_ref().map(|c| c.id().to_string());
+
+    let mut response = match req_builder.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let body = json!({
+                "error": {"type": "upstream_error", "message": format!("{}", e)}
+            })
+            .to_string();
+            if let Some(capture) = http_capture.take() {
+                capture.finish(
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                    false,
+                    &HeaderMap::new(),
+                    body.as_bytes(),
+                    turn_started.elapsed(),
+                );
+            }
+            let mut row = ostk_cache::http_capture::UpstreamErrorRow::new(
+                &session_id,
+                &method_str,
+                &path_owned,
+                StatusCode::BAD_GATEWAY.as_u16(),
+                req_bytes_in,
+                req_bytes_out,
+                turn_started.elapsed(),
+            )
+            .with_resp_bytes(body.len() as u64);
+            if let Some(id) = capture_id_pre {
+                row = row.with_capture_id(id);
+            }
+            ostk_cache::http_capture::log_upstream_error(&capture_root, &row);
+            return Ok((StatusCode::BAD_GATEWAY, body).into_response());
+        }
+    };
+
+    let status = response.status();
+    let mut resp_builder = Response::builder().status(status.as_u16());
+    let mut is_sse = false;
+    for (k, v) in response.headers().iter() {
+        if !should_forward_response_header(k) {
+            continue;
+        }
+        if k.as_str().eq_ignore_ascii_case("content-type") && is_sse_content_type(v) {
+            is_sse = true;
+        }
+        resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
+    }
+    let response_headers_capture = response.headers().clone();
+    let session_id_for_stream = session_id.clone();
+    let method_for_stream = method_str.clone();
+    let path_for_stream = path_owned.clone();
+    let capture_id_for_stream = capture_id_pre.clone();
+
+    let stream = stream! {
+        let mut accumulated = Vec::<u8>::new();
+        while let Ok(Some(chunk)) = response.chunk().await {
+            if chunk.is_empty() {
+                continue;
+            }
+            accumulated.extend_from_slice(&chunk);
+            yield Ok::<_, std::io::Error>(chunk);
+        }
+
+        let resp_bytes_total = accumulated.len() as u64;
+        if let Some(capture) = http_capture.take() {
+            capture.finish(
+                status.as_u16(),
+                is_sse,
+                &response_headers_capture,
+                &accumulated,
+                turn_started.elapsed(),
+            );
+        }
+
+        if status.as_u16() >= 400 {
+            let mut row = ostk_cache::http_capture::UpstreamErrorRow::new(
+                &session_id_for_stream,
+                &method_for_stream,
+                &path_for_stream,
+                status.as_u16(),
+                req_bytes_in,
+                req_bytes_out,
+                turn_started.elapsed(),
+            )
+            .with_resp_bytes(resp_bytes_total);
+            if let Some(id) = capture_id_for_stream.clone() {
+                row = row.with_capture_id(id);
+            }
+            ostk_cache::http_capture::log_upstream_error(&capture_root, &row);
+        }
     };
 
     Ok(resp_builder.body(Body::from_stream(stream)).unwrap())

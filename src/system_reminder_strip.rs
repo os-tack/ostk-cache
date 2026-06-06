@@ -40,34 +40,43 @@
 //! rebuild-kernel) carries the same accumulated message history;
 //! none of them benefit from re-billing yesterday's nudges.
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const OPEN_TAG: &str = "<system-reminder>";
 const CLOSE_TAG: &str = "</system-reminder>";
 
-/// Aggregate statistics from one strip pass.
+// Inserted when stripping leaves a content array empty. Anthropic rejects
+// messages with zero content blocks, so we keep the slot to preserve
+// tool_use/tool_result pairings by index and substitute a minimal text.
+const PLACEHOLDER_TEXT: &str = "(reminder)";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SystemReminderStats {
-    /// Number of `<system-reminder>` blocks removed across all
-    /// stripped messages.
     pub blocks_removed: usize,
-    /// Total bytes removed (length of the stripped substrings,
-    /// tags included).
     pub bytes_removed: usize,
+    // Empty {type:"text", text:""} blocks pruned after a strip emptied
+    // them. The Anthropic API rejects empty text content blocks with
+    // 400: "text content blocks must be non-empty".
+    pub empty_blocks_pruned: usize,
+    // Placeholder text blocks inserted because pruning would otherwise
+    // have emptied a content array entirely.
+    pub placeholders_inserted: usize,
 }
 
 impl SystemReminderStats {
     pub fn is_empty(self) -> bool {
         self.blocks_removed == 0
+            && self.empty_blocks_pruned == 0
+            && self.placeholders_inserted == 0
     }
 
     pub fn add(&mut self, other: Self) {
         self.blocks_removed += other.blocks_removed;
         self.bytes_removed += other.bytes_removed;
+        self.empty_blocks_pruned += other.empty_blocks_pruned;
+        self.placeholders_inserted += other.placeholders_inserted;
     }
 
-    /// Rough token estimate. English text averages ~4 bytes/token;
-    /// this number is used for telemetry only.
     pub fn tokens_estimate(self) -> usize {
         self.bytes_removed / 4
     }
@@ -146,6 +155,51 @@ fn strip_reminders_recursive(value: &mut Value) -> SystemReminderStats {
 ///
 /// Returns aggregate stats; `SystemReminderStats::default()` if
 /// `messages` is missing, not an array, or contains no reminders.
+/// Recursively prune `{type:"text", text:""}` from every array reachable
+/// from `value`. When an array is emptied as a result, insert a single
+/// placeholder text block so callers (Anthropic) don't reject the request
+/// for a zero-block content array. Returns (pruned, placeholders).
+fn prune_empty_text_blocks(value: &mut Value) -> (usize, usize) {
+    let mut pruned = 0usize;
+    let mut placeholders = 0usize;
+    match value {
+        Value::Array(arr) => {
+            let before = arr.len();
+            arr.retain(|item| {
+                if let Value::Object(obj) = item {
+                    let is_text =
+                        obj.get("type").and_then(|t| t.as_str()) == Some("text");
+                    let is_empty =
+                        obj.get("text").and_then(|t| t.as_str()) == Some("");
+                    !(is_text && is_empty)
+                } else {
+                    true
+                }
+            });
+            let local_pruned = before - arr.len();
+            pruned += local_pruned;
+            if local_pruned > 0 && arr.is_empty() {
+                arr.push(json!({"type": "text", "text": PLACEHOLDER_TEXT}));
+                placeholders += 1;
+            }
+            for item in arr.iter_mut() {
+                let (p, ph) = prune_empty_text_blocks(item);
+                pruned += p;
+                placeholders += ph;
+            }
+        }
+        Value::Object(obj) => {
+            for (_, v) in obj.iter_mut() {
+                let (p, ph) = prune_empty_text_blocks(v);
+                pruned += p;
+                placeholders += ph;
+            }
+        }
+        _ => {}
+    }
+    (pruned, placeholders)
+}
+
 pub fn strip_system_reminders_from_past_turns(value: &mut Value) -> SystemReminderStats {
     let messages = match value.get_mut("messages").and_then(|m| m.as_array_mut()) {
         Some(m) => m,
@@ -159,8 +213,23 @@ pub fn strip_system_reminders_from_past_turns(value: &mut Value) -> SystemRemind
         if Some(i) == last_user_idx {
             continue;
         }
-        if let Some(content) = msg.get_mut("content") {
-            acc.add(strip_reminders_recursive(content));
+        let Some(content) = msg.get_mut("content") else {
+            continue;
+        };
+        let strip_stats = strip_reminders_recursive(content);
+        if strip_stats.blocks_removed == 0 {
+            continue;
+        }
+        acc.add(strip_stats);
+        let (pruned, placeholders) = prune_empty_text_blocks(content);
+        acc.empty_blocks_pruned += pruned;
+        acc.placeholders_inserted += placeholders;
+        // Bare-string content (older shape): strip may leave "".
+        if let Value::String(s) = content {
+            if s.is_empty() {
+                *s = PLACEHOLDER_TEXT.to_string();
+                acc.placeholders_inserted += 1;
+            }
         }
     }
     acc
@@ -355,6 +424,8 @@ mod tests {
         let stats = SystemReminderStats {
             blocks_removed: 1,
             bytes_removed: 400,
+            empty_blocks_pruned: 0,
+            placeholders_inserted: 0,
         };
         assert_eq!(stats.tokens_estimate(), 100);
     }
@@ -365,5 +436,121 @@ mod tests {
         let (out, stats) = strip_reminders_in_str(s).unwrap();
         assert_eq!(out, "tail");
         assert_eq!(stats.blocks_removed, 2);
+    }
+
+    // Repros the production 400: Claude Code's first user turn contains
+    // several reminder-only text blocks followed by the real user text.
+    // On turn 2, this becomes a "past" message; pre-fix, strip left three
+    // empty text blocks and Anthropic returned:
+    //   400 messages: text content blocks must be non-empty
+    #[test]
+    fn prunes_empty_text_blocks_left_by_strip() {
+        let mut v = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>MCP instructions</system-reminder>"},
+                        {"type": "text", "text": "<system-reminder>skills list</system-reminder>"},
+                        {"type": "text", "text": "<system-reminder>auto mode</system-reminder>"},
+                        {"type": "text", "text": "Hello, what were we working on?"}
+                    ]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]},
+                {"role": "user", "content": [{"type": "text", "text": "follow-up"}]}
+            ]
+        });
+        let stats = strip_system_reminders_from_past_turns(&mut v);
+        assert_eq!(stats.blocks_removed, 3);
+        assert_eq!(stats.empty_blocks_pruned, 3);
+        assert_eq!(stats.placeholders_inserted, 0);
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "Hello, what were we working on?");
+        for blk in content {
+            if blk["type"] == "text" {
+                assert_ne!(blk["text"], "", "no empty text block must remain");
+            }
+        }
+    }
+
+    #[test]
+    fn inserts_placeholder_when_all_blocks_were_reminders() {
+        let mut v = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "<system-reminder>only this</system-reminder>"}
+                    ]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "ack"}]},
+                {"role": "user", "content": [{"type": "text", "text": "next"}]}
+            ]
+        });
+        let stats = strip_system_reminders_from_past_turns(&mut v);
+        assert_eq!(stats.blocks_removed, 1);
+        assert_eq!(stats.empty_blocks_pruned, 1);
+        assert_eq!(stats.placeholders_inserted, 1);
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert!(
+            !content[0]["text"].as_str().unwrap().is_empty(),
+            "placeholder must be non-empty"
+        );
+    }
+
+    #[test]
+    fn does_not_prune_whitespace_only_text() {
+        // Whitespace-only text is accepted by Anthropic; leave it alone.
+        let mut v = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "\n<system-reminder>x</system-reminder>"}
+                    ]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "x"}]},
+                {"role": "user", "content": [{"type": "text", "text": "next"}]}
+            ]
+        });
+        let stats = strip_system_reminders_from_past_turns(&mut v);
+        assert_eq!(stats.blocks_removed, 1);
+        assert_eq!(stats.empty_blocks_pruned, 0);
+        assert_eq!(stats.placeholders_inserted, 0);
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["text"], "\n");
+    }
+
+    #[test]
+    fn prunes_empty_text_inside_tool_result_content() {
+        let mut v = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_a",
+                        "content": [
+                            {"type": "text", "text": "<system-reminder>only</system-reminder>"}
+                        ]
+                    }]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "ack"}]},
+                {"role": "user", "content": [{"type": "text", "text": "next"}]}
+            ]
+        });
+        let stats = strip_system_reminders_from_past_turns(&mut v);
+        assert_eq!(stats.blocks_removed, 1);
+        assert_eq!(stats.empty_blocks_pruned, 1);
+        assert_eq!(stats.placeholders_inserted, 1);
+        let tool_content = v["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(tool_content.len(), 1);
+        assert!(!tool_content[0]["text"].as_str().unwrap().is_empty());
     }
 }

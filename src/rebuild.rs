@@ -154,6 +154,14 @@ pub struct RebuildConfig {
     /// daemon. None → templates unavailable (standalone mode, kernel
     /// down, daemon predates the verb, or no clusters formed).
     pub templates_summary: Option<String>,
+    /// Less-lossy prior-user-intent thread, sourced from the harness
+    /// transcript JSONL (Layer 3 Pattern A). When present, replaces
+    /// the in-process `extract_user_intent_thread` output — the
+    /// transcript has the full user text, so we kill the 240-char
+    /// chop. Capped at `max_user_intent_thread` (last N turns) by
+    /// the caller. None → fall back to in-process slice (e.g.
+    /// non-claude-code harness, missing projects dir).
+    pub prior_user_turns_override: Option<Vec<String>>,
 }
 
 impl RebuildConfig {
@@ -179,6 +187,7 @@ impl RebuildConfig {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         }
     }
 
@@ -204,6 +213,7 @@ impl RebuildConfig {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         }
     }
 }
@@ -283,7 +293,16 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         .clone()
         .or_else(|| extract_latest_envelope(dropped_slice));
     let native_summary = summarize_native_tools(dropped_slice, config.max_native_tool_summary);
-    let user_thread = extract_user_intent_thread(dropped_slice, config.max_user_intent_thread);
+    let user_thread = match &config.prior_user_turns_override {
+        Some(turns) if !turns.is_empty() => {
+            // Transcript-sourced thread: full text, no chop. Cap at the
+            // last N turns to match in-process behavior.
+            let cap = config.max_user_intent_thread;
+            let start = turns.len().saturating_sub(cap);
+            turns[start..].to_vec()
+        }
+        _ => extract_user_intent_thread(dropped_slice, config.max_user_intent_thread),
+    };
 
     let synthetic = compose_synthetic_context(
         &envelope,
@@ -869,6 +888,11 @@ fn find_envelope_quadruplet(text: &str) -> Option<String> {
 #[derive(Debug, Clone, Default)]
 struct NativeToolCall {
     name: String,
+    /// Tool-use id from the inbound request (claude-code: `toolu_<…>`,
+    /// other harnesses vary). Carried through so the projection can
+    /// emit a short tag (`short_tag`-style suffix) — addressable by
+    /// eye and resolvable to a body via the transcript index.
+    id: String,
     /// Raw input args (preserved so we can render per-tool signatures
     /// at compose time — extracting offset/limit for Read, cmd for
     /// Bash, etc. — instead of dumping the JSON blob).
@@ -928,9 +952,10 @@ fn summarize_native_tools(messages: &[Value], cap: usize) -> Vec<NativeToolCall>
                         order.push(id.clone());
                     }
                     by_id.insert(
-                        id,
+                        id.clone(),
                         NativeToolCall {
                             name,
+                            id,
                             input,
                             output_size: 0,
                             status: "pending".into(),
@@ -1144,7 +1169,10 @@ fn render_tool_signature(call: &NativeToolCall) -> String {
         }
     };
 
-    let head = format!("{} [{}] (out:{}b)", signature, call.status, call.output_size);
+    let mut head = format!("{} [{}] (out:{}b)", signature, call.status, call.output_size);
+    if let Some(tag) = short_tool_tag(&call.id) {
+        head.push_str(&format!(" [{}]", tag));
+    }
     // Inline body for [error] under budget — small, signal-dense,
     // almost always worth seeing without a re-fetch. [ok] results
     // stay shape-only.
@@ -1152,6 +1180,19 @@ fn render_tool_signature(call: &NativeToolCall) -> String {
         Some(body) => format!("{}\n  ```\n  {}\n  ```", head, body.replace('\n', "\n  ")),
         None => head,
     }
+}
+
+/// Last 8 chars of a tool-use id, lowercased — addressable by eye, and
+/// resolvable to a full body via the transcript index. Returns None for
+/// empty ids or ids shorter than 8 chars (those are too generic to be
+/// useful as a tag).
+fn short_tool_tag(id: &str) -> Option<String> {
+    if id.chars().count() < 8 {
+        return None;
+    }
+    let total = id.chars().count();
+    let tail: String = id.chars().skip(total - 8).collect();
+    Some(tail.to_lowercase())
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -1486,6 +1527,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -1526,6 +1568,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -1558,6 +1601,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Disabled));
@@ -1577,6 +1621,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -1596,6 +1641,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -1612,6 +1658,7 @@ mod tests {
             output_size: 95,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("read"));
@@ -1630,6 +1677,7 @@ mod tests {
             output_size: 800,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("/abs/native_read.rs"), "must extract file_path");
@@ -1645,6 +1693,7 @@ mod tests {
             output_size: 0,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("/abs/out.rs"));
@@ -1658,6 +1707,7 @@ mod tests {
             output_size: 50,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("/abs/edit.rs"));
@@ -1673,6 +1723,7 @@ mod tests {
             output_size: 6467,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("/abs/std.rs"));
@@ -1688,6 +1739,7 @@ mod tests {
             output_size: 225,
             status: "error".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("cargo test --release"));
@@ -1702,6 +1754,7 @@ mod tests {
             output_size: 800,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("fn main"));
@@ -1717,6 +1770,7 @@ mod tests {
             output_size: 10,
             status: "ok".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("exotic_tool"));
@@ -1732,6 +1786,7 @@ mod tests {
             output_size: 0,
             status: "pending".into(),
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("bash"));
@@ -1748,6 +1803,7 @@ mod tests {
             output_size: 225,
             status: "error".into(),
             error_body: Some("error[E0308]: mismatched types\n  --> src/main.rs:10:5\n   |\n10 |     return 42;\n   |     ^^^^^^^^^ expected `()`, found integer".into()),
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(line.contains("[error]"));
@@ -1769,6 +1825,7 @@ mod tests {
             // error_body when status==error, but the renderer must
             // not double-rely on that.)
             error_body: None,
+            id: String::new(),
         };
         let line = render_tool_signature(&call);
         assert!(!line.contains("```"));
@@ -1838,6 +1895,50 @@ mod tests {
     // ── Discipline preamble ───────────────────────────────────────────────
 
     #[test]
+    fn render_signature_appends_short_tool_tag() {
+        let call = NativeToolCall {
+            name: "Bash".into(),
+            id: "toolu_01ABCdefA8B99E0D".into(),
+            input: Some(json!({"cmd": "ls"})),
+            output_size: 31,
+            status: "ok".into(),
+            error_body: None,
+        };
+        let line = render_tool_signature(&call);
+        // Last 8 chars, lowercased.
+        assert!(line.ends_with(" [a8b99e0d]"), "got: {}", line);
+        assert!(line.contains("(out:31b) ["), "tag follows the (out:Nb) marker");
+    }
+
+    #[test]
+    fn render_signature_omits_tag_when_id_missing() {
+        let call = NativeToolCall {
+            name: "Bash".into(),
+            id: String::new(),
+            input: Some(json!({"cmd": "ls"})),
+            output_size: 12,
+            status: "ok".into(),
+            error_body: None,
+        };
+        let line = render_tool_signature(&call);
+        assert!(line.ends_with("(out:12b)"), "no tag suffix when id empty: {}", line);
+    }
+
+    #[test]
+    fn render_signature_omits_tag_when_id_too_short() {
+        let call = NativeToolCall {
+            name: "Bash".into(),
+            id: "abc123".into(),
+            input: Some(json!({"cmd": "ls"})),
+            output_size: 5,
+            status: "ok".into(),
+            error_body: None,
+        };
+        let line = render_tool_signature(&call);
+        assert!(line.ends_with("(out:5b)"), "no tag suffix when id <8 chars: {}", line);
+    }
+
+    #[test]
     fn synthetic_context_includes_discipline_preamble() {
         let mut req = json!({
             "messages": [
@@ -1855,6 +1956,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         apply_rebuild(&mut req, &config);
         let messages = req.get("messages").unwrap().as_array().unwrap();
@@ -2059,6 +2161,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         apply_rebuild(&mut req, &config);
         let synthetic_block = req.get("messages").unwrap().as_array().unwrap()[0]
@@ -2107,6 +2210,7 @@ mod tests {
                 "## Recent assistant turns (digest)\n\n- **[t-0]** [agreed] did the thing [a.rs]\n".into(),
             ),
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2160,6 +2264,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -2199,6 +2304,7 @@ mod tests {
             ),
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2433,6 +2539,7 @@ mod tests {
             transcript_tail_summary: None,
             recent_assistant_digests: None,
             templates_summary: None,
+            prior_user_turns_override: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(

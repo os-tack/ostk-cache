@@ -1,98 +1,98 @@
 # .language — compiled tack dialect
 # verb | tier | layer | last_gen | momentum | resolution | signature | doc | spec | core_resident
 # --- services (tier 0) ---
-:approval    | 0 | service  | 20587| 1.00 | internal | () -> () | tool approval gate |  | 
+:approval    | 0 | service  | 20594| 1.00 | internal | () -> () | tool approval gate |  | 
 :arrive      | 0 | service  | 0    | 1.00 | internal | () -> () | arrive |  | core
-:capture     | 0 | service  | 20587| 1.00 | internal | (out?, action?) -> (path) | toggle terminal recording — asciicast v2 |  | 
-:digest      | 0 | service  | 20587| 1.00 | internal | () -> () | process + file annotations |  | 
+:capture     | 0 | service  | 20594| 1.00 | internal | (out?, action?) -> (path) | toggle terminal recording — asciicast v2 |  | 
+:digest      | 0 | service  | 20594| 1.00 | internal | () -> () | process + file annotations |  | 
 :dispatch    | 0 | service  | 0    | 1.00 | internal | () -> () | dispatch |  | core
-:elision     | 0 | service  | 20587| 1.00 | internal | () -> () | read optimization (304) |  | 
-:embeddings  | 0 | service  | 20587| 1.00 | internal | (text) -> (vector) | semantic similarity Burn GPU |  | 
+:elision     | 0 | service  | 20594| 1.00 | internal | () -> () | read optimization (304) |  | 
+:embeddings  | 0 | service  | 20594| 1.00 | internal | (text) -> (vector) | semantic similarity Burn GPU |  | 
 :fs_ops      | 0 | service  | 0    | 1.00 | internal | () -> () | fs_ops |  | core
-:gen-table   | 0 | service  | 20587| 1.00 | internal | () -> () | file generation tracking |  | 
+:gen-table   | 0 | service  | 20594| 1.00 | internal | () -> () | file generation tracking |  | 
 :handoff     | 0 | service  | 0    | 1.00 | internal | () -> () | handoff |  | core
-:heartbeat   | 0 | service  | 20587| 1.00 | internal | () -> () | agent health monitoring |  | 
-:hotpr       | 0 | service  | 20587| 1.00 | internal | () -> () | conflict resolution |  | 
-:lifecycle   | 0 | service  | 20587| 1.00 | .ostk/fleet/ | () -> (state) | agent lifecycle state machine (replaces dying →1176) |  | 
+:heartbeat   | 0 | service  | 20594| 1.00 | internal | () -> () | agent health monitoring |  | 
+:hotpr       | 0 | service  | 20594| 1.00 | internal | () -> () | conflict resolution |  | 
+:lifecycle   | 0 | service  | 20594| 1.00 | .ostk/fleet/ | () -> (state) | agent lifecycle state machine (replaces dying →1176) |  | 
 :note        | 0 | service  | 0    | 1.00 | internal | () -> () | note |  | core
-:recovery    | 0 | service  | 20587| 1.00 | internal | () -> () | tool call logging |  | 
-:release_turns| 0 | service  | 20587| 1.00 | internal | (before_turn) -> (ack) | release processed turns — journal bookkeeping |  | core
+:recovery    | 0 | service  | 20594| 1.00 | internal | () -> () | tool call logging |  | 
+:release_turns| 0 | service  | 20594| 1.00 | internal | (before_turn) -> (ack) | release processed turns — journal bookkeeping |  | core
 :session_history| 0 | service  | 0    | 1.00 | internal | () -> () | sess hist |  | core
 :verb_help   | 0 | service  | 0    | 1.00 | internal | () -> () | verb_help |  | core
 :verb_load   | 0 | service  | 0    | 1.00 | internal | () -> () | verb_load |  | core
 # --- devices (tier 0) ---
-:fcp-olleh   | 0 | device   | 20587| 0.00 | .ostk/drivers/fcp-olleh.sock | (query) -> (result) | olleh device driver |  | 
-:fcp-recall  | 0 | device   | 20587| 0.00 | .ostk/drivers/fcp-recall.sock | (query) -> (result) | recall device driver |  | 
-:fcp-rust    | 0 | device   | 20587| 0.00 | .ostk/drivers/fcp-rust.sock | (query) -> (result) | rust device driver |  | 
-:fcp-screen  | 0 | device   | 20587| 1.00 | internal | (event) -> (render) | display driver |  | 
-:fcp-web     | 0 | device   | 20587| 1.00 | internal | (query) -> (result) | web device driver |  | 
-:web_links   | 0 | device   | 20587| 1.00 | internal | (url) → (links) | extract all links from a web page |  | core
-:web_read    | 0 | device   | 20587| 1.00 | internal | (url) → (text) | read a web page and extract text content |  | core
-:web_status  | 0 | device   | 20587| 1.00 | internal | (url) → (status) | check HTTP status and headers for a URL |  | core
+:fcp-olleh   | 0 | device   | 20594| 0.00 | .ostk/drivers/fcp-olleh.sock | (query) -> (result) | olleh device driver |  | 
+:fcp-recall  | 0 | device   | 20594| 0.00 | .ostk/drivers/fcp-recall.sock | (query) -> (result) | recall device driver |  | 
+:fcp-rust    | 0 | device   | 20594| 0.00 | .ostk/drivers/fcp-rust.sock | (query) -> (result) | rust device driver |  | 
+:fcp-screen  | 0 | device   | 20594| 1.00 | internal | (event) -> (render) | display driver |  | 
+:fcp-web     | 0 | device   | 20594| 1.00 | internal | (query) -> (result) | web device driver |  | 
+:web_links   | 0 | device   | 20594| 1.00 | internal | (url) → (links) | extract all links from a web page |  | core
+:web_read    | 0 | device   | 20594| 1.00 | internal | (url) → (text) | read a web page and extract text content |  | core
+:web_status  | 0 | device   | 20594| 1.00 | internal | (url) → (status) | check HTTP status and headers for a URL |  | core
 # --- kernel ---
-:audit       | 0 | kernel   | 20587| 1.00 | internal | () → (report) | audit integrity check |  | 
-:boot        | 0 | kernel   | 20587| 1.00 | internal | () → (state) | read state, report identity |  | 
-:clock       | 0 | kernel   | 20587| 1.00 | internal | () → (time,id,audit) | temporal position |  | 
-:compile     | 0 | kernel   | 20587| 1.00 | internal | (dry_run?) → (report) | triage hay into needles, rebuild spheres |  | 
-:diff        | 0 | kernel   | 20587| 1.00 | internal | () → (delta) | session delta since boot |  | 
-:ps          | 0 | kernel   | 20587| 1.00 | internal | () → (fleet) | daemon and agent status |  | 
-:reap        | 0 | kernel   | 20587| 1.00 | internal | () → (count) | clean dead agents |  | 
-:trace       | 0 | kernel   | 20587| 1.00 | internal | (id) → (graph) | trace needle, spec, or commit |  | 
+:audit       | 0 | kernel   | 20594| 1.00 | internal | () → (report) | audit integrity check |  | 
+:boot        | 0 | kernel   | 20594| 1.00 | internal | () → (state) | read state, report identity |  | 
+:clock       | 0 | kernel   | 20594| 1.00 | internal | () → (time,id,audit) | temporal position |  | 
+:compile     | 0 | kernel   | 20594| 1.00 | internal | (dry_run?) → (report) | triage hay into needles, rebuild spheres |  | 
+:diff        | 0 | kernel   | 20594| 1.00 | internal | () → (delta) | session delta since boot |  | 
+:ps          | 0 | kernel   | 20594| 1.00 | internal | () → (fleet) | daemon and agent status |  | 
+:reap        | 0 | kernel   | 20594| 1.00 | internal | () → (count) | clean dead agents |  | 
+:trace       | 0 | kernel   | 20594| 1.00 | internal | (id) → (graph) | trace needle, spec, or commit |  | 
 # --- user ---
-:activate    | 0 | user     | 20587| 1.00 | internal | (id) → (briefing) | pre-flight briefing for a needle |  | 
-:add         | 0 | user     | 20587| 1.00 | internal | (title, priority?, milestone?, tags?, ac?, description?, depends_on?, blocks?) → (id) | file a needle |  | 
+:activate    | 0 | user     | 20594| 1.00 | internal | (id) → (briefing) | pre-flight briefing for a needle |  | 
+:add         | 0 | user     | 20594| 1.00 | internal | (title, priority?, milestone?, tags?, ac?, description?, depends_on?, blocks?) → (id) | file a needle |  | 
 # --- user ---
-:bash        | 0 | process  | 20587| 1.00 | internal | (cmd, cwd?, timeout?, raw?) → (output) | run a shell command (kernel-equivalent of native Bash; adds audit + gen_table). Pass cwd to set working directory — do not prefix with 'cd X && ...' |  | core
+:bash        | 0 | process  | 20594| 1.00 | internal | (cmd, cwd?, timeout?, raw?) → (output) | run a shell command (kernel-equivalent of native Bash; adds audit + gen_table). Pass cwd to set working directory — do not prefix with 'cd X && ...' |  | core
 # --- user ---
-:close       | 0 | user     | 20587| 1.00 | internal | (id, reason?) → () | close a needle |  | 
+:close       | 0 | user     | 20594| 1.00 | internal | (id, reason?) → () | close a needle |  | 
 # --- user ---
-:context_evict| 0 | memory   | 20587| 1.00 | internal | (name) → (freed_tokens) | explicit evict hot → warm |  | core
-:context_load| 0 | memory   | 20587| 1.00 | internal | (name) → (page) | load page into hot context |  | core
-:context_pages| 0 | memory   | 20587| 1.00 | internal | (state?) → (pages) | list pages |  | core
-:context_pin | 0 | memory   | 20587| 1.00 | internal | (name, unpin?) → (was) | toggle eviction protection |  | core
-:context_release| 0 | memory   | 20587| 1.00 | internal | (name) → () | mark page warm (release hot slot) |  | core
-:context_restore| 0 | memory   | 20587| 1.00 | internal | (name) → (page) | promote warm/cold → hot |  | core
-:context_store| 0 | memory   | 20587| 1.00 | internal | (name, content, owner?) → (page) | store content as L1.5 page (cold) |  | core
+:context_evict| 0 | memory   | 20594| 1.00 | internal | (name) → (freed_tokens) | explicit evict hot → warm |  | core
+:context_load| 0 | memory   | 20594| 1.00 | internal | (name) → (page) | load page into hot context |  | core
+:context_pages| 0 | memory   | 20594| 1.00 | internal | (state?) → (pages) | list pages |  | core
+:context_pin | 0 | memory   | 20594| 1.00 | internal | (name, unpin?) → (was) | toggle eviction protection |  | core
+:context_release| 0 | memory   | 20594| 1.00 | internal | (name) → () | mark page warm (release hot slot) |  | core
+:context_restore| 0 | memory   | 20594| 1.00 | internal | (name) → (page) | promote warm/cold → hot |  | core
+:context_store| 0 | memory   | 20594| 1.00 | internal | (name, content, owner?) → (page) | store content as L1.5 page (cold) |  | core
 # --- user ---
-:correct     | 0 | user     | 20587| 1.00 | internal | (agent, message) → () | send correction nudge |  | 
-:decide      | 0 | user     | 20587| 1.00 | internal | (key, value, reason?) → () | append a decision to decisions.jsonl |  | 
-:draft       | 0 | user     | 20587| 1.00 | internal | (title) → (path) | create draft document |  | 
-:hay         | 0 | user     | 20587| 1.00 | internal | (text, source?) → () | capture raw intent |  | 
+:correct     | 0 | user     | 20594| 1.00 | internal | (agent, message) → () | send correction nudge |  | 
+:decide      | 0 | user     | 20594| 1.00 | internal | (key, value, reason?) → () | append a decision to decisions.jsonl |  | 
+:draft       | 0 | user     | 20594| 1.00 | internal | (title) → (path) | create draft document |  | 
+:hay         | 0 | user     | 20594| 1.00 | internal | (text, source?) → () | capture raw intent |  | 
 # --- user ---
-:help        | 0 | info     | 20587| 1.00 | internal | () → (help) | show available tools and usage |  | core
+:help        | 0 | info     | 20594| 1.00 | internal | () → (help) | show available tools and usage |  | core
 # --- user ---
-:idea        | 0 | user     | 20587| 1.00 | internal | (straw) → () | capture intent — thought with shape, not yet executable |  | 
+:idea        | 0 | user     | 20594| 1.00 | internal | (straw) → () | capture intent — thought with shape, not yet executable |  | 
 # --- user ---
-:interact    | 0 | process  | 20587| 1.00 | internal | (alias, action, input?, lines?, timeout?) → (output) | interact with background process |  | core
+:interact    | 0 | process  | 20594| 1.00 | internal | (alias, action, input?, lines?, timeout?) → (output) | interact with background process |  | core
 # --- user ---
-:lock        | 0 | state    | 20587| 1.00 | internal | (action, name, timeout?) → (result) | coordination locks |  | core
+:lock        | 0 | state    | 20594| 1.00 | internal | (action, name, timeout?) → (result) | coordination locks |  | core
 # --- user ---
-:mem_fault_recall| 0 | memory   | 20587| 1.00 | internal | (query, intent?, limit?) → (page_names) | Synthesize recall hits into virtual memory pages |  | core
+:mem_fault_recall| 0 | memory   | 20594| 1.00 | internal | (query, intent?, limit?) → (page_names) | Synthesize recall hits into virtual memory pages |  | core
 # --- user ---
-:needle      | 0 | user     | 20587| 1.00 | internal | (title, priority?, milestone?, tags?, ac?, description?, depends_on?, blocks?) → (id) | file a needle |  | 
-:needle_edit | 0 | user     | 20587| 1.00 | internal | (id, priority?, milestone?, tags?, ac?, description?) → () | edit needle fields (not file CAS — for that use `edit`) |  | 
-:nudge       | 0 | user     | 20587| 1.00 | internal | (agent, message) → () | inter-agent messaging |  | 
-:promote     | 0 | user     | 20587| 1.00 | internal | (id, priority, reason?) → () | change needle priority |  | 
+:needle      | 0 | user     | 20594| 1.00 | internal | (title, priority?, milestone?, tags?, ac?, description?, depends_on?, blocks?) → (id) | file a needle |  | 
+:needle_edit | 0 | user     | 20594| 1.00 | internal | (id, priority?, milestone?, tags?, ac?, description?) → () | edit needle fields (not file CAS — for that use `edit`) |  | 
+:nudge       | 0 | user     | 20594| 1.00 | internal | (agent, message) → () | inter-agent messaging |  | 
+:promote     | 0 | user     | 20594| 1.00 | internal | (id, priority, reason?) → () | change needle priority |  | 
 # --- user ---
-:read        | 0 | process  | 20587| 1.00 | internal | (path, offset?, limit?, enrich?) → (text) | read a file (kernel-equivalent of native Read; adds gen_table + elision) |  | core
+:read        | 0 | process  | 20594| 1.00 | internal | (path, offset?, limit?, enrich?) → (text) | read a file (kernel-equivalent of native Read; adds gen_table + elision) |  | core
 # --- user ---
-:recall      | 0 | memory   | 20587| 1.00 | internal | (addr) → (record) | fetch a substrate record by address (needle / decision / path / journal seq) |  | core
-:recall_outline| 0 | memory   | 20587| 1.00 | internal | (addr, depth?) → (outline) | hierarchical outline for a recall address (title + children) |  | core
-:recall_search| 0 | memory   | 20587| 1.00 | internal | (query, scope?, mode?, limit?) → (matches) | search across the recall substrate (needles, decisions, code, transcripts) |  | core
+:recall      | 0 | memory   | 20594| 1.00 | internal | (addr) → (record) | fetch a substrate record by address (needle / decision / path / journal seq) |  | core
+:recall_outline| 0 | memory   | 20594| 1.00 | internal | (addr, depth?) → (outline) | hierarchical outline for a recall address (title + children) |  | core
+:recall_search| 0 | memory   | 20594| 1.00 | internal | (query, scope?, mode?, limit?) → (matches) | search across the recall substrate (needles, decisions, code, transcripts) |  | core
 # --- user ---
-:search      | 0 | user     | 20587| 1.00 | internal | (query, scope?, mode?, expand?, limit?) → (matches) | unified search across code, memory, and transcripts |  | core
+:search      | 0 | user     | 20594| 1.00 | internal | (query, scope?, mode?, expand?, limit?) → (matches) | unified search across code, memory, and transcripts |  | core
 # --- user ---
-:session     | 0 | state    | 20587| 1.00 | internal | (action, name?) → (result) | session management |  | core
+:session     | 0 | state    | 20594| 1.00 | internal | (action, name?) → (result) | session management |  | core
 # --- user ---
-:shelve      | 0 | user     | 20587| 1.00 | internal | (id) → (snapshot) | pause needle work |  | 
-:show        | 0 | user     | 20587| 1.00 | internal | (target, json?) → (detail) | show kernel state |  | 
+:shelve      | 0 | user     | 20594| 1.00 | internal | (id) → (snapshot) | pause needle work |  | 
+:show        | 0 | user     | 20594| 1.00 | internal | (target, json?) → (detail) | show kernel state |  | 
 # --- user ---
-:spawn       | 0 | process  | 20587| 1.00 | internal | (alias, cmd, wait_for?, timeout?) → (pid) | background process |  | core
+:spawn       | 0 | process  | 20594| 1.00 | internal | (alias, cmd, wait_for?, timeout?) → (pid) | background process |  | core
 # --- user ---
-:status      | 0 | user     | 20587| 1.00 | internal | (json?) → (summary) | show OS status |  | 
+:status      | 0 | user     | 20594| 1.00 | internal | (json?) → (summary) | show OS status |  | 
 # --- user ---
-:tack        | 0 | resolver | 20587| 1.00 | internal | (input) → (resolution) | resolve tack grammar to ostk commands |  | core
+:tack        | 0 | resolver | 20594| 1.00 | internal | (input) → (resolution) | resolve tack grammar to ostk commands |  | core
 # --- user ---
-:unshelve    | 0 | user     | 20587| 1.00 | internal | (id) → () | resume needle work |  | 
+:unshelve    | 0 | user     | 20594| 1.00 | internal | (id) → () | resume needle work |  | 
 # --- user ---
-:write       | 0 | process  | 20587| 1.00 | internal | (path, content) → (bytes) | write a file (kernel-equivalent of native Write; adds gen_table + audit) |  | 
+:write       | 0 | process  | 20594| 1.00 | internal | (path, content) → (bytes) | write a file (kernel-equivalent of native Write; adds gen_table + audit) |  | 
