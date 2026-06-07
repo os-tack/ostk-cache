@@ -124,6 +124,10 @@ pub struct RebuildConfig {
     pub mode_tag: String,
     /// Cap on the number of native tool calls summarized into context
     /// (most recent N retained). Bounded to prevent runaway summaries.
+    /// →1979 K4: rebudgeted 50→18 — resolved-[ok] shapes beyond the
+    /// current epoch are recall/re-run territory; the deep window was
+    /// unanimously low-value (→1974). Unresolved frontier items are
+    /// EXEMPT from this cap (see [`summarize_unresolved`]).
     pub max_native_tool_summary: usize,
     /// Cap on the number of prior user messages retained in the user
     /// intent thread (most recent N).
@@ -181,7 +185,7 @@ impl RebuildConfig {
         Self {
             enabled,
             mode_tag: mode_tag.to_string(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -207,7 +211,7 @@ impl RebuildConfig {
         Self {
             enabled,
             mode_tag: mode_tag.to_string(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -293,6 +297,10 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         .clone()
         .or_else(|| extract_latest_envelope(dropped_slice));
     let native_summary = summarize_native_tools(dropped_slice, config.max_native_tool_summary);
+    // →1979 K3: frontier scan runs over the FULL dropped slice,
+    // deliberately uncapped — unresolved items are exempt from the
+    // paging budget above.
+    let unresolved = summarize_unresolved(dropped_slice);
     let user_thread = match &config.prior_user_turns_override {
         Some(turns) if !turns.is_empty() => {
             // Transcript-sourced thread: full text, no chop. Cap at the
@@ -307,6 +315,7 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
     let synthetic = compose_synthetic_context(
         &envelope,
         &native_summary,
+        &unresolved,
         &user_thread,
         config.transcript_tail_summary.as_deref(),
         config.recent_assistant_digests.as_deref(),
@@ -1029,6 +1038,94 @@ fn summarize_native_tools(messages: &[Value], cap: usize) -> Vec<NativeToolCall>
         .collect()
 }
 
+/// →1979 K3: scan the FULL dropped slice (uncapped — this is the
+/// survival mechanism) for frontier items that must not fall off the
+/// projection just because resolved [ok] shapes pushed them past the
+/// paging cap:
+///
+/// 1. **In-flight tool_use** — a `tool_use` with no paired
+///    `tool_result` at the cycle boundary (cycle died mid-chain).
+/// 2. **Armed monitors** — `Monitor` calls that returned [ok];
+///    liveness is not derivable from the transcript, so entries carry
+///    a verify hint rather than asserting the monitor still runs.
+/// 3. **Held locks / lane claims** — kernel `lock` `create` without a
+///    matching `release`/`break` for the same name in the window.
+///
+/// Because this is recomputed from the request's message history on
+/// every rebuild, frontier items survive cycle death and compaction
+/// regardless of how deep they sit — they re-emit into each new
+/// synthetic until the transcript shows them resolved.
+fn summarize_unresolved(messages: &[Value]) -> Vec<String> {
+    let all = summarize_native_tools(messages, usize::MAX);
+    let mut items: Vec<String> = Vec::new();
+
+    // 1. in-flight tool_use (pending = no tool_result observed)
+    for call in &all {
+        if call.status == "pending" {
+            items.push(format!(
+                "in-flight tool_use: {} — no result observed at cycle boundary; re-issue or check substrate before assuming it ran",
+                render_tool_signature(call)
+            ));
+        }
+    }
+
+    // 2. armed monitors (transcript can't prove liveness — hint, don't assert)
+    for call in &all {
+        if call.status == "ok" && call.name == "Monitor" {
+            let desc = call
+                .input
+                .as_ref()
+                .and_then(|i| i.get("description"))
+                .and_then(|d| d.as_str())
+                .unwrap_or("?");
+            items.push(format!(
+                "armed monitor: {:?} (liveness not derivable from transcript — verify via /tasks)",
+                truncate_chars(desc, 100)
+            ));
+        }
+    }
+
+    // 3. locks created and not released in the window (lane claims).
+    // Encounter order is preserved by `all`, so create→release pairs
+    // cancel correctly even when re-acquired.
+    let mut held: Vec<String> = Vec::new();
+    for call in &all {
+        if call.status != "ok" {
+            continue;
+        }
+        let is_lock = call.name == "mcp__ostk__lock" || call.name == "lock";
+        if !is_lock {
+            continue;
+        }
+        let (action, name) = match call.input.as_ref() {
+            Some(i) => (
+                i.get("action").and_then(|a| a.as_str()).unwrap_or(""),
+                i.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+            ),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        match action {
+            "create" => {
+                if !held.iter().any(|h| h == name) {
+                    held.push(name.to_string());
+                }
+            }
+            "release" | "break" => held.retain(|h| h != name),
+            _ => {}
+        }
+    }
+    for name in held {
+        items.push(format!(
+            "lock held: {name} (created this window, no release observed — confirm with lock status before re-claiming)"
+        ));
+    }
+
+    items
+}
+
 fn extract_user_intent_thread(messages: &[Value], cap: usize) -> Vec<String> {
     let mut thread = Vec::new();
     for msg in messages {
@@ -1207,6 +1304,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 fn compose_synthetic_context(
     envelope: &Option<String>,
     native_summary: &[NativeToolCall],
+    unresolved: &[String],
     user_thread: &[String],
     transcript_tail_summary: Option<&str>,
     recent_assistant_digests: Option<&str>,
@@ -1215,7 +1313,7 @@ fn compose_synthetic_context(
     let mut out = String::new();
     out.push_str("# Kernel projection — current cycle state\n\n");
     out.push_str(
-        "See your system prompt's `# ostk-cache kernel orientation` block for the trichotomy, the ok/error asymmetry, and the turn-digest fence requirement. The sections below are dynamic state for *this cycle only*: live envelope, paged tool activity, prior user thread, recent assistant digests.\n\n",
+        "See your system prompt's `# ostk-cache kernel orientation` block for the trichotomy, the ok/error asymmetry, and the turn-digest fence requirement. The sections below are dynamic state for *this cycle only*: live envelope, paged tool activity, unresolved frontier, prior user thread, recent assistant digests.\n\n",
     );
 
     out.push_str("## Live state envelope\n\n");
@@ -1236,6 +1334,16 @@ fn compose_synthetic_context(
         out.push_str("## Recent tool activity (paged from prior turns)\n\n");
         for call in native_summary {
             out.push_str(&format!("- {}\n", render_tool_signature(call)));
+        }
+        out.push('\n');
+    }
+
+    // →1979 K3: pending frontier. Rendered even past the paging cap —
+    // these are the items a fresh cycle must not silently forget.
+    if !unresolved.is_empty() {
+        out.push_str("## Unresolved (frontier at cycle boundary — exempt from paging, recomputed every cycle)\n\n");
+        for item in unresolved {
+            out.push_str(&format!("- {item}\n"));
         }
         out.push('\n');
     }
@@ -1521,7 +1629,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -1562,7 +1670,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -1595,7 +1703,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: false,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -1615,7 +1723,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -1635,7 +1743,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -1950,7 +2058,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -2155,7 +2263,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -2202,7 +2310,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -2258,7 +2366,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_kernel".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: Some(kernel_envelope.to_string()),
             transcript_tail_summary: None,
@@ -2296,7 +2404,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: Some(
@@ -2533,7 +2641,7 @@ mod tests {
         let config = RebuildConfig {
             enabled: true,
             mode_tag: "rebuild_local".into(),
-            max_native_tool_summary: 50,
+            max_native_tool_summary: 18,
             max_user_intent_thread: 10,
             live_envelope_override: None,
             transcript_tail_summary: None,
@@ -2707,5 +2815,218 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["name"], "tool1");
         assert_eq!(report.tier_c_tools_dropped, 1);
+    }
+
+    // ── →1979 K3+K4 — unresolved frontier + paging rebudget ──────────
+
+    /// Helper: a rebuild config with the given paging cap.
+    fn k_config(cap: usize) -> RebuildConfig {
+        RebuildConfig {
+            enabled: true,
+            mode_tag: "rebuild_local".into(),
+            max_native_tool_summary: cap,
+            max_user_intent_thread: 10,
+            live_envelope_override: None,
+            transcript_tail_summary: None,
+            recent_assistant_digests: None,
+            templates_summary: None,
+            prior_user_turns_override: None,
+        }
+    }
+
+    /// AC-3 (→1979 K4): defaults rebudgeted 50→18 on both constructors.
+    #[test]
+    fn k4_default_paging_cap_is_18() {
+        assert_eq!(RebuildConfig::from_env().max_native_tool_summary, 18);
+        use clap::Parser;
+        let cli = crate::config::CliArgs::parse_from(["ostk-cache"]);
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::resolve(cli, tmp.path());
+        assert_eq!(
+            RebuildConfig::from_resolved(&cfg).max_native_tool_summary,
+            18
+        );
+    }
+
+    /// AC-1 (→1979 K3): all three frontier kinds — pending tool_use,
+    /// armed monitor, held lock — render under `## Unresolved`.
+    #[test]
+    fn k3_unresolved_section_lists_all_frontier_kinds() {
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_mon", "name": "Monitor",
+                     "input": {"description": "watch deploy log", "command": "tail -f x", "timeout_ms": 1000, "persistent": true}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_mon", "content": "armed"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_lock", "name": "mcp__ostk__lock",
+                     "input": {"action": "create", "name": "lane-1979-p89507"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_lock", "content": "created"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_dead", "name": "Bash", "input": {"command": "cargo test"}}
+                ]},
+                // no tool_result for tu_dead — cycle died mid-chain
+                {"role": "user", "content": "new turn"}
+            ]
+        });
+        let outcome = apply_rebuild(&mut req, &k_config(18));
+        assert!(matches!(outcome, RebuildOutcome::Applied(_)));
+        let synthetic = req["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(synthetic.contains("## Unresolved"), "missing section:\n{synthetic}");
+        assert!(synthetic.contains("in-flight tool_use"), "pending call not surfaced");
+        assert!(synthetic.contains("armed monitor"), "monitor not surfaced");
+        assert!(synthetic.contains("watch deploy log"), "monitor description lost");
+        assert!(
+            synthetic.contains("lock held: lane-1979-p89507"),
+            "lane claim not surfaced"
+        );
+    }
+
+    /// AC-2 (→1979 K3): a pending tool_use buried deeper than the
+    /// paging cap still surfaces — the frontier scan is uncapped. This
+    /// is the survival property: recomputation each cycle means the
+    /// item re-emits after cycle death and after compaction shrinks
+    /// the paged window.
+    #[test]
+    fn k3_unresolved_survives_past_paging_cap() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "start"}),
+            // the frontier item: pending tool_use, oldest in the window
+            json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "tu_orphan", "name": "Bash",
+                 "input": {"command": "deploy --prod"}}
+            ]}),
+        ];
+        // bury it under 30 resolved calls (cap will be 5)
+        for i in 0..30 {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": format!("tu_{i}"), "name": "Read",
+                 "input": {"file_path": format!("/tmp/f{i}")}}
+            ]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": format!("tu_{i}"), "content": "ok"}
+            ]}));
+        }
+        messages.push(json!({"role": "user", "content": "new turn"}));
+        let mut req = json!({ "messages": messages });
+        let outcome = apply_rebuild(&mut req, &k_config(5));
+        assert!(matches!(outcome, RebuildOutcome::Applied(_)));
+        let synthetic = req["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            synthetic.contains("deploy --prod"),
+            "pending call evicted by paging cap — frontier must be exempt:\n{synthetic}"
+        );
+        // and the paged section honored its cap: tu_0..tu_24 dropped
+        assert!(!synthetic.contains("/tmp/f0\""), "paging cap not applied");
+    }
+
+    /// AC-1 negative: clean window (everything resolved, locks
+    /// released) → no `## Unresolved` section at all.
+    #[test]
+    fn k3_no_unresolved_section_when_frontier_empty() {
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_l", "name": "mcp__ostk__lock",
+                     "input": {"action": "create", "name": "lane-x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_l", "content": "created"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_r", "name": "mcp__ostk__lock",
+                     "input": {"action": "release", "name": "lane-x"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_r", "content": "released"}
+                ]},
+                {"role": "user", "content": "new turn"}
+            ]
+        });
+        let outcome = apply_rebuild(&mut req, &k_config(18));
+        assert!(matches!(outcome, RebuildOutcome::Applied(_)));
+        let synthetic = req["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !synthetic.contains("## Unresolved"),
+            "create→release pair must cancel:\n{synthetic}"
+        );
+    }
+
+    /// AC-4 (→1979 KEEP): error bodies stay inline verbatim under the
+    /// rebudgeted cap — regression guard on the unanimously
+    /// load-bearing policy.
+    #[test]
+    fn k4_error_bodies_remain_inline_verbatim() {
+        let err_body = "error[E0308]: mismatched types\n --> src/main.rs:7:9";
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "start"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_e", "name": "Bash", "input": {"command": "cargo build"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_e", "content": err_body, "is_error": true}
+                ]},
+                {"role": "user", "content": "new turn"}
+            ]
+        });
+        let outcome = apply_rebuild(&mut req, &k_config(18));
+        assert!(matches!(outcome, RebuildOutcome::Applied(_)));
+        let synthetic = req["messages"][0]["content"][0]["text"].as_str().unwrap();
+        // Rendering indents continuation lines by two spaces inside the
+        // fence; assert per-line presence (the policy is "body inline",
+        // not byte-identical whitespace).
+        assert!(
+            synthetic.contains("error[E0308]: mismatched types"),
+            "error body first line must be inline:\n{synthetic}"
+        );
+        assert!(
+            synthetic.contains("--> src/main.rs:7:9"),
+            "error body continuation line must be inline:\n{synthetic}"
+        );
+    }
+
+    /// AC-5 (→1979 K4): budget-delta receipt. Replays a real captured
+    /// request body through apply_rebuild at cap 50 (old) vs 18 (new)
+    /// and prints reclaimed bytes. Ignored by default — needs a capture
+    /// path: `OSTK_CAPTURE_BODY=<path>/request-in.body cargo test
+    /// k4_budget_delta -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn k4_budget_delta_on_capture() {
+        let path = match std::env::var("OSTK_CAPTURE_BODY") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("OSTK_CAPTURE_BODY not set; skipping");
+                return;
+            }
+        };
+        let raw = std::fs::read_to_string(&path).expect("read capture body");
+        let body: Value = serde_json::from_str(&raw).expect("parse capture body");
+
+        let mut sizes = Vec::new();
+        for cap in [50usize, 18] {
+            let mut req = body.clone();
+            match apply_rebuild(&mut req, &k_config(cap)) {
+                RebuildOutcome::Applied(report) => sizes.push((cap, report.bytes_out)),
+                other => panic!("expected Applied at cap {cap}, got {other:?}"),
+            }
+        }
+        let (_, old_bytes) = sizes[0];
+        let (_, new_bytes) = sizes[1];
+        eprintln!(
+            "K4 budget delta on {path}: cap50={old_bytes}b cap18={new_bytes}b reclaimed={}b ({:.1}%)",
+            old_bytes as i64 - new_bytes as i64,
+            100.0 * (old_bytes as f64 - new_bytes as f64) / old_bytes as f64
+        );
+        assert!(new_bytes <= old_bytes, "rebudget must not grow the synthetic");
     }
 }
