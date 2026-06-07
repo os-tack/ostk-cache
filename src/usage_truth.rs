@@ -39,6 +39,27 @@ pub fn estimate_tokens(body_bytes: u64, bytes_per_token: f64) -> u64 {
     (body_bytes as f64 / bytes_per_token).round() as u64
 }
 
+/// X1(B): session-scoped enablement. Usage-truth rewriting fires when
+/// the global flag is on, OR the request's wire-header session id is on
+/// the allowlist. Keyed on the wire header ONLY — never the workspace
+/// fallback id (→1973/K2: wire header is keying ground truth) — so a
+/// request with no session header can never allowlist-hit. Empty
+/// allowlist with the global flag off is byte-identical to pre-allowlist
+/// behavior: non-listed sessions see zero diff.
+pub fn enabled_for_session(
+    global: bool,
+    allowlist: &[String],
+    wire_session: Option<&str>,
+) -> bool {
+    if global {
+        return true;
+    }
+    match wire_session {
+        Some(sid) => allowlist.iter().any(|s| s == sid),
+        None => false,
+    }
+}
+
 /// X2: the Anthropic error body Claude Code treats as a reactive
 /// compaction trigger. Both numbers are derived from wire bytes at the
 /// honest 4.0 scale so the harness's parsed `(actual, max)` pair is
@@ -228,6 +249,50 @@ fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- X1(B) session-scoped enablement ------------------------------
+
+    fn allow(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn session_gate_global_on_wins_regardless() {
+        assert!(enabled_for_session(true, &[], None));
+        assert!(enabled_for_session(true, &allow(&["x"]), Some("y")));
+    }
+
+    #[test]
+    fn session_gate_empty_allowlist_is_passthrough() {
+        // Condition (1): empty allowlist + global off = current behavior.
+        assert!(!enabled_for_session(false, &[], Some("any-session")));
+        assert!(!enabled_for_session(false, &[], None));
+    }
+
+    #[test]
+    fn session_gate_hit_enables() {
+        let list = allow(&["d08903c2-aaaa-bbbb-cccc-000000000000"]);
+        assert!(enabled_for_session(
+            false,
+            &list,
+            Some("d08903c2-aaaa-bbbb-cccc-000000000000")
+        ));
+    }
+
+    #[test]
+    fn session_gate_miss_is_passthrough() {
+        // Condition (2): allowlist-miss must behave exactly like off.
+        let list = allow(&["d08903c2-aaaa-bbbb-cccc-000000000000"]);
+        assert!(!enabled_for_session(false, &list, Some("other-session")));
+    }
+
+    #[test]
+    fn session_gate_fallback_id_never_hits() {
+        // No wire header → workspace-fallback keying → never allowlisted,
+        // even if someone lists the fallback-shaped id itself.
+        let list = allow(&["wkhash:deadbeef0123"]);
+        assert!(!enabled_for_session(false, &list, None));
+    }
 
     // The literal regex shipped in Claude Code 2.1.168 (binary-verified):
     // `prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)`. Replicated

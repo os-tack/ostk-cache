@@ -205,6 +205,20 @@ pub struct CliArgs {
     #[arg(long)]
     pub usage_truth: bool,
 
+    /// →1985 X1(B): session-scoped usage-truth allowlist. Repeatable.
+    /// Requests whose wire session header (x-claude-code-session-id)
+    /// matches an entry get usage-truth rewriting even while the global
+    /// flag is off. Keyed on the wire header ONLY — never the workspace
+    /// fallback id (→1973/K2). Empty = no per-session enablement.
+    ///
+    /// NOTE (N1): an empty CLI value cannot CLEAR a TOML-set allowlist
+    /// (empty Vec resolves to None, so the file wins — shared pick_value
+    /// behavior). To disable a filed allowlist, remove it from cache.toml.
+    /// NOTE (N2): rewriting is SSE-only; a non-streaming client on the
+    /// allowlist silently gets no usage-truth (CC always streams).
+    #[arg(long = "usage-truth-session", value_name = "SESSION_ID")]
+    pub usage_truth_session: Vec<String>,
+
     /// Calibration scale for --usage-truth: bytes of inbound body per
     /// reported token. Smaller → compaction fires earlier. Default: 16.
     #[arg(long)]
@@ -263,6 +277,9 @@ struct FileConfig {
 struct TruthFile {
     enabled: Option<bool>,
     bytes_per_token: Option<f64>,
+    /// →1985 X1(B): wire-header session ids allowlisted for usage-truth
+    /// while the global flag stays off.
+    sessions: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -361,6 +378,7 @@ pub struct Config {
     pub body_limit_mb: Resolved<u64>,
     pub overflow_mb: Resolved<u64>,
     pub usage_truth: Resolved<bool>,
+    pub usage_truth_sessions: Resolved<Vec<String>>,
     pub truth_bytes_per_token: Resolved<f64>,
     pub capture_http: Resolved<bool>,
     pub capture_http_dir: Resolved<PathBuf>,
@@ -542,6 +560,23 @@ impl Config {
             false,
         );
 
+        // →1985 X1(B): session allowlist. Env form is comma-separated.
+        let usage_truth_sessions = pick_value(
+            if cli.usage_truth_session.is_empty() {
+                None
+            } else {
+                Some(cli.usage_truth_session.clone())
+            },
+            env_str("OSTK_CACHE_USAGE_TRUTH_SESSIONS").map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            }),
+            file.and_then(|f| f.truth.sessions.clone()),
+            Vec::new(),
+        );
+
         let truth_bytes_per_token = pick_value(
             cli.truth_bytes_per_token,
             env_str("OSTK_CACHE_TRUTH_BYTES_PER_TOKEN").and_then(|s| s.parse().ok()),
@@ -586,6 +621,7 @@ impl Config {
             body_limit_mb,
             overflow_mb,
             usage_truth,
+            usage_truth_sessions,
             truth_bytes_per_token,
             capture_http,
             capture_http_dir,
@@ -660,6 +696,16 @@ impl Config {
             "truth.enabled",
             &self.usage_truth.value,
             self.usage_truth.source,
+        ));
+        let truth_sessions = if self.usage_truth_sessions.value.is_empty() {
+            "(empty)".to_string()
+        } else {
+            self.usage_truth_sessions.value.join(",")
+        };
+        out.push_str(&row(
+            "truth.sessions",
+            &truth_sessions,
+            self.usage_truth_sessions.source,
         ));
         out.push_str(&row(
             "truth.bytes_per_token",
@@ -780,6 +826,7 @@ mod tests {
             "OSTK_CACHE_BODY_LIMIT_MB",
             "OSTK_CACHE_OVERFLOW_MB",
             "OSTK_CACHE_USAGE_TRUTH",
+            "OSTK_CACHE_USAGE_TRUTH_SESSIONS",
             "OSTK_CACHE_TRUTH_BYTES_PER_TOKEN",
         ] {
             unsafe { std::env::remove_var(k) };
@@ -805,6 +852,7 @@ mod tests {
             body_limit_mb: None,
             overflow_mb: None,
             usage_truth: false,
+            usage_truth_session: Vec::new(),
             truth_bytes_per_token: None,
             capture_http: false,
             capture_http_dir: None,
@@ -827,6 +875,7 @@ mod tests {
         assert_eq!(cfg.body_limit_mb.value, DEFAULT_BODY_LIMIT_MB);
         assert_eq!(cfg.overflow_mb.value, DEFAULT_OVERFLOW_MB);
         assert!(!cfg.usage_truth.value);
+        assert!(cfg.usage_truth_sessions.value.is_empty());
         assert_eq!(
             cfg.truth_bytes_per_token.value,
             DEFAULT_TRUTH_BYTES_PER_TOKEN
@@ -836,6 +885,33 @@ mod tests {
         assert!(cfg.body_limit_mb.value > cfg.overflow_mb.value);
         assert!(cfg.rewrite_enabled.value);
         assert_eq!(cfg.rewrite_enabled.source, Source::Default);
+    }
+
+    // →1985 X1(B): allowlist resolution — TOML source, env override,
+    // and the invariant that sessions alone never flip the global flag.
+    #[test]
+    fn truth_sessions_from_toml_and_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ostk");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cache.toml"), "[truth]\nsessions = [\"abc-123\"]\n").unwrap();
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert_eq!(cfg.usage_truth_sessions.value, vec!["abc-123".to_string()]);
+        assert_eq!(cfg.usage_truth_sessions.source, Source::Toml);
+        // Allowlist never flips the global flag — non-listed sessions
+        // must see zero diff.
+        assert!(!cfg.usage_truth.value);
+
+        unsafe { std::env::set_var("OSTK_CACHE_USAGE_TRUTH_SESSIONS", "s1, s2,") };
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert_eq!(
+            cfg.usage_truth_sessions.value,
+            vec!["s1".to_string(), "s2".to_string()]
+        );
+        assert_eq!(cfg.usage_truth_sessions.source, Source::Env);
+        clear_env();
     }
 
     #[test]

@@ -227,6 +227,16 @@ async fn handle_anthropic_message(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // →1985 X1(B): usage-truth gate, resolved per-request. Global flag OR
+    // wire-header allowlist hit; computed here while the raw header is
+    // still in hand (the fallback-composed session_id below must never
+    // key the allowlist — →1973/K2).
+    let usage_truth_on = ostk_cache::usage_truth::enabled_for_session(
+        config.usage_truth.value,
+        &config.usage_truth_sessions.value,
+        session_header.as_deref(),
+    );
+
     let workspace = ostk_cache::Workspace::from_path(
         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     )
@@ -989,13 +999,14 @@ async fn handle_anthropic_message(
     let capture_root_for_stream = config.capture_http_dir.value.clone();
     let capture_id_for_stream = http_capture.as_ref().map(|c| c.id().to_string());
 
-    // →1985 X1: usage-truth passthrough. When enabled, the streamed
-    // response's usage.input_tokens is rewritten so the reported input
-    // side reflects the TRUE inbound body size — re-arming Claude Code's
-    // proactive auto-compact, which the projection's small upstream
-    // usage otherwise disables. Accounting and capture stay on the
-    // ORIGINAL upstream bytes (accounting must stay honest).
-    let truth_est_tokens = if config.usage_truth.value {
+    // →1985 X1: usage-truth passthrough. When enabled (globally or via
+    // the per-session allowlist — X1(B)), the streamed response's
+    // usage.input_tokens is rewritten so the reported input side reflects
+    // the TRUE inbound body size — re-arming Claude Code's proactive
+    // auto-compact, which the projection's small upstream usage otherwise
+    // disables. Accounting and capture stay on the ORIGINAL upstream
+    // bytes (accounting must stay honest).
+    let truth_est_tokens = if usage_truth_on {
         ostk_cache::usage_truth::estimate_tokens(
             req_bytes_in,
             config.truth_bytes_per_token.value,
