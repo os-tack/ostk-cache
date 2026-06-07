@@ -9,6 +9,7 @@ pub mod rewrite_middleware;
 pub mod standalone;
 pub mod system_reminder_strip;
 pub mod transcript_tail;
+pub mod usage_truth;
 
 pub use ostk_cache_core::usage::ProviderUsage;
 use serde::{Deserialize, Serialize};

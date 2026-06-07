@@ -166,6 +166,10 @@ pub struct RebuildConfig {
     /// the caller. None → fall back to in-process slice (e.g.
     /// non-claude-code harness, missing projects dir).
     pub prior_user_turns_override: Option<Vec<String>>,
+    /// →1985 X3: true inbound request body size in bytes. When set, the
+    /// projected `[meminfo]` line gains a ` body:<N.N>MB/32MB` gauge so
+    /// seats and the lead can watch the march toward the transport wall.
+    pub body_bytes_in: Option<u64>,
 }
 
 impl RebuildConfig {
@@ -192,6 +196,7 @@ impl RebuildConfig {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         }
     }
 
@@ -218,6 +223,7 @@ impl RebuildConfig {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         }
     }
 }
@@ -295,7 +301,13 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
     let envelope = config
         .live_envelope_override
         .clone()
-        .or_else(|| extract_latest_envelope(dropped_slice));
+        .or_else(|| extract_latest_envelope(dropped_slice))
+        // →1985 X3: stamp the true inbound body size onto the [meminfo]
+        // line so the projection carries the transport-wall gauge.
+        .map(|env| match config.body_bytes_in {
+            Some(bytes) => crate::usage_truth::augment_meminfo_body(&env, bytes),
+            None => env,
+        });
     let native_summary = summarize_native_tools(dropped_slice, config.max_native_tool_summary);
     // →1979 K3: frontier scan runs over the FULL dropped slice,
     // deliberately uncapped — unresolved items are exempt from the
@@ -1636,6 +1648,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -1677,6 +1690,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -1710,6 +1724,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Disabled));
@@ -1730,6 +1745,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -1750,6 +1766,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -2065,6 +2082,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         apply_rebuild(&mut req, &config);
         let messages = req.get("messages").unwrap().as_array().unwrap();
@@ -2270,6 +2288,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         apply_rebuild(&mut req, &config);
         let synthetic_block = req.get("messages").unwrap().as_array().unwrap()[0]
@@ -2319,6 +2338,7 @@ mod tests {
             ),
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2373,6 +2393,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -2413,6 +2434,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2648,6 +2670,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(
@@ -2831,6 +2854,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            body_bytes_in: None,
         }
     }
 

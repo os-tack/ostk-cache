@@ -186,6 +186,30 @@ pub struct CliArgs {
     #[arg(long, conflicts_with = "soft_cap_mb")]
     pub no_soft_cap: bool,
 
+    /// Max inbound request body size in MiB the proxy will buffer
+    /// (replaces axum's stock 2MiB DefaultBodyLimit — →1985 X0). Default: 30.
+    #[arg(long)]
+    pub body_limit_mb: Option<u64>,
+
+    /// Soft overflow threshold in MiB (→1985 X2): inbound bodies above
+    /// this are answered with the Anthropic prompt-too-long error shape,
+    /// which Claude Code routes through reactive auto-compaction, instead
+    /// of marching into the hard body-limit wall. 0 disables. Default: 24.
+    #[arg(long)]
+    pub overflow_mb: Option<u64>,
+
+    /// →1985 X1: rewrite usage.input_tokens in streamed responses so the
+    /// reported input side reflects the TRUE inbound body size, letting
+    /// Claude Code's proactive auto-compact fire. Default: off (CC's
+    /// tolerance of usage > model window is unverified — canary first).
+    #[arg(long)]
+    pub usage_truth: bool,
+
+    /// Calibration scale for --usage-truth: bytes of inbound body per
+    /// reported token. Smaller → compaction fires earlier. Default: 16.
+    #[arg(long)]
+    pub truth_bytes_per_token: Option<f64>,
+
     /// Capture full inbound request, outbound request, and upstream response bodies.
     #[arg(long)]
     pub capture_http: bool,
@@ -220,6 +244,10 @@ struct FileConfig {
     provider: Option<Provider>,
     mode: Option<Mode>,
     soft_cap_mb: Option<u64>,
+    body_limit_mb: Option<u64>,
+    overflow_mb: Option<u64>,
+    #[serde(default)]
+    truth: TruthFile,
     #[serde(default)]
     tail: TailFile,
     #[serde(default)]
@@ -228,6 +256,13 @@ struct FileConfig {
     kernel: KernelFile,
     #[serde(default)]
     capture: CaptureFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TruthFile {
+    enabled: Option<bool>,
+    bytes_per_token: Option<f64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -287,6 +322,18 @@ pub const DEFAULT_TAIL_LIMIT: usize = 50;
 pub const DEFAULT_KERNEL_TIMEOUT_MS: u64 = 500;
 pub const DEFAULT_SOFT_CAP_MB: u64 = 30;
 pub const ANTHROPIC_HARD_LIMIT_MB: u64 = 32;
+/// →1985 X0: inbound body buffer ceiling. Replaces axum's stock 2MiB
+/// DefaultBodyLimit, which was the fleet's REAL transport wall
+/// (triple-reproduced: 2MiB+ε → 413 pre-handler, pre-capture). Sits
+/// 2MiB under the Anthropic hard limit so the proxy always sees the
+/// body before any downstream wall can.
+pub const DEFAULT_BODY_LIMIT_MB: u64 = 30;
+/// →1985 X2: soft overflow threshold. Bodies above this come back as
+/// the prompt-too-long error shape (Claude Code reactive-compact
+/// trigger) instead of marching into the body-limit 413.
+pub const DEFAULT_OVERFLOW_MB: u64 = 24;
+/// →1985 X1: usage-truth calibration default (bytes per reported token).
+pub const DEFAULT_TRUTH_BYTES_PER_TOKEN: f64 = 16.0;
 
 fn default_claude_projects_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
@@ -311,6 +358,10 @@ pub struct Config {
     pub kernel_socket: Resolved<Option<PathBuf>>,
     pub kernel_timeout_ms: Resolved<u64>,
     pub soft_cap_mb: Resolved<u64>,
+    pub body_limit_mb: Resolved<u64>,
+    pub overflow_mb: Resolved<u64>,
+    pub usage_truth: Resolved<bool>,
+    pub truth_bytes_per_token: Resolved<f64>,
     pub capture_http: Resolved<bool>,
     pub capture_http_dir: Resolved<PathBuf>,
     pub verbose: Resolved<bool>,
@@ -469,6 +520,35 @@ impl Config {
             DEFAULT_SOFT_CAP_MB,
         );
 
+        // ---- →1985 body limit / overflow / usage-truth -----------------
+        let body_limit_mb = pick_value(
+            cli.body_limit_mb,
+            env_num("OSTK_CACHE_BODY_LIMIT_MB"),
+            file.and_then(|f| f.body_limit_mb),
+            DEFAULT_BODY_LIMIT_MB,
+        );
+
+        let overflow_mb = pick_value(
+            cli.overflow_mb,
+            env_num("OSTK_CACHE_OVERFLOW_MB"),
+            file.and_then(|f| f.overflow_mb),
+            DEFAULT_OVERFLOW_MB,
+        );
+
+        let usage_truth = pick_value(
+            if cli.usage_truth { Some(true) } else { None },
+            env_truthy("OSTK_CACHE_USAGE_TRUTH"),
+            file.and_then(|f| f.truth.enabled),
+            false,
+        );
+
+        let truth_bytes_per_token = pick_value(
+            cli.truth_bytes_per_token,
+            env_str("OSTK_CACHE_TRUTH_BYTES_PER_TOKEN").and_then(|s| s.parse().ok()),
+            file.and_then(|f| f.truth.bytes_per_token),
+            DEFAULT_TRUTH_BYTES_PER_TOKEN,
+        );
+
         let capture_http = pick_value(
             if cli.capture_http { Some(true) } else { None },
             env_truthy("OSTK_CAPTURE_HTTP"),
@@ -503,6 +583,10 @@ impl Config {
             kernel_socket,
             kernel_timeout_ms,
             soft_cap_mb,
+            body_limit_mb,
+            overflow_mb,
+            usage_truth,
+            truth_bytes_per_token,
             capture_http,
             capture_http_dir,
             verbose,
@@ -561,6 +645,27 @@ impl Config {
             format!("{}MB", self.soft_cap_mb.value)
         };
         out.push_str(&row("soft_cap", &cap, self.soft_cap_mb.source));
+        out.push_str(&row(
+            "body_limit",
+            &format!("{}MB", self.body_limit_mb.value),
+            self.body_limit_mb.source,
+        ));
+        let overflow = if self.overflow_mb.value == 0 {
+            "disabled".to_string()
+        } else {
+            format!("{}MB", self.overflow_mb.value)
+        };
+        out.push_str(&row("overflow", &overflow, self.overflow_mb.source));
+        out.push_str(&row(
+            "truth.enabled",
+            &self.usage_truth.value,
+            self.usage_truth.source,
+        ));
+        out.push_str(&row(
+            "truth.bytes_per_token",
+            &self.truth_bytes_per_token.value,
+            self.truth_bytes_per_token.source,
+        ));
         out.push_str(&row(
             "capture.http",
             &self.capture_http.value,
@@ -672,6 +777,10 @@ mod tests {
             "OSTK_CACHE_KERNEL_TIMEOUT_MS",
             "OSTK_CAPTURE_HTTP",
             "OSTK_CAPTURE_HTTP_DIR",
+            "OSTK_CACHE_BODY_LIMIT_MB",
+            "OSTK_CACHE_OVERFLOW_MB",
+            "OSTK_CACHE_USAGE_TRUTH",
+            "OSTK_CACHE_TRUTH_BYTES_PER_TOKEN",
         ] {
             unsafe { std::env::remove_var(k) };
         }
@@ -693,6 +802,10 @@ mod tests {
             no_rewrite: false,
             soft_cap_mb: None,
             no_soft_cap: false,
+            body_limit_mb: None,
+            overflow_mb: None,
+            usage_truth: false,
+            truth_bytes_per_token: None,
             capture_http: false,
             capture_http_dir: None,
             verbose: false,
@@ -711,6 +824,16 @@ mod tests {
         assert_eq!(cfg.port.source, Source::Default);
         assert_eq!(cfg.mode.value, DEFAULT_MODE);
         assert_eq!(cfg.soft_cap_mb.value, DEFAULT_SOFT_CAP_MB);
+        assert_eq!(cfg.body_limit_mb.value, DEFAULT_BODY_LIMIT_MB);
+        assert_eq!(cfg.overflow_mb.value, DEFAULT_OVERFLOW_MB);
+        assert!(!cfg.usage_truth.value);
+        assert_eq!(
+            cfg.truth_bytes_per_token.value,
+            DEFAULT_TRUTH_BYTES_PER_TOKEN
+        );
+        // X0 invariant: the proxy must be able to buffer past the
+        // overflow threshold, or X2 can never fire.
+        assert!(cfg.body_limit_mb.value > cfg.overflow_mb.value);
         assert!(cfg.rewrite_enabled.value);
         assert_eq!(cfg.rewrite_enabled.source, Source::Default);
     }

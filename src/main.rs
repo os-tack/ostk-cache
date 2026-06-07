@@ -82,11 +82,18 @@ async fn main() {
         config: Arc::new(config),
     };
 
+    // →1985 X0: replace axum's stock 2MiB DefaultBodyLimit — empirically
+    // the fleet's REAL transport wall (413 pre-handler, pre-capture,
+    // invisible to every log surface). The proxy must always see the
+    // body; the X2 overflow guard below decides what to do with it.
+    let body_limit_bytes = (state.config.body_limit_mb.value as usize)
+        .saturating_mul(1024 * 1024);
     let app = Router::new()
         .route("/v1/messages", post(handle_anthropic_message))
         .route("/v1/responses", post(handle_openai_response))
         .route("/hook/event", post(handle_hook_event))
         .fallback(handle_catchall)
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit_bytes))
         .with_state(state);
 
     axum::serve(listener, app)
@@ -264,9 +271,43 @@ async fn handle_anthropic_message(
         &body_bytes,
     );
 
+    // →1985 X2: overflow translation. Bodies above the soft threshold
+    // are answered with the Anthropic prompt-too-long error shape, which
+    // Claude Code routes through reactive auto-compaction (CC 2.1.168
+    // binary-verified trigger regex). Without this the body marches into
+    // the X0 body-limit 413 — a terminal transport error CC can't heal.
+    let overflow_bytes = config.overflow_mb.value.saturating_mul(1024 * 1024);
+    if overflow_bytes > 0 && req_bytes_in > overflow_bytes {
+        let error_body = ostk_cache::usage_truth::overflow_error_body(req_bytes_in, overflow_bytes);
+        let error_bytes = serde_json::to_vec(&error_body).unwrap_or_default();
+        println!(
+            "[proxy] overflow: req {:.1}MB > soft {}MB → prompt-too-long translation (reactive compact) session={}",
+            req_bytes_in as f64 / (1024.0 * 1024.0),
+            config.overflow_mb.value,
+            session_id
+        );
+        if let Some(capture) = http_capture.take() {
+            capture.finish(
+                400,
+                false,
+                &HeaderMap::new(),
+                &error_bytes,
+                turn_started.elapsed(),
+            );
+        }
+        return Ok(Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(error_bytes))
+            .unwrap());
+    }
+
     // Build the rebuild config from the resolved Config; mode is the
     // canonical source for enabled+tag (CLI > env > toml > default).
     let mut rebuild_config = RebuildConfig::from_resolved(&config);
+    // →1985 X3: thread the true inbound body size through to projection
+    // synthesis so the [meminfo] line carries the body gauge.
+    rebuild_config.body_bytes_in = Some(req_bytes_in);
 
     // Federated mode (mode=rebuild-kernel): fetch a fresh envelope from
     // the kernel daemon over IPC. Any failure falls through to standalone
@@ -948,15 +989,49 @@ async fn handle_anthropic_message(
     let capture_root_for_stream = config.capture_http_dir.value.clone();
     let capture_id_for_stream = http_capture.as_ref().map(|c| c.id().to_string());
 
+    // →1985 X1: usage-truth passthrough. When enabled, the streamed
+    // response's usage.input_tokens is rewritten so the reported input
+    // side reflects the TRUE inbound body size — re-arming Claude Code's
+    // proactive auto-compact, which the projection's small upstream
+    // usage otherwise disables. Accounting and capture stay on the
+    // ORIGINAL upstream bytes (accounting must stay honest).
+    let truth_est_tokens = if config.usage_truth.value {
+        ostk_cache::usage_truth::estimate_tokens(
+            req_bytes_in,
+            config.truth_bytes_per_token.value,
+        )
+    } else {
+        0
+    };
+
     let stream = stream! {
         let mut accumulated = Vec::<u8>::new();
+        let mut truth_rewriter = if truth_est_tokens > 0 && is_sse {
+            Some(ostk_cache::usage_truth::SseUsageRewriter::new(truth_est_tokens))
+        } else {
+            None
+        };
 
         while let Ok(Some(chunk)) = response.chunk().await {
             if chunk.is_empty() {
                 continue;
             }
             accumulated.extend_from_slice(&chunk);
-            yield Ok::<_, std::io::Error>(chunk);
+            match truth_rewriter.as_mut() {
+                Some(rw) => {
+                    let out = rw.transform(&chunk);
+                    if !out.is_empty() {
+                        yield Ok::<_, std::io::Error>(axum::body::Bytes::from(out));
+                    }
+                }
+                None => yield Ok::<_, std::io::Error>(chunk),
+            }
+        }
+        if let Some(rw) = truth_rewriter.as_mut() {
+            let tail = rw.flush();
+            if !tail.is_empty() {
+                yield Ok::<_, std::io::Error>(axum::body::Bytes::from(tail));
+            }
         }
 
         let resp_bytes_total = accumulated.len() as u64;
