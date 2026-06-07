@@ -208,8 +208,15 @@ async fn handle_anthropic_message(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // Claude Code stamps every request with `x-claude-code-session-id`
+    // (a per-seat UUID); `anthropic-session-id` is kept as a fallback
+    // for other clients. Missing both, the workspace+api-key hash below
+    // collapses every seat in the fleet to ONE session id — which is
+    // how digest-bleed (→1973) shipped: 438/438 digest rows stamped
+    // with the same fallback session.
     let session_header = headers
-        .get("anthropic-session-id")
+        .get("x-claude-code-session-id")
+        .or_else(|| headers.get("anthropic-session-id"))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -351,16 +358,27 @@ async fn handle_anthropic_message(
     // Layer 1 cycle digest read: if prior digests exist in the
     // standalone state dir, render the last K into a section the
     // synthesis can drop in as `## Recent assistant turns`. Independent
-    // of the rebuild mode and the transcript tail.
+    // of the rebuild mode and the transcript tail. Reads are keyed by
+    // session (→1973): only this seat's digests render first-person;
+    // peer-seat digests go under an explicitly labeled peer section.
     if rebuild_config.enabled {
         let cwd_for_digests =
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        let recent = ostk_cache::cycle_digest::read_recent(&cwd_for_digests, 5);
-        if let Some(section) = ostk_cache::cycle_digest::render_recent_section(&recent) {
+        let recent =
+            ostk_cache::cycle_digest::read_recent_for_session(&cwd_for_digests, &session_id, 5);
+        let mut section = ostk_cache::cycle_digest::render_recent_section(&recent)
+            .unwrap_or_default();
+        let peers =
+            ostk_cache::cycle_digest::read_recent_peers(&cwd_for_digests, &session_id, 3);
+        if let Some(peer_section) = ostk_cache::cycle_digest::render_peer_section(&peers) {
+            section.push_str(&peer_section);
+        }
+        if !section.is_empty() {
             if config.verbose.value {
                 println!(
-                    "[proxy] rebuild: composed {} recent assistant digests",
-                    recent.len()
+                    "[proxy] rebuild: composed {} own + {} peer assistant digests",
+                    recent.len(),
+                    peers.len()
                 );
             }
             rebuild_config.recent_assistant_digests = Some(section);

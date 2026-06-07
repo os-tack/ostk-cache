@@ -151,6 +151,29 @@ pub fn write_digest(workspace: &Path, digest: &CycleDigest) -> std::io::Result<(
 /// Returns empty Vec on any read error (digests are best-effort
 /// enrichment; no harm if missing).
 pub fn read_recent(workspace: &Path, n: usize) -> Vec<CycleDigest> {
+    read_recent_where(workspace, n, |_| true)
+}
+
+/// Read up to `n` most-recent digests stamped with `session`. The
+/// digest file is shared per-workspace, so without this filter a
+/// multi-seat fleet pools every seat's digests into each seat's
+/// first-person history (→1973 digest-bleed → self-misID).
+pub fn read_recent_for_session(workspace: &Path, session: &str, n: usize) -> Vec<CycleDigest> {
+    read_recent_where(workspace, n, |d| d.session == session)
+}
+
+/// Read up to `n` most-recent digests NOT stamped with `session` —
+/// peer seats sharing the workspace. These must only ever render under
+/// an explicit labeled peer section, never as first-person turns.
+pub fn read_recent_peers(workspace: &Path, session: &str, n: usize) -> Vec<CycleDigest> {
+    read_recent_where(workspace, n, |d| d.session != session)
+}
+
+fn read_recent_where(
+    workspace: &Path,
+    n: usize,
+    pred: impl Fn(&CycleDigest) -> bool,
+) -> Vec<CycleDigest> {
     let dir = crate::standalone::state_dir_for(workspace);
     let path = dir.join(DIGEST_FILE);
     let file = match std::fs::File::open(&path) {
@@ -158,12 +181,14 @@ pub fn read_recent(workspace: &Path, n: usize) -> Vec<CycleDigest> {
         Err(_) => return Vec::new(),
     };
     let reader = BufReader::new(file);
-    let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..]
-        .iter()
-        .filter_map(|l| serde_json::from_str::<CycleDigest>(l).ok())
-        .collect()
+    let mut matched: Vec<CycleDigest> = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| serde_json::from_str::<CycleDigest>(&l).ok())
+        .filter(|d| pred(d))
+        .collect();
+    let start = matched.len().saturating_sub(n);
+    matched.split_off(start)
 }
 
 /// Render last-K digests into a projection-ready section. Returns None
@@ -197,6 +222,39 @@ pub fn render_recent_section(digests: &[CycleDigest]) -> Option<String> {
         } else {
             out.push_str(&format!("- **[{}]** [{}]{}\n", label, outcome, artifacts));
         }
+    }
+    out.push('\n');
+    Some(out)
+}
+
+/// Render peer-seat digests into an explicitly labeled section. Peer
+/// turns are tagged with a short session prefix and never use the
+/// first-person `[t-K]` labels — the reader must not be able to
+/// mistake a peer's turn for its own history (→1973).
+pub fn render_peer_section(digests: &[CycleDigest]) -> Option<String> {
+    if digests.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    out.push_str("## Peer activity (other seats, digest — NOT your turns)\n\n");
+    for d in digests {
+        let tag: String = d.session.chars().take(8).collect();
+        let tag = if tag.is_empty() { "?".to_string() } else { tag };
+        let outcome = d.outcome.as_deref().unwrap_or("?");
+        let text = d
+            .narrative
+            .as_deref()
+            .or(d.intent.as_deref())
+            .unwrap_or("");
+        let artifacts = if d.artifacts.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", d.artifacts.join(", "))
+        };
+        out.push_str(&format!(
+            "- **[peer:{}]** [{}] {}{}\n",
+            tag, outcome, text, artifacts
+        ));
     }
     out.push('\n');
     Some(out)
@@ -241,6 +299,11 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Serializes the HOME-mutating tests against ALL other
+    /// HOME-mutating tests in the crate (state_dir_for reads HOME at
+    /// call time) — a module-local mutex would still race standalone's.
+    use crate::standalone::TEST_HOME_LOCK as HOME_LOCK;
 
     #[test]
     fn parse_digest_roundtrip() {
@@ -291,6 +354,7 @@ trailing"#;
         // cycle_digest writes go through ensure_state_dir which itself
         // reads HOME at call time. Test-isolation works because tempdir
         // gives us an exclusive HOME for the duration.
+        let _guard = HOME_LOCK.lock().unwrap();
         let tmp = tempdir().unwrap();
         unsafe {
             std::env::set_var("HOME", tmp.path());
@@ -344,5 +408,75 @@ trailing"#;
         assert!(section.contains("did the second thing"));
         assert!(section.contains("[agreed]"));
         assert!(section.contains("[committed]"));
+    }
+
+    fn digest_for(session: &str, narrative: &str) -> CycleDigest {
+        CycleDigest {
+            ts: "2026-06-07T16:00:00Z".into(),
+            session: session.into(),
+            intent: None,
+            outcome: Some("committed".into()),
+            artifacts: vec![],
+            narrative: Some(narrative.into()),
+        }
+    }
+
+    #[test]
+    fn read_recent_for_session_excludes_peer_rows() {
+        // →1973 digest-bleed regression: the shared per-workspace file
+        // interleaves seats; first-person reads must filter by session.
+        let _guard = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let workspace = std::path::Path::new("/some/work_bleed");
+        write_digest(workspace, &digest_for("seat-a", "a turn 1")).unwrap();
+        write_digest(workspace, &digest_for("seat-b", "b turn 1")).unwrap();
+        write_digest(workspace, &digest_for("seat-a", "a turn 2")).unwrap();
+        write_digest(workspace, &digest_for("seat-b", "b turn 2")).unwrap();
+
+        let own = read_recent_for_session(workspace, "seat-a", 5);
+        assert_eq!(own.len(), 2);
+        assert!(own.iter().all(|d| d.session == "seat-a"));
+        assert_eq!(own[1].narrative.as_deref(), Some("a turn 2"));
+
+        let peers = read_recent_peers(workspace, "seat-a", 5);
+        assert_eq!(peers.len(), 2);
+        assert!(peers.iter().all(|d| d.session == "seat-b"));
+    }
+
+    #[test]
+    fn read_recent_for_session_takes_last_n_of_own_rows_only() {
+        // The n-budget must apply AFTER the session filter — a burst of
+        // peer writes must not evict this seat's own history.
+        let _guard = HOME_LOCK.lock().unwrap();
+        let tmp = tempdir().unwrap();
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+        }
+        let workspace = std::path::Path::new("/some/work_budget");
+        write_digest(workspace, &digest_for("seat-a", "own old")).unwrap();
+        for i in 0..10 {
+            write_digest(workspace, &digest_for("seat-b", &format!("peer {i}"))).unwrap();
+        }
+        let own = read_recent_for_session(workspace, "seat-a", 5);
+        assert_eq!(own.len(), 1, "own row survives 10 newer peer rows");
+        assert_eq!(own[0].narrative.as_deref(), Some("own old"));
+    }
+
+    #[test]
+    fn render_peer_section_labels_and_never_uses_t_minus() {
+        let digests = vec![digest_for("0123456789abcdef", "peer did a thing")];
+        let section = render_peer_section(&digests).unwrap();
+        assert!(section.contains("Peer activity"));
+        assert!(section.contains("NOT your turns"));
+        assert!(section.contains("[peer:01234567]"), "8-char session tag");
+        assert!(section.contains("peer did a thing"));
+        assert!(
+            !section.contains("[t-"),
+            "peer turns must never carry first-person t-K labels"
+        );
+        assert!(render_peer_section(&[]).is_none());
     }
 }

@@ -97,17 +97,24 @@ pub fn log_activation(workspace: &Path, mode: &str, session: &str, turns_dropped
     }
 }
 
+/// Serializes every test in the crate that mutates the process-global
+/// `HOME` env var (state_dir_for reads HOME at call time). Crate-wide
+/// because HOME-mutating tests exist in multiple modules (standalone,
+/// cycle_digest); per-module mutexes still race each other under
+/// cargo's parallel test execution.
+#[cfg(test)]
+pub(crate) static TEST_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::tempdir;
 
     // Tests in this module mutate the process-global `HOME` env var,
     // which races with cargo's default parallel test execution.
-    // Serialize all HOME-touching tests through this single mutex so
+    // Serialize all HOME-touching tests through the crate-wide mutex so
     // the deterministic-hash assertions don't see HOME flip mid-test.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    use super::TEST_HOME_LOCK as HOME_LOCK;
 
     #[test]
     fn state_dir_is_deterministic_for_same_path() {
