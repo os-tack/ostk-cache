@@ -13,6 +13,7 @@ use ostk_cache::config::{CliArgs, Config, Mode};
 use ostk_cache::rebuild::{RebuildConfig, RebuildOutcome, apply_rebuild};
 use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome};
 use ostk_cache::ttl_forecast::{IdentityHintCache, SeatCadence, forecast_ttl};
+use ostk_cache::write_policy::{self, PolicyDecision};
 use ostk_cache::{
     AccountInput, AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind,
     InMemoryPageTable, ProviderUsage, SessionId, SizeMetrics, account, fmt_bytes, persist_amp_row,
@@ -39,12 +40,16 @@ struct AmpAccumulator {
 type AmpStore = Arc<DashMap<SessionId, AmpAccumulator>>;
 /// Per-session cadence state for →2030(a) TTL forecast.
 type CadenceStore = Arc<DashMap<SessionId, SeatCadence>>;
+/// →2032: per-(session, model) write-policy lane state.
+type LaneStore = Arc<DashMap<(SessionId, String), write_policy::LaneState>>;
 type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 
 #[derive(Clone)]
 struct AppState {
     amp_store: AmpStore,
     cadence_store: CadenceStore,
+    /// →2032: write-policy lanes (same lifecycle as the cadence store).
+    lane_store: LaneStore,
     hint_cache: Arc<IdentityHintCache>,
     hook_adapter: HookAdapterHandle,
     config: Arc<Config>,
@@ -99,6 +104,7 @@ async fn main() {
     let state = AppState {
         amp_store: Arc::new(DashMap::new()),
         cadence_store: Arc::new(DashMap::new()),
+        lane_store: Arc::new(DashMap::new()),
         hint_cache: Arc::new(IdentityHintCache::new()),
         hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
         // →2035 fix 2: spawn the background capture writer.
@@ -329,6 +335,69 @@ async fn handle_anthropic_message(
     };
 
     let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // →2032: active write-policy decision — one per request, computed
+    // before the rebuild config so a DEAD verdict can size the
+    // re-projection and the tier can drive the cache_control emission
+    // sites below. Lane state advances only while the policy is
+    // enabled, so a mid-session flag flip starts from a clean lane.
+    // Independent of the →2030(a) forecast above (telemetry-only);
+    // this is the active policy with its own per-lane cadence.
+    let policy_decision: Option<PolicyDecision> = if config.write_policy_enabled.value {
+        // Lane key needs the model id; serde has no prefix-parse mode
+        // so this is one extra full-body parse per request — local
+        // proxy at turn cadence, and only on the policy path.
+        #[derive(Deserialize)]
+        struct ModelProbe {
+            #[serde(default)]
+            model: String,
+        }
+        let model = serde_json::from_str::<ModelProbe>(&body_str)
+            .map(|p| p.model)
+            .unwrap_or_default();
+        let params = write_policy::WritePolicyParams {
+            compact: config.policy_compact.value,
+            min_prefix: config.policy_min_prefix.value,
+            cold_cap: config.policy_cold_cap.value,
+        };
+        let observed_prompt_tokens =
+            (req_bytes_in as f64 / config.truth_bytes_per_token.value.max(1.0)).round() as u64;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let key = (session_id.clone(), model);
+        let mut lane = state
+            .lane_store
+            .get(&key)
+            .map(|r| r.clone())
+            .unwrap_or_default();
+        let decision =
+            write_policy::decide(&mut lane, now_secs, observed_prompt_tokens, &params);
+        state.lane_store.insert(key, lane);
+        if config.verbose.value {
+            println!(
+                "[proxy] policy: {} tier={} read~{} write~{}{}",
+                decision.class.as_str(),
+                decision.tier.wire_str(),
+                decision.expected_read,
+                decision.expected_write,
+                decision
+                    .compact_target
+                    .map(|t| format!(" compact_target={}", t))
+                    .unwrap_or_default()
+            );
+        }
+        Some(decision)
+    } else {
+        None
+    };
+    // Tier-driven TTLs for the breakpoints WE emit; status-quo
+    // literals when the policy is dark. Harness-set markers are never
+    // rewritten either way (→2030(a) condition-1 holds).
+    let firmware_ttl = policy_decision.map(|d| d.tier.wire_str()).unwrap_or("1h");
+    let hud_ttl = policy_decision.map(|d| d.tier.wire_str()).unwrap_or("5m");
+
     let mut firmware_len = 0;
     let mut state_len = 0;
     let mut rebuild_mode_tag: Option<String> = None;
@@ -389,6 +458,12 @@ async fn handle_anthropic_message(
     // →1985 X3: thread the true inbound body size through to projection
     // synthesis so the [meminfo] line carries the body gauge.
     rebuild_config.body_bytes_in = Some(req_bytes_in);
+    // →2032: a DEAD verdict licenses a faithful re-projection sized to
+    // compact_target — converted to the rebuild module's byte currency
+    // with the same calibration the token estimate used.
+    rebuild_config.compact_target_bytes = policy_decision
+        .and_then(|d| d.compact_target)
+        .map(|t| (t as f64 * config.truth_bytes_per_token.value) as usize);
 
     // Federated mode (mode=rebuild-kernel): fetch a fresh envelope from
     // the kernel daemon over IPC. Any failure falls through to standalone
@@ -636,11 +711,15 @@ async fn handle_anthropic_message(
             // every turn after the first. Idempotent — repeated
             // requests do not double-append.
             if rebuild_config.enabled
-                && ostk_cache::rebuild::append_kernel_orientation_to_system(&mut value)
+                && ostk_cache::rebuild::append_kernel_orientation_to_system(
+                    &mut value,
+                    firmware_ttl,
+                )
             {
                 if config.verbose.value {
                     println!(
-                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl=1h)"
+                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl={})",
+                        firmware_ttl
                     );
                 }
                 mutated = true;
@@ -896,7 +975,9 @@ async fn handle_anthropic_message(
                     {
                         "type": "text",
                         "text": firmware,
-                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                        // →2032: tier-driven when the policy is active;
+                        // status-quo 1h otherwise.
+                        "cache_control": {"type": "ephemeral", "ttl": firmware_ttl}
                     }
                 ]));
 
@@ -929,11 +1010,13 @@ async fn handle_anthropic_message(
                         new_content_array.push(json!({
                             "type": "text",
                             "text": format!("{}\n", hud),
-                            // →2030(a): telemetry-only forecast — the HUD
-                            // breakpoint stays at the status-quo 5m TTL.
+                            // →2030(a): the forecast itself is telemetry-
+                            // only. →2032: the ACTIVE policy's tier drives
+                            // this breakpoint when enabled; status-quo 5m
+                            // otherwise.
                             "cache_control": {
                                 "type": "ephemeral",
-                                "ttl": "5m"
+                                "ttl": hud_ttl
                             }
                         }));
 

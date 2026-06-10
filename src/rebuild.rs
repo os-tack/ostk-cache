@@ -47,26 +47,27 @@ const ORIENTATION_HEADER_MARKER: &str = "# ostk-cache kernel orientation";
 
 /// Append the kernel orientation block to the request's system prompt.
 ///
-/// Adds `cache_control: ttl=1h` IFF we have budget remaining under
-/// Anthropic's 4-block limit. If we're already at the limit, the
-/// orientation text is still appended (model still sees the
-/// discipline); it just doesn't get a dedicated cache breakpoint and
-/// falls back to whatever prefix-cache happens to land on its stable
-/// bytes.
+/// Adds `cache_control` with the caller-chosen `ttl` ("5m" or "1h" —
+/// status-quo callers pass "1h"; →2032 the write policy's tier when
+/// active) IFF we have budget remaining under Anthropic's 4-block
+/// limit. If we're already at the limit, the orientation text is still
+/// appended (model still sees the discipline); it just doesn't get a
+/// dedicated cache breakpoint and falls back to whatever prefix-cache
+/// happens to land on its stable bytes.
 ///
 /// Preserves claude-code's existing system structure (string or array
 /// of blocks). Idempotent — if the orientation marker is already
 /// present, no-op.
 ///
 /// Returns true if a block was appended; false otherwise.
-pub fn append_kernel_orientation_to_system(value: &mut Value) -> bool {
+pub fn append_kernel_orientation_to_system(value: &mut Value, ttl: &str) -> bool {
     let with_cache_control =
         count_cache_control_fields(value) < ANTHROPIC_CACHE_CONTROL_LIMIT;
     let new_block = if with_cache_control {
         json!({
             "type": "text",
             "text": KERNEL_ORIENTATION,
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            "cache_control": {"type": "ephemeral", "ttl": ttl}
         })
     } else {
         json!({
@@ -170,6 +171,15 @@ pub struct RebuildConfig {
     /// projected `[meminfo]` line gains a ` body:<N.N>MB/32MB` gauge so
     /// seats and the lead can watch the march toward the transport wall.
     pub body_bytes_in: Option<u64>,
+    /// →2032: DEAD-path faithful-projection byte budget, converted by
+    /// the caller from the write policy's `compact_target` tokens
+    /// (`tokens × truth_bytes_per_token`). When the composed synthetic
+    /// context exceeds it, optional substrate-recoverable sections are
+    /// elided in fixed priority order (templates → transcript tail →
+    /// assistant digests); the core sections (envelope, tool activity,
+    /// frontier, user thread) are never elided. None → WARM turn or
+    /// policy dark: no elision, status-quo composition.
+    pub compact_target_bytes: Option<usize>,
 }
 
 impl RebuildConfig {
@@ -197,6 +207,7 @@ impl RebuildConfig {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         }
     }
 
@@ -224,6 +235,7 @@ impl RebuildConfig {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         }
     }
 }
@@ -258,6 +270,9 @@ pub struct RebuildReport {
     pub native_tool_calls_summarized: usize,
     /// Number of prior user messages retained in the user intent thread.
     pub user_messages_summarized: usize,
+    /// →2032: optional sections elided to meet `compact_target_bytes`
+    /// (0 = no budget set or synthetic already fit).
+    pub sections_elided: usize,
 }
 
 /// Run the rebuild rewriter against `req` in place.
@@ -333,6 +348,44 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         config.recent_assistant_digests.as_deref(),
         config.templates_summary.as_deref(),
     );
+
+    // →2032: DEAD-path compaction. A `compact_target_bytes` budget
+    // licenses a faithful re-projection — elide optional sections in
+    // fixed priority order (templates first: derived data; then
+    // transcript tail; then assistant digests) until the synthetic
+    // fits. All three are substrate-recoverable (recall / transcript
+    // JSONL / cycle_digests.jsonl), satisfying the →1985 faithfulness
+    // constraint. If the core projection alone still exceeds the
+    // budget, it stands as-is — never elide envelope, tool activity,
+    // frontier, or the user thread.
+    let mut synthetic = synthetic;
+    let mut sections_elided = 0usize;
+    if let Some(budget) = config.compact_target_bytes {
+        let mut templates = config.templates_summary.as_deref();
+        let mut tail = config.transcript_tail_summary.as_deref();
+        let mut digests = config.recent_assistant_digests.as_deref();
+        while synthetic.len() > budget {
+            if templates.is_some() {
+                templates = None;
+            } else if tail.is_some() {
+                tail = None;
+            } else if digests.is_some() {
+                digests = None;
+            } else {
+                break;
+            }
+            sections_elided += 1;
+            synthetic = compose_synthetic_context(
+                &envelope,
+                &native_summary,
+                &unresolved,
+                &user_thread,
+                tail,
+                digests,
+                templates,
+            );
+        }
+    }
     let bytes_out = synthetic.len();
 
     let in_flight: Vec<Value> = messages[user_idx..].to_vec();
@@ -373,6 +426,7 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         envelope_found: envelope.is_some(),
         native_tool_calls_summarized: native_summary.len(),
         user_messages_summarized: user_thread.len(),
+        sections_elided,
     })
 }
 
@@ -1649,6 +1703,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -1663,6 +1718,81 @@ mod tests {
         assert_eq!(messages[0].get("role").unwrap().as_str(), Some("user"));
         assert_eq!(messages[1].get("role").unwrap().as_str(), Some("user"));
         assert_eq!(messages[1].get("content").unwrap().as_str(), Some("new"));
+    }
+
+    // →2032: a compact_target_bytes budget elides optional sections in
+    // priority order (templates → tail → digests) and reports the
+    // count; the core projection always survives.
+    #[test]
+    fn compact_target_elides_optional_sections() {
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"}
+            ]
+        });
+        let config = RebuildConfig {
+            enabled: true,
+            mode_tag: "rebuild_local".into(),
+            max_native_tool_summary: 18,
+            max_user_intent_thread: 10,
+            live_envelope_override: None,
+            transcript_tail_summary: Some("tail-section-marker".into()),
+            recent_assistant_digests: Some("digest-section-marker".into()),
+            templates_summary: Some("templates-section-marker".into()),
+            prior_user_turns_override: None,
+            body_bytes_in: None,
+            // Impossible budget: every optional section must go and the
+            // core projection still stands.
+            compact_target_bytes: Some(1),
+        };
+        match apply_rebuild(&mut req, &config) {
+            RebuildOutcome::Applied(report) => {
+                assert_eq!(report.sections_elided, 3);
+                assert!(report.bytes_out > 0, "core projection must survive");
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
+        let text = serde_json::to_string(&req).unwrap();
+        assert!(!text.contains("templates-section-marker"));
+        assert!(!text.contains("tail-section-marker"));
+        assert!(!text.contains("digest-section-marker"));
+        assert!(text.contains("Kernel projection"), "core sections never elided");
+    }
+
+    // →2032: a generous budget elides nothing — WARM-equivalent
+    // composition is byte-identical to the no-budget path.
+    #[test]
+    fn compact_target_keeps_sections_when_under_budget() {
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"}
+            ]
+        });
+        let config = RebuildConfig {
+            enabled: true,
+            mode_tag: "rebuild_local".into(),
+            max_native_tool_summary: 18,
+            max_user_intent_thread: 10,
+            live_envelope_override: None,
+            transcript_tail_summary: Some("tail-section-marker".into()),
+            recent_assistant_digests: None,
+            templates_summary: None,
+            prior_user_turns_override: None,
+            body_bytes_in: None,
+            compact_target_bytes: Some(10_000_000),
+        };
+        match apply_rebuild(&mut req, &config) {
+            RebuildOutcome::Applied(report) => {
+                assert_eq!(report.sections_elided, 0);
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
+        let text = serde_json::to_string(&req).unwrap();
+        assert!(text.contains("tail-section-marker"));
     }
 
     #[test]
@@ -1691,6 +1821,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -1725,6 +1856,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Disabled));
@@ -1746,6 +1878,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -1767,6 +1900,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Skipped(_)));
@@ -2083,6 +2217,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         apply_rebuild(&mut req, &config);
         let messages = req.get("messages").unwrap().as_array().unwrap();
@@ -2120,7 +2255,7 @@ mod tests {
                 {"type": "text", "text": "claude-code original system block"}
             ]
         });
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(appended);
         let arr = req.get("system").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -2141,7 +2276,7 @@ mod tests {
     #[test]
     fn append_orientation_wraps_string_system_into_array() {
         let mut req = json!({"system": "claude-code's flat string system"});
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(appended);
         let arr = req.get("system").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -2162,7 +2297,7 @@ mod tests {
     #[test]
     fn append_orientation_creates_system_when_absent() {
         let mut req = json!({"messages": []});
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(appended);
         let arr = req.get("system").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -2184,7 +2319,7 @@ mod tests {
                 {"type": "text", "text": KERNEL_ORIENTATION, "cache_control": {"type":"ephemeral","ttl":"1h"}}
             ]
         });
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(!appended, "orientation already present — must not double-append");
         let arr = req.get("system").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -2193,7 +2328,7 @@ mod tests {
     #[test]
     fn append_orientation_is_idempotent_on_string() {
         let mut req = json!({"system": KERNEL_ORIENTATION});
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(!appended);
         // String not converted to array since no append happened:
         assert!(req.get("system").unwrap().is_string());
@@ -2237,7 +2372,7 @@ mod tests {
             ]
         });
         assert_eq!(count_cache_control_fields(&req), ANTHROPIC_CACHE_CONTROL_LIMIT);
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(appended, "orientation text must still be appended");
         let last = req.get("system").unwrap().as_array().unwrap().last().unwrap();
         assert!(
@@ -2261,7 +2396,7 @@ mod tests {
         });
         let before = count_cache_control_fields(&req);
         assert_eq!(before, 1);
-        append_kernel_orientation_to_system(&mut req);
+        append_kernel_orientation_to_system(&mut req, "1h");
         let after = count_cache_control_fields(&req);
         assert_eq!(after, 2, "orientation marker added under limit");
     }
@@ -2289,6 +2424,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         apply_rebuild(&mut req, &config);
         let synthetic_block = req.get("messages").unwrap().as_array().unwrap()[0]
@@ -2339,6 +2475,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2394,6 +2531,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         match outcome {
@@ -2435,6 +2573,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
@@ -2671,6 +2810,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         };
         let outcome = apply_rebuild(&mut req, &config);
         assert!(
@@ -2678,7 +2818,7 @@ mod tests {
             "rebuild must apply against this fixture; got {:?}",
             outcome
         );
-        let appended = append_kernel_orientation_to_system(&mut req);
+        let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(appended, "orientation block must append to fixture");
 
         let ttls = collect_ttls_in_doc_order(&req);
@@ -2855,6 +2995,7 @@ mod tests {
             templates_summary: None,
             prior_user_turns_override: None,
             body_bytes_in: None,
+            compact_target_bytes: None,
         }
     }
 
