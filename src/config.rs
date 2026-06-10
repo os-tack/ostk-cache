@@ -238,6 +238,26 @@ pub struct CliArgs {
     #[arg(long)]
     pub capture_max_entries: Option<usize>,
 
+    /// →2032: enable the active cache-write policy — WARM/DEAD lane
+    /// classification, write-time TTL tiering, and DEAD-path faithful
+    /// re-projection targets. Default: off until the AC-2 live A/B clears.
+    #[arg(long)]
+    pub write_policy: bool,
+
+    /// →2032: DEAD-path compaction factor applied to the simulated
+    /// prefix. Default: 0.278 (replay-validated reference value).
+    #[arg(long)]
+    pub policy_compact: Option<f64>,
+
+    /// →2032: floor (tokens) for a compacted projection. Default: 25000.
+    #[arg(long)]
+    pub policy_min_prefix: Option<u64>,
+
+    /// →2032: ceiling (tokens) for any single cold write (AC-4,
+    /// structural). Default: 200000.
+    #[arg(long)]
+    pub policy_cold_cap: Option<u64>,
+
     /// Verbose per-turn logging (multi-line breakdown instead of the
     /// single `[turn ...]` line).
     #[arg(long, short = 'v')]
@@ -276,6 +296,18 @@ struct FileConfig {
     kernel: KernelFile,
     #[serde(default)]
     capture: CaptureFile,
+    #[serde(default)]
+    write_policy: WritePolicyFile,
+}
+
+/// →2032 `[write_policy]` section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WritePolicyFile {
+    enabled: Option<bool>,
+    compact: Option<f64>,
+    min_prefix: Option<u64>,
+    cold_cap: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -392,6 +424,14 @@ pub struct Config {
     pub capture_http_dir: Resolved<PathBuf>,
     /// →2035: rotation cap; 0 = unlimited.
     pub capture_max_entries: Resolved<usize>,
+    /// →2032: active write policy master switch (default off).
+    pub write_policy_enabled: Resolved<bool>,
+    /// →2032: DEAD-path compaction factor.
+    pub policy_compact: Resolved<f64>,
+    /// →2032: compacted-projection floor (tokens).
+    pub policy_min_prefix: Resolved<u64>,
+    /// →2032: single cold-write ceiling (tokens, AC-4).
+    pub policy_cold_cap: Resolved<u64>,
     pub verbose: Resolved<bool>,
     pub config_path: Option<PathBuf>,
 }
@@ -615,6 +655,36 @@ impl Config {
             crate::http_capture::DEFAULT_CAPTURE_MAX_ENTRIES,
         );
 
+        // ---- →2032 write policy ----------------------------------------
+        let write_policy_enabled = pick_value(
+            if cli.write_policy { Some(true) } else { None },
+            env_truthy("OSTK_CACHE_WRITE_POLICY"),
+            file.and_then(|f| f.write_policy.enabled),
+            false,
+        );
+
+        let policy_defaults = crate::write_policy::WritePolicyParams::default();
+        let policy_compact = pick_value(
+            cli.policy_compact,
+            env_str("OSTK_CACHE_POLICY_COMPACT").and_then(|s| s.parse().ok()),
+            file.and_then(|f| f.write_policy.compact),
+            policy_defaults.compact,
+        );
+
+        let policy_min_prefix = pick_value(
+            cli.policy_min_prefix,
+            env_num("OSTK_CACHE_POLICY_MIN_PREFIX"),
+            file.and_then(|f| f.write_policy.min_prefix),
+            policy_defaults.min_prefix,
+        );
+
+        let policy_cold_cap = pick_value(
+            cli.policy_cold_cap,
+            env_num("OSTK_CACHE_POLICY_COLD_CAP"),
+            file.and_then(|f| f.write_policy.cold_cap),
+            policy_defaults.cold_cap,
+        );
+
         let verbose = pick_value(
             if cli.verbose { Some(true) } else { None },
             None,
@@ -643,6 +713,10 @@ impl Config {
             capture_http,
             capture_http_dir,
             capture_max_entries,
+            write_policy_enabled,
+            policy_compact,
+            policy_min_prefix,
+            policy_cold_cap,
             verbose,
             config_path,
         }
@@ -744,6 +818,26 @@ impl Config {
             "capture.max_entries",
             &self.capture_max_entries.value,
             self.capture_max_entries.source,
+        ));
+        out.push_str(&row(
+            "write_policy.enabled",
+            &self.write_policy_enabled.value,
+            self.write_policy_enabled.source,
+        ));
+        out.push_str(&row(
+            "write_policy.compact",
+            &self.policy_compact.value,
+            self.policy_compact.source,
+        ));
+        out.push_str(&row(
+            "write_policy.min_prefix",
+            &self.policy_min_prefix.value,
+            self.policy_min_prefix.source,
+        ));
+        out.push_str(&row(
+            "write_policy.cold_cap",
+            &self.policy_cold_cap.value,
+            self.policy_cold_cap.source,
         ));
         out.push_str(&row("verbose", &self.verbose.value, self.verbose.source));
         out
@@ -851,6 +945,10 @@ mod tests {
             "OSTK_CACHE_USAGE_TRUTH",
             "OSTK_CACHE_USAGE_TRUTH_SESSIONS",
             "OSTK_CACHE_TRUTH_BYTES_PER_TOKEN",
+            "OSTK_CACHE_WRITE_POLICY",
+            "OSTK_CACHE_POLICY_COMPACT",
+            "OSTK_CACHE_POLICY_MIN_PREFIX",
+            "OSTK_CACHE_POLICY_COLD_CAP",
         ] {
             unsafe { std::env::remove_var(k) };
         }
@@ -880,6 +978,10 @@ mod tests {
             capture_http: false,
             capture_http_dir: None,
             capture_max_entries: None,
+            write_policy: false,
+            policy_compact: None,
+            policy_min_prefix: None,
+            policy_cold_cap: None,
             verbose: false,
             config: None,
             print_config: false,
@@ -909,6 +1011,13 @@ mod tests {
         assert!(cfg.body_limit_mb.value > cfg.overflow_mb.value);
         assert!(cfg.rewrite_enabled.value);
         assert_eq!(cfg.rewrite_enabled.source, Source::Default);
+        // →2032: policy ships dark; knob defaults mirror WritePolicyParams.
+        assert!(!cfg.write_policy_enabled.value);
+        assert_eq!(cfg.write_policy_enabled.source, Source::Default);
+        let pd = crate::write_policy::WritePolicyParams::default();
+        assert_eq!(cfg.policy_compact.value, pd.compact);
+        assert_eq!(cfg.policy_min_prefix.value, pd.min_prefix);
+        assert_eq!(cfg.policy_cold_cap.value, pd.cold_cap);
     }
 
     // →1985 X1(B): allowlist resolution — TOML source, env override,
@@ -936,6 +1045,45 @@ mod tests {
         );
         assert_eq!(cfg.usage_truth_sessions.source, Source::Env);
         clear_env();
+    }
+
+    // →2032: [write_policy] TOML section, env override, and the
+    // invariant that tuning knobs alone never flip the master switch.
+    #[test]
+    fn write_policy_from_toml_and_env() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ostk");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cache.toml"),
+            "[write_policy]\nenabled = true\ncompact = 0.5\nmin_prefix = 30000\n",
+        )
+        .unwrap();
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert!(cfg.write_policy_enabled.value);
+        assert_eq!(cfg.write_policy_enabled.source, Source::Toml);
+        assert_eq!(cfg.policy_compact.value, 0.5);
+        assert_eq!(cfg.policy_min_prefix.value, 30_000);
+        // cold_cap untouched in TOML — falls through to the params default.
+        assert_eq!(
+            cfg.policy_cold_cap.value,
+            crate::write_policy::WritePolicyParams::default().cold_cap
+        );
+        assert_eq!(cfg.policy_cold_cap.source, Source::Default);
+
+        unsafe { std::env::set_var("OSTK_CACHE_POLICY_COLD_CAP", "150000") };
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert_eq!(cfg.policy_cold_cap.value, 150_000);
+        assert_eq!(cfg.policy_cold_cap.source, Source::Env);
+        clear_env();
+
+        // Knobs without `enabled` leave the policy dark.
+        std::fs::write(dir.join("cache.toml"), "[write_policy]\ncompact = 0.4\n").unwrap();
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert!(!cfg.write_policy_enabled.value);
+        assert_eq!(cfg.policy_compact.value, 0.4);
     }
 
     #[test]
