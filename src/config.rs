@@ -228,7 +228,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub capture_http: bool,
 
-    /// Directory for --capture-http output. Default: <cwd>/.ostk/http-capture.
+    /// Directory for --capture-http output. Default:
+    /// ~/.cache/ostk-cache/http-capture (never inside a project .ostk
+    /// tree; pass an explicit path to opt back in).
     #[arg(long)]
     pub capture_http_dir: Option<PathBuf>,
 
@@ -603,7 +605,7 @@ impl Config {
             cli.capture_http_dir.clone(),
             env_str("OSTK_CAPTURE_HTTP_DIR").map(PathBuf::from),
             file.and_then(|f| f.capture.dir.clone()),
-            crate::http_capture::default_capture_dir(cwd),
+            crate::http_capture::default_capture_dir(),
         );
 
         let capture_max_entries = pick_value(

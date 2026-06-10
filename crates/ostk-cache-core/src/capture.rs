@@ -507,8 +507,19 @@ pub fn check_upstream_self_loop(upstream_url: &str, listen_port: u16) -> Result<
 // default_capture_dir
 // ---------------------------------------------------------------------------
 
-pub fn default_capture_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".ostk").join("http-capture")
+/// Default capture root: `~/.cache/ostk-cache/http-capture`, falling back
+/// to `<system tmp>/ostk-cache/http-capture` when `$HOME` is unset.
+/// Deliberately OUTSIDE any project `.ostk` tree (→2035): the in-repo
+/// default was the traversal-wedge site in the 20260610 self-loop
+/// incident, and the entry cap only bounds — not prevents — that blast
+/// radius. A project-local path remains available as an explicit
+/// override (CLI `--capture-http-dir`, `OSTK_CAPTURE_HTTP_DIR`,
+/// `capture.dir` in TOML).
+pub fn default_capture_dir() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".cache"))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("ostk-cache").join("http-capture")
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +908,24 @@ mod tests {
         assert!(
             cache.check_and_record("sess", "body-hash-aaa"),
             "second call with same key should be duplicate"
+        );
+    }
+
+    // ---- Default capture dir (→2035 rider) ----------------------------------
+
+    #[test]
+    fn default_capture_dir_is_outside_any_ostk_tree() {
+        let dir = default_capture_dir();
+        assert!(
+            !dir.components()
+                .any(|c| c.as_os_str() == std::ffi::OsStr::new(".ostk")),
+            "default capture dir must never sit inside a .ostk tree (traversal-wedge site, →2035); got {}",
+            dir.display()
+        );
+        assert!(
+            dir.ends_with(Path::new("ostk-cache").join("http-capture")),
+            "unexpected default capture dir shape: {}",
+            dir.display()
         );
     }
 }
