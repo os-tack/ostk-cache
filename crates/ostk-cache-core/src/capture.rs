@@ -11,6 +11,14 @@
 //!    entries (pre-shard) are still readable; the only break is that NEW writes
 //!    go into shards.
 //!
+//!    →2038 polish: the full directory walk is amortized through [`RotationState`]
+//!    — Starts only pay the walk at cold start (count unknown) or when the
+//!    in-process estimate crosses `max_entries + max_entries/16` slack, so the cap
+//!    is enforced within ~6% overshoot instead of rescanned on every capture.
+//!    Rotation also removes shard dirs it empties, and `Finish`/`Outbound`
+//!    messages whose entry was rotated away in flight are dropped silently
+//!    (counted in [`rotated_inflight_drops`], not logged).
+//!
 //! 2. **Non-blocking capture** — `maybe_start` returns immediately; actual disk I/O
 //!    is delegated to the calling crate's async writer via the `CaptureWriter` trait.
 //!
@@ -59,6 +67,15 @@ pub fn dropped_captures() -> u64 {
 
 pub fn increment_dropped_captures() {
     DROPPED_CAPTURES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `Finish`/`Outbound` messages dropped because rotation evicted their entry
+/// while the capture was still in flight (→2038). Expected under sustained
+/// load at the cap; not an error.
+static ROTATED_INFLIGHT_DROPS: AtomicU64 = AtomicU64::new(0);
+
+pub fn rotated_inflight_drops() -> u64 {
+    ROTATED_INFLIGHT_DROPS.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -179,13 +196,23 @@ pub fn handle_capture_msg(msg: CaptureMsg) {
                 return;
             }
             // Rotation: run after successful write (off request path).
-            rotate_capture_dir(&root, max_entries);
+            // Amortized — only walks the tree when the estimate crosses the cap.
+            GLOBAL_ROTATION.record_and_maybe_rotate(&root, max_entries);
             // Persist partial metadata so a crashed capture still has a record.
             let _ = write_metadata(&entry_dir, &meta_partial);
         }
         CaptureMsg::Outbound { entry_dir, payload } => {
+            if !entry_dir.exists() {
+                // Entry rotated away while the request was in flight (→2038).
+                ROTATED_INFLIGHT_DROPS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             if let Err(e) = write_blob_raw(&entry_dir, REQUEST_OUT_BODY, &payload) {
-                eprintln!("[proxy] capture outbound write failed: {}", e);
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    ROTATED_INFLIGHT_DROPS.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    eprintln!("[proxy] capture outbound write failed: {}", e);
+                }
             }
         }
         CaptureMsg::Finish {
@@ -196,9 +223,18 @@ pub fn handle_capture_msg(msg: CaptureMsg) {
             response_body,
             elapsed_ms,
         } => {
+            if !entry_dir.exists() {
+                // Entry rotated away while the request was in flight (→2038).
+                ROTATED_INFLIGHT_DROPS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             let resp_blob = match write_blob_raw(&entry_dir, RESPONSE_BODY, &response_body) {
                 Ok(b) => Some(b),
                 Err(e) => {
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        ROTATED_INFLIGHT_DROPS.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
                     eprintln!("[proxy] capture response write failed: {}", e);
                     None
                 }
@@ -223,18 +259,76 @@ pub fn handle_capture_msg(msg: CaptureMsg) {
 // Rotation helpers
 // ---------------------------------------------------------------------------
 
+/// Sentinel for "entry count not yet measured" (forces a scan on first use).
+const COUNT_UNKNOWN: u64 = u64::MAX;
+
+/// Amortized rotation driver (→2038): tracks an in-process estimate of the
+/// entry count so the full directory walk in [`rotate_capture_dir`] only runs
+/// when the cap could actually be exceeded, instead of on every Start.
+///
+/// One state covers one capture root; the proxy runs a single root per
+/// process, which is the assumption baked into [`handle_capture_msg`]'s
+/// global instance. The estimate may drift under concurrent writers or
+/// external deletion — every full scan re-syncs it to the true count, so
+/// drift is bounded between scans.
+pub struct RotationState {
+    /// Estimated entries under the root, *excluding* the entry currently
+    /// being recorded. `COUNT_UNKNOWN` forces a scan.
+    estimate: AtomicU64,
+}
+
+impl RotationState {
+    pub const fn new() -> Self {
+        Self {
+            estimate: AtomicU64::new(COUNT_UNKNOWN),
+        }
+    }
+
+    /// Record one newly written entry (already on disk) and rotate if the
+    /// cap could be exceeded. Scans are triggered with `max_entries / 16`
+    /// slack (min 1) so a root sitting at the cap pays the walk once per
+    /// slack-many Starts rather than on every capture; the cap is therefore
+    /// enforced within that slack, not exactly.
+    pub fn record_and_maybe_rotate(&self, root: &Path, max_entries: usize) {
+        if max_entries == 0 {
+            return; // 0 = unlimited
+        }
+        let slack = (max_entries / 16).max(1) as u64;
+        let est = self.estimate.load(Ordering::Relaxed);
+        if est == COUNT_UNKNOWN || est + 1 >= max_entries as u64 + slack {
+            let remaining = rotate_capture_dir(root, max_entries);
+            self.estimate.store(remaining as u64, Ordering::Relaxed);
+        } else {
+            self.estimate.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Default for RotationState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static GLOBAL_ROTATION: RotationState = RotationState::new();
+
 /// Count total capture entries (across shards) under `root` and delete
-/// oldest by lexicographic order until count <= max_entries.
-pub fn rotate_capture_dir(root: &Path, max_entries: usize) {
+/// oldest by lexicographic order until count <= max_entries. Shard dirs
+/// emptied by the eviction are removed as well (→2038). Returns the number
+/// of entries remaining (0 on unreadable root or when `max_entries == 0`,
+/// where no scan happens).
+pub fn rotate_capture_dir(root: &Path, max_entries: usize) -> usize {
     if max_entries == 0 {
-        return; // 0 = unlimited
+        return 0; // 0 = unlimited
     }
 
     // Collect all entry dirs: both sharded (<root>/<8-prefix>/<id>/)
     // and legacy flat (<root>/<id>/) by checking for metadata.json.
     let mut entries: Vec<PathBuf> = Vec::new();
 
-    let Ok(top) = std::fs::read_dir(root) else { return };
+    let Ok(top) = std::fs::read_dir(root) else {
+        return 0;
+    };
     for top_item in top.flatten() {
         let p = top_item.path();
         if !p.is_dir() {
@@ -245,7 +339,9 @@ pub fn rotate_capture_dir(root: &Path, max_entries: usize) {
             entries.push(p);
         } else {
             // Potentially a shard dir — look inside.
-            let Ok(shard_rd) = std::fs::read_dir(&p) else { continue };
+            let Ok(shard_rd) = std::fs::read_dir(&p) else {
+                continue;
+            };
             for shard_item in shard_rd.flatten() {
                 let ep = shard_item.path();
                 if ep.is_dir() {
@@ -256,7 +352,7 @@ pub fn rotate_capture_dir(root: &Path, max_entries: usize) {
     }
 
     if entries.len() <= max_entries {
-        return;
+        return entries.len();
     }
 
     // Sort by entry dir name (lexicographic == chronological for our ids).
@@ -267,15 +363,35 @@ pub fn rotate_capture_dir(root: &Path, max_entries: usize) {
     });
 
     let to_delete = entries.len().saturating_sub(max_entries);
+    let mut deleted = 0usize;
+    let mut touched_shards: Vec<PathBuf> = Vec::new();
     for dir in entries.iter().take(to_delete) {
-        if let Err(e) = std::fs::remove_dir_all(dir) {
-            eprintln!(
-                "[proxy] capture rotation delete failed {}: {}",
-                dir.display(),
-                e
-            );
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => {
+                deleted += 1;
+                if let Some(parent) = dir.parent()
+                    && parent != root
+                    && !touched_shards.iter().any(|s| s == parent)
+                {
+                    touched_shards.push(parent.to_path_buf());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[proxy] capture rotation delete failed {}: {}",
+                    dir.display(),
+                    e
+                );
+            }
         }
     }
+    // Remove shard dirs the eviction emptied. remove_dir refuses non-empty
+    // dirs, so a shard that still holds entries is left alone.
+    for shard in touched_shards {
+        let _ = std::fs::remove_dir(&shard);
+    }
+
+    entries.len() - deleted
 }
 
 /// Compute the shard subdir path for a given entry id.
@@ -414,7 +530,11 @@ impl HttpCapture {
             meta_partial: Box::new(meta),
         });
 
-        Some(Self { id, entry_dir: dir, sink })
+        Some(Self {
+            id,
+            entry_dir: dir,
+            sink,
+        })
     }
 
     /// Capture id (filename-safe).
@@ -468,7 +588,11 @@ pub fn check_upstream_self_loop(upstream_url: &str, listen_port: u16) -> Result<
     let (host, port_str) = if let Some(colon) = host_port.rfind(':') {
         (&host_port[..colon], &host_port[colon + 1..])
     } else {
-        let default_port = if url.starts_with("https://") { "443" } else { "80" };
+        let default_port = if url.starts_with("https://") {
+            "443"
+        } else {
+            "80"
+        };
         (host_port, default_port)
     };
 
@@ -481,14 +605,7 @@ pub fn check_upstream_self_loop(upstream_url: &str, listen_port: u16) -> Result<
         return Ok(());
     }
 
-    let local_hosts = [
-        "127.0.0.1",
-        "::1",
-        "localhost",
-        "0.0.0.0",
-        "[::]",
-        "[::1]",
-    ];
+    let local_hosts = ["127.0.0.1", "::1", "localhost", "0.0.0.0", "[::]", "[::1]"];
 
     if local_hosts.iter().any(|h| h.eq_ignore_ascii_case(host)) {
         return Err(format!(
@@ -815,6 +932,211 @@ mod tests {
         assert_eq!(count, 3);
     }
 
+    // ---- →2038 rotation polish ----------------------------------------------
+
+    fn count_entries(root: &Path) -> usize {
+        let mut count = 0usize;
+        for top in std::fs::read_dir(root).unwrap().flatten() {
+            let p = top.path();
+            if !p.is_dir() {
+                continue;
+            }
+            if p.join(METADATA_JSON).exists() {
+                count += 1; // legacy flat
+            } else {
+                for e in std::fs::read_dir(&p).unwrap().flatten() {
+                    if e.path().is_dir() {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn rotation_returns_remaining_count() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        for i in 0u64..5 {
+            let id = format!("{:016}-000001-aabb{:08}", i, i);
+            let dir = entry_dir(root, &id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+        }
+        assert_eq!(
+            rotate_capture_dir(root, 3),
+            3,
+            "evicting scan returns post-eviction count"
+        );
+        assert_eq!(
+            rotate_capture_dir(root, 10),
+            3,
+            "under-cap scan returns current count"
+        );
+    }
+
+    #[test]
+    fn rotation_removes_emptied_shard_dirs() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let old_ids: Vec<String> = (0u64..2).map(|i| format!("aaaa0000-{:06}", i)).collect();
+        let new_ids: Vec<String> = (0u64..2).map(|i| format!("bbbb0000-{:06}", i)).collect();
+        for id in old_ids.iter().chain(new_ids.iter()) {
+            let dir = entry_dir(root, id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+        }
+
+        let remaining = rotate_capture_dir(root, 2);
+
+        assert_eq!(remaining, 2);
+        assert!(
+            !shard_dir(root, &old_ids[0]).exists(),
+            "shard dir emptied by eviction should be removed"
+        );
+        assert!(
+            shard_dir(root, &new_ids[0]).exists(),
+            "shard dir with surviving entries should remain"
+        );
+    }
+
+    #[test]
+    fn rotation_keeps_partially_emptied_shard_dirs() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let ids: Vec<String> = (0u64..3).map(|i| format!("cccc0000-{:06}", i)).collect();
+        for id in &ids {
+            let dir = entry_dir(root, id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+        }
+
+        let remaining = rotate_capture_dir(root, 2);
+
+        assert_eq!(remaining, 2);
+        let shard = shard_dir(root, &ids[0]);
+        assert!(
+            shard.exists(),
+            "shard still holding entries must not be removed"
+        );
+        assert!(!entry_dir(root, &ids[0]).exists());
+        assert!(entry_dir(root, &ids[2]).exists());
+    }
+
+    #[test]
+    fn rotation_legacy_eviction_never_removes_root() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        for i in 0u64..3 {
+            let id = format!("{:016}-000001-legacy{:06}", i, i);
+            let dir = root.join(&id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+        }
+
+        let remaining = rotate_capture_dir(root, 1);
+
+        assert_eq!(remaining, 1);
+        assert!(root.exists(), "root must survive legacy flat eviction");
+    }
+
+    #[test]
+    fn finish_after_rotation_drops_silently() {
+        let td = TempDir::new().unwrap();
+        let gone = td
+            .path()
+            .join("17000000")
+            .join("17000000-000001-deadbeef0000");
+        let before = rotated_inflight_drops();
+
+        handle_capture_msg(CaptureMsg::Finish {
+            entry_dir: gone.clone(),
+            status: 200,
+            is_sse: false,
+            response_headers: Vec::new(),
+            response_body: b"body".to_vec(),
+            elapsed_ms: 1,
+        });
+
+        assert!(
+            rotated_inflight_drops() > before,
+            "finish on rotated-away entry should count as inflight drop"
+        );
+        assert!(!gone.exists(), "finish must not recreate the evicted entry");
+    }
+
+    #[test]
+    fn outbound_after_rotation_drops_silently() {
+        let td = TempDir::new().unwrap();
+        let gone = td
+            .path()
+            .join("17000000")
+            .join("17000000-000002-deadbeef0000");
+        let before = rotated_inflight_drops();
+
+        handle_capture_msg(CaptureMsg::Outbound {
+            entry_dir: gone.clone(),
+            payload: b"payload".to_vec(),
+        });
+
+        assert!(
+            rotated_inflight_drops() > before,
+            "outbound on rotated-away entry should count as inflight drop"
+        );
+        assert!(
+            !gone.exists(),
+            "outbound must not recreate the evicted entry"
+        );
+    }
+
+    #[test]
+    fn rotation_state_amortizes_and_enforces_cap_within_slack() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let state = RotationState::new();
+        let max = 4usize; // slack = max(4/16, 1) = 1 → scan when est+1 >= 5
+
+        let ids: Vec<String> = (0u64..6)
+            .map(|i| format!("{:016}-000001-cafe{:08}", i, i))
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            let dir = entry_dir(root, id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+            state.record_and_maybe_rotate(root, max);
+            if i < max {
+                assert_eq!(
+                    count_entries(root),
+                    i + 1,
+                    "no eviction while within cap+slack"
+                );
+            }
+        }
+
+        assert_eq!(count_entries(root), max, "cap restored once slack crossed");
+        assert!(
+            !entry_dir(root, &ids[0]).exists(),
+            "oldest entry evicted first"
+        );
+        assert!(entry_dir(root, &ids[5]).exists(), "newest entry survives");
+    }
+
+    #[test]
+    fn rotation_state_zero_max_is_unlimited() {
+        let td = TempDir::new().unwrap();
+        let root = td.path();
+        let state = RotationState::new();
+        for i in 0u64..5 {
+            let id = format!("{:016}-000001-feed{:08}", i, i);
+            let dir = entry_dir(root, &id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("metadata.json"), b"{}").unwrap();
+            state.record_and_maybe_rotate(root, 0);
+        }
+        assert_eq!(count_entries(root), 5, "max_entries=0 must never evict");
+    }
+
     // ---- Dedupe window ------------------------------------------------------
 
     #[test]
@@ -823,7 +1145,10 @@ mod tests {
         let first = cache.check_and_record("session-1", "hash-abc");
         assert!(!first, "first occurrence should not be a duplicate");
         let second = cache.check_and_record("session-1", "hash-abc");
-        assert!(second, "second occurrence within window should be duplicate");
+        assert!(
+            second,
+            "second occurrence within window should be duplicate"
+        );
     }
 
     #[test]
