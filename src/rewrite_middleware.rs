@@ -132,12 +132,14 @@ pub struct RewriteEventRow {
     pub tokens_saved_estimate: u64,
     // →2030(a) TTL forecast telemetry fields. Added with serde defaults so
     // old rows (missing these fields) still parse — they get the default
-    // "keep5m"/"default"/None values which match pre-feature behavior.
-    /// TTL forecast decision: "keep5m" | "promote1h" | "die_cold".
+    // "keep1h"/"default"/None values which match pre-feature behavior.
+    /// TTL forecast decision: "keep1h" | "demote5m" | "die_cold".
     #[serde(default = "default_ttl_decision")]
     pub ttl_decision: String,
-    /// Median observed inter-request gap in seconds; None when the
-    /// decision came from an identity hint or the default path.
+    /// The observed gap (seconds) that drove the decision: the window
+    /// minimum for `demote5m` (the gap that survived the veto), the
+    /// median for an observed `keep1h`; None when the decision came
+    /// from an identity hint or the default path.
     #[serde(default)]
     pub observed_gap_s: Option<u64>,
     /// Source of the cadence classification: "observed" | "identity_hint" | "default".
@@ -146,7 +148,7 @@ pub struct RewriteEventRow {
 }
 
 fn default_ttl_decision() -> String {
-    "keep5m".to_string()
+    "keep1h".to_string()
 }
 
 fn default_cadence_source() -> String {
@@ -260,7 +262,7 @@ pub fn build_event_row_with_ttl(
             f.observed_gap_s,
             f.source.as_str().to_string(),
         ),
-        None => ("keep5m".to_string(), None, "default".to_string()),
+        None => ("keep1h".to_string(), None, "default".to_string()),
     };
 
     RewriteEventRow {
