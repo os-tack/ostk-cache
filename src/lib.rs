@@ -11,6 +11,7 @@ pub mod system_reminder_strip;
 pub mod transcript_tail;
 pub mod ttl_forecast;
 pub mod usage_truth;
+pub mod write_policy;
 
 pub use ostk_cache_core::usage::ProviderUsage;
 use serde::{Deserialize, Serialize};
