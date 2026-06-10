@@ -48,6 +48,10 @@ struct AppState {
     hint_cache: Arc<IdentityHintCache>,
     hook_adapter: HookAdapterHandle,
     config: Arc<Config>,
+    /// →2035 fix 2: background capture writer task handle.
+    capture_writer: Arc<dyn ostk_cache_core::capture::CaptureSink>,
+    /// →2035 fix 3: in-memory dedupe cache.
+    capture_dedupe: Arc<Mutex<ostk_cache::http_capture::DedupeCache>>,
 }
 
 #[tokio::main]
@@ -60,6 +64,14 @@ async fn main() {
     if print_only {
         println!("{}", config.print_table());
         return;
+    }
+
+    // →2035 fix 4(a): self-loop guard — refuse to start if upstream == us.
+    if let Err(msg) =
+        ostk_cache::http_capture::check_upstream_self_loop(&config.upstream.value, config.port.value)
+    {
+        eprintln!("[proxy] fatal: {}", msg);
+        std::process::exit(1);
     }
 
     let bind_addr = format!("127.0.0.1:{}", config.port.value);
@@ -89,6 +101,10 @@ async fn main() {
         cadence_store: Arc::new(DashMap::new()),
         hint_cache: Arc::new(IdentityHintCache::new()),
         hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
+        // →2035 fix 2: spawn the background capture writer.
+        capture_writer: ostk_cache::http_capture::spawn_capture_writer(),
+        // →2035 fix 3: dedupe cache (1024-entry LRU).
+        capture_dedupe: Arc::new(Mutex::new(ostk_cache::http_capture::DedupeCache::new(1024))),
         config: Arc::new(config),
     };
 
@@ -211,6 +227,24 @@ async fn handle_anthropic_message(
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
+    // →2035 fix 4(b): hop-header ingress guard. If we see our own hop
+    // header the request is already in a self-loop; reject with 508.
+    if headers.contains_key(ostk_cache::http_capture::HOP_HEADER) {
+        let body = json!({
+            "type": "error",
+            "error": {
+                "type": "loop_detected",
+                "message": format!(
+                    "ostk-cache detected a request loop (header {} present). \
+                     Check that ANTHROPIC_BASE_URL does not point at the proxy itself (→2035).",
+                    ostk_cache::http_capture::HOP_HEADER
+                )
+            }
+        })
+        .to_string();
+        return Ok((StatusCode::from_u16(508).unwrap_or(StatusCode::LOOP_DETECTED), body).into_response());
+    }
+
     let amp_store = state.amp_store.clone();
     let config = state.config.clone();
     let passthrough = matches!(config.mode.value, Mode::Passthrough);
@@ -313,6 +347,9 @@ async fn handle_anthropic_message(
         "/v1/messages",
         &headers,
         &body_bytes,
+        Some(&state.capture_writer),
+        Some(&state.capture_dedupe),
+        config.capture_max_entries.value,
     );
 
     // →1985 X2: overflow translation. Bodies above the soft threshold
@@ -959,6 +996,11 @@ async fn handle_anthropic_message(
     }
     req_builder = req_builder.header("content-type", "application/json");
     req_builder = req_builder.header("accept-encoding", "identity");
+    // →2035 fix 4(b): stamp hop header so a self-loop is detectable on ingress.
+    req_builder = req_builder.header(
+        ostk_cache::http_capture::HOP_HEADER,
+        ostk_cache::http_capture::HOP_HEADER_VALUE,
+    );
 
     let req_bytes_out = payload.len() as u64;
     if let Some(capture) = http_capture.as_mut() {
@@ -1229,6 +1271,22 @@ async fn handle_openai_response(
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
+    // →2035 fix 4(b): hop-header ingress guard.
+    if headers.contains_key(ostk_cache::http_capture::HOP_HEADER) {
+        let body = json!({
+            "error": {
+                "type": "loop_detected",
+                "message": format!(
+                    "ostk-cache detected a request loop (header {} present). \
+                     Check that upstream does not point at the proxy itself (→2035).",
+                    ostk_cache::http_capture::HOP_HEADER
+                )
+            }
+        })
+        .to_string();
+        return Ok((StatusCode::LOOP_DETECTED, body).into_response());
+    }
+
     let amp_store = state.amp_store.clone();
     let config = state.config.clone();
     let req_bytes_in = body_bytes.len() as u64;
@@ -1277,6 +1335,9 @@ async fn handle_openai_response(
         path,
         &headers,
         &body_bytes,
+        Some(&state.capture_writer),
+        Some(&state.capture_dedupe),
+        config.capture_max_entries.value,
     );
 
     let body_str = String::from_utf8_lossy(&body_bytes);
@@ -1308,6 +1369,11 @@ async fn handle_openai_response(
     }
     req_builder = req_builder.header("content-type", "application/json");
     req_builder = req_builder.header("accept-encoding", "identity");
+    // →2035 fix 4(b): stamp hop header on outbound.
+    req_builder = req_builder.header(
+        ostk_cache::http_capture::HOP_HEADER,
+        ostk_cache::http_capture::HOP_HEADER_VALUE,
+    );
 
     let req_bytes_out = payload.len() as u64;
     if let Some(capture) = http_capture.as_mut() {
@@ -1464,6 +1530,23 @@ async fn handle_catchall(
     headers: HeaderMap,
     body_bytes: axum::body::Bytes,
 ) -> Result<Response, StatusCode> {
+    // →2035 fix 4(b): hop-header ingress guard. The catchall is the widest
+    // routing surface, so a self-loop on any unrecognised path recurses here.
+    if headers.contains_key(ostk_cache::http_capture::HOP_HEADER) {
+        let body = json!({
+            "error": {
+                "type": "loop_detected",
+                "message": format!(
+                    "ostk-cache detected a request loop (header {} present). \
+                     Check that upstream does not point at the proxy itself (→2035).",
+                    ostk_cache::http_capture::HOP_HEADER
+                )
+            }
+        })
+        .to_string();
+        return Ok((StatusCode::LOOP_DETECTED, body).into_response());
+    }
+
     let config = state.config.clone();
     let req_bytes_in = body_bytes.len() as u64;
     let req_bytes_out = req_bytes_in;
@@ -1509,6 +1592,9 @@ async fn handle_catchall(
         path,
         &headers,
         &body_bytes,
+        Some(&state.capture_writer),
+        Some(&state.capture_dedupe),
+        config.capture_max_entries.value,
     );
 
     let capture_root = config.capture_http_dir.value.clone();
@@ -1523,6 +1609,11 @@ async fn handle_catchall(
         }
     }
     req_builder = req_builder.header("accept-encoding", "identity");
+    // →2035 fix 4(b): stamp hop header on outbound.
+    req_builder = req_builder.header(
+        ostk_cache::http_capture::HOP_HEADER,
+        ostk_cache::http_capture::HOP_HEADER_VALUE,
+    );
 
     if !body_bytes.is_empty() {
         if let Some(capture) = http_capture.as_mut() {

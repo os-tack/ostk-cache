@@ -552,12 +552,33 @@ async fn capture_http_writes_request_response_bodies_and_redacted_metadata() {
 
     let mut metadata_path = None;
     for _ in 0..100 {
-        if let Ok(entries) = std::fs::read_dir(&capture_dir) {
-            for entry in entries.flatten() {
-                let candidate = entry.path().join("metadata.json");
-                if candidate.exists() {
-                    metadata_path = Some(candidate);
-                    break;
+        // →2035: captures are now sharded into subdirs. Walk two levels:
+        // capture_dir/<shard>/<entry>/metadata.json OR
+        // capture_dir/<entry>/metadata.json (legacy flat, kept for compat).
+        'outer: {
+            if let Ok(top_entries) = std::fs::read_dir(&capture_dir) {
+                for top_entry in top_entries.flatten() {
+                    let top_path = top_entry.path();
+                    if !top_path.is_dir() {
+                        continue;
+                    }
+                    // Check flat (legacy): top_path is the entry dir.
+                    let flat_candidate = top_path.join("metadata.json");
+                    if flat_candidate.exists() {
+                        metadata_path = Some(flat_candidate);
+                        break 'outer;
+                    }
+                    // Check sharded: top_path is a shard dir.
+                    if let Ok(shard_entries) = std::fs::read_dir(&top_path) {
+                        for shard_entry in shard_entries.flatten() {
+                            let entry_path = shard_entry.path();
+                            let candidate = entry_path.join("metadata.json");
+                            if candidate.exists() {
+                                metadata_path = Some(candidate);
+                                break 'outer;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -567,11 +588,36 @@ async fn capture_http_writes_request_response_bodies_and_redacted_metadata() {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 
+    let metadata_path = metadata_path.expect("capture metadata should be written");
+    let capture_request_dir = metadata_path.parent().unwrap().to_path_buf();
+
+    // →2035: capture writes are async; wait for the finish files to land
+    // before killing the proxy (otherwise the writer task may be mid-write).
+    let response_body_path = capture_request_dir.join("response.body");
+    for _ in 0..100 {
+        if response_body_path.exists() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // Wait for the final metadata (status=200) BEFORE killing the proxy —
+    // killing mid-rewrite was a torn-write race until write_metadata went
+    // atomic; waiting here keeps the test deterministic either way.
+    for _ in 0..100 {
+        if let Ok(raw) = std::fs::read(&metadata_path) {
+            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+                if v["status"].as_u64().is_some() {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
     let _ = proxy.kill();
     let _ = proxy.wait();
 
-    let metadata_path = metadata_path.expect("capture metadata should be written");
-    let capture_request_dir = metadata_path.parent().unwrap();
     assert_eq!(
         std::fs::read(capture_request_dir.join("request-in.body")).unwrap(),
         req_body
@@ -581,7 +627,7 @@ async fn capture_http_writes_request_response_bodies_and_redacted_metadata() {
         req_body,
         "passthrough capture should preserve the exact outbound body"
     );
-    let response_body = std::fs::read_to_string(capture_request_dir.join("response.body")).unwrap();
+    let response_body = std::fs::read_to_string(&response_body_path).unwrap();
     assert!(response_body.contains("\"usage\""), "response body should be captured: {}", response_body);
 
     let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
@@ -1675,4 +1721,53 @@ async fn ledger_row_mode_field_reflects_passthrough_env_var() {
         rows_b[0]["session"].as_str(), Some("mutate-ledger-b"),
         "Phase B row should carry the session id we sent: {}", rows_b[0]
     );
+}
+
+#[tokio::test]
+async fn hop_header_ingress_guard_rejects_loops_on_all_handlers() {
+    // →2035 fix 4(b): a request carrying our own hop header is a self-loop
+    // and must be rejected with 508 on every routing surface — including
+    // the catchall, which is where loops on unrecognised paths recurse.
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let proxy_port = 8214;
+    let mut proxy_process = spawn_proxy(proxy_port, &upstream_url, None);
+    wait_for_proxy(proxy_port, 10_000).await;
+
+    let client = reqwest::Client::new();
+    let cases = [
+        ("/v1/messages", "anthropic handler"),
+        ("/v1/responses", "openai handler"),
+        ("/v1/some/unknown/path", "catchall handler"),
+    ];
+    for (path, label) in cases {
+        let url = format!("http://127.0.0.1:{}{}", proxy_port, path);
+        let resp = client
+            .post(&url)
+            .header("x-ostk-cache-hop", "1")
+            .header("anthropic-session-id", "loop-test")
+            .json(&json!({"messages": []}))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{}: request failed: {}", label, e));
+        assert_eq!(
+            resp.status().as_u16(),
+            508,
+            "{} must reject hop-header requests with 508, got {}",
+            label,
+            resp.status()
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("loop_detected"),
+            "{}: 508 body should name loop_detected, got: {}",
+            label,
+            body
+        );
+    }
+
+    let _ = proxy_process.kill();
+    let _ = proxy_process.wait();
 }

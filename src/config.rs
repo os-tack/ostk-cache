@@ -232,6 +232,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub capture_http_dir: Option<PathBuf>,
 
+    /// →2035: max capture entries before oldest are evicted (0 = unlimited). Default: 5000.
+    #[arg(long)]
+    pub capture_max_entries: Option<usize>,
+
     /// Verbose per-turn logging (multi-line breakdown instead of the
     /// single `[turn ...]` line).
     #[arg(long, short = 'v')]
@@ -309,6 +313,8 @@ struct KernelFile {
 struct CaptureFile {
     http: Option<bool>,
     dir: Option<PathBuf>,
+    /// →2035: max entries before oldest are rotated out (0 = unlimited).
+    max_entries: Option<usize>,
 }
 
 fn load_file_config(path: &Path) -> Option<FileConfig> {
@@ -382,6 +388,8 @@ pub struct Config {
     pub truth_bytes_per_token: Resolved<f64>,
     pub capture_http: Resolved<bool>,
     pub capture_http_dir: Resolved<PathBuf>,
+    /// →2035: rotation cap; 0 = unlimited.
+    pub capture_max_entries: Resolved<usize>,
     pub verbose: Resolved<bool>,
     pub config_path: Option<PathBuf>,
 }
@@ -598,6 +606,13 @@ impl Config {
             crate::http_capture::default_capture_dir(cwd),
         );
 
+        let capture_max_entries = pick_value(
+            cli.capture_max_entries,
+            env_num("OSTK_CAPTURE_MAX_ENTRIES").map(|n| n as usize),
+            file.and_then(|f| f.capture.max_entries),
+            crate::http_capture::DEFAULT_CAPTURE_MAX_ENTRIES,
+        );
+
         let verbose = pick_value(
             if cli.verbose { Some(true) } else { None },
             None,
@@ -625,6 +640,7 @@ impl Config {
             truth_bytes_per_token,
             capture_http,
             capture_http_dir,
+            capture_max_entries,
             verbose,
             config_path,
         }
@@ -721,6 +737,11 @@ impl Config {
             "capture.dir",
             &self.capture_http_dir.value.display(),
             self.capture_http_dir.source,
+        ));
+        out.push_str(&row(
+            "capture.max_entries",
+            &self.capture_max_entries.value,
+            self.capture_max_entries.source,
         ));
         out.push_str(&row("verbose", &self.verbose.value, self.verbose.source));
         out
@@ -856,6 +877,7 @@ mod tests {
             truth_bytes_per_token: None,
             capture_http: false,
             capture_http_dir: None,
+            capture_max_entries: None,
             verbose: false,
             config: None,
             print_config: false,
