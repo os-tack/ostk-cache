@@ -42,6 +42,10 @@ type AmpStore = Arc<DashMap<SessionId, AmpAccumulator>>;
 type CadenceStore = Arc<DashMap<SessionId, SeatCadence>>;
 /// →2032: per-(session, model) write-policy lane state.
 type LaneStore = Arc<DashMap<(SessionId, String), write_policy::LaneState>>;
+/// →2032 follow-up (a): lanes idle longer than this are evicted; the sweep
+/// only runs once the store exceeds the minimum length.
+const LANE_IDLE_EVICT_SECS: u64 = 24 * 60 * 60;
+const LANE_SWEEP_MIN_LEN: usize = 64;
 type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 
 #[derive(Clone)]
@@ -367,14 +371,21 @@ async fn handle_anthropic_message(
             .unwrap_or_default()
             .as_secs();
         let key = (session_id.clone(), model);
-        let mut lane = state
-            .lane_store
-            .get(&key)
-            .map(|r| r.clone())
-            .unwrap_or_default();
-        let decision =
-            write_policy::decide(&mut lane, now_secs, observed_prompt_tokens, &params);
-        state.lane_store.insert(key, lane);
+        // entry() holds the shard lock across decide() so concurrent requests
+        // on a shared session id (subagent/main-loop interleave) can't drop
+        // gap observations.
+        let decision = {
+            let mut lane = state.lane_store.entry(key).or_default();
+            write_policy::decide(&mut lane, now_secs, observed_prompt_tokens, &params)
+        };
+        // Lanes are keyed (session, model) and otherwise accumulate for the
+        // proxy's lifetime; drop lanes idle past the eviction window.
+        if state.lane_store.len() > LANE_SWEEP_MIN_LEN {
+            state.lane_store.retain(|_, lane| {
+                lane.last_ts
+                    .is_none_or(|ts| now_secs.saturating_sub(ts) <= LANE_IDLE_EVICT_SECS)
+            });
+        }
         if config.verbose.value {
             println!(
                 "[proxy] policy: {} tier={} read~{} write~{}{}",
