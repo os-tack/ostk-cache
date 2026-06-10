@@ -40,7 +40,7 @@
 //! rebuild-kernel) carries the same accumulated message history;
 //! none of them benefit from re-billing yesterday's nudges.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const OPEN_TAG: &str = "<system-reminder>";
 const CLOSE_TAG: &str = "</system-reminder>";
@@ -65,9 +65,7 @@ pub struct SystemReminderStats {
 
 impl SystemReminderStats {
     pub fn is_empty(self) -> bool {
-        self.blocks_removed == 0
-            && self.empty_blocks_pruned == 0
-            && self.placeholders_inserted == 0
+        self.blocks_removed == 0 && self.empty_blocks_pruned == 0 && self.placeholders_inserted == 0
     }
 
     pub fn add(&mut self, other: Self) {
@@ -167,10 +165,8 @@ fn prune_empty_text_blocks(value: &mut Value) -> (usize, usize) {
             let before = arr.len();
             arr.retain(|item| {
                 if let Value::Object(obj) = item {
-                    let is_text =
-                        obj.get("type").and_then(|t| t.as_str()) == Some("text");
-                    let is_empty =
-                        obj.get("text").and_then(|t| t.as_str()) == Some("");
+                    let is_text = obj.get("type").and_then(|t| t.as_str()) == Some("text");
+                    let is_empty = obj.get("text").and_then(|t| t.as_str()) == Some("");
                     !(is_text && is_empty)
                 } else {
                     true

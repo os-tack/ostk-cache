@@ -86,8 +86,7 @@ fn strip_cch_tokens_in_str(s: &str) -> Option<(String, usize)> {
         if &bytes[i..i + needle.len()] == needle {
             let value_start = i + needle.len();
             let mut j = value_start;
-            while j < bytes.len() && bytes[j].is_ascii_hexdigit()
-                && !bytes[j].is_ascii_uppercase()
+            while j < bytes.len() && bytes[j].is_ascii_hexdigit() && !bytes[j].is_ascii_uppercase()
             {
                 j += 1;
             }
@@ -204,7 +203,10 @@ mod tests {
         let n = strip_volatile_billing_tokens(&mut v);
         assert_eq!(n, 1);
         let after = v["system"][0]["text"].as_str().unwrap();
-        assert!(!after.contains("cch="), "cch token should be gone; got: {after}");
+        assert!(
+            !after.contains("cch="),
+            "cch token should be gone; got: {after}"
+        );
         assert!(after.contains("cc_version=2.1"));
         assert!(after.contains("cc_entrypoint=cli"));
         assert!(after.contains("You are Claude Code"));
@@ -244,7 +246,10 @@ mod tests {
         let tr = v["messages"][0]["content"][0]["content"][0]["text"]
             .as_str()
             .unwrap();
-        assert!(!tr.contains("cch="), "tool_result text should be stripped; got: {tr}");
+        assert!(
+            !tr.contains("cch="),
+            "tool_result text should be stripped; got: {tr}"
+        );
         assert!(tr.contains("+ exit:0 proxy log: observed"));
     }
 
@@ -358,7 +363,10 @@ mod tests {
             "messages": [{"role": "user", "content": [{"text": "cch=deadbeef no semi"}]}]
         });
         let n = strip_volatile_billing_tokens(&mut v);
-        assert_eq!(n, 0, "neither uppercase nor missing-semi should be stripped");
+        assert_eq!(
+            n, 0,
+            "neither uppercase nor missing-semi should be stripped"
+        );
     }
 
     #[test]

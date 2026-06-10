@@ -76,9 +76,10 @@ async fn main() {
     }
 
     // →2035 fix 4(a): self-loop guard — refuse to start if upstream == us.
-    if let Err(msg) =
-        ostk_cache::http_capture::check_upstream_self_loop(&config.upstream.value, config.port.value)
-    {
+    if let Err(msg) = ostk_cache::http_capture::check_upstream_self_loop(
+        &config.upstream.value,
+        config.port.value,
+    ) {
         eprintln!("[proxy] fatal: {}", msg);
         std::process::exit(1);
     }
@@ -252,7 +253,11 @@ async fn handle_anthropic_message(
             }
         })
         .to_string();
-        return Ok((StatusCode::from_u16(508).unwrap_or(StatusCode::LOOP_DETECTED), body).into_response());
+        return Ok((
+            StatusCode::from_u16(508).unwrap_or(StatusCode::LOOP_DETECTED),
+            body,
+        )
+            .into_response());
     }
 
     let amp_store = state.amp_store.clone();

@@ -48,7 +48,9 @@ fn walk_content(content: &Value, b: &mut BodyBreakdown) {
         b.content_text += s.len();
         return;
     }
-    let Some(arr) = content.as_array() else { return };
+    let Some(arr) = content.as_array() else {
+        return;
+    };
     for block in arr {
         let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let size = json_size(block);
@@ -158,7 +160,10 @@ mod tests {
         assert!(b.content_text > 0, "text block contributes");
         assert!(b.content_tool_use > 0, "tool_use block contributes");
         assert!(b.content_tool_result > 0, "tool_result wrapper contributes");
-        assert_eq!(b.image_count, 2, "image at top level + image nested in tool_result");
+        assert_eq!(
+            b.image_count, 2,
+            "image at top level + image nested in tool_result"
+        );
         assert!(b.content_images > 0);
         assert!(b.largest_image > 0);
     }

@@ -67,10 +67,7 @@ pub fn ensure_state_dir(workspace: &Path) -> std::io::Result<PathBuf> {
 pub fn append_journal(workspace: &Path, row: &serde_json::Value) -> std::io::Result<()> {
     let dir = ensure_state_dir(workspace)?;
     let path = dir.join("journal.jsonl");
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     let mut line = serde_json::to_string(row).unwrap_or_else(|_| "{}".into());
     line.push('\n');
     file.write_all(line.as_bytes())?;

@@ -15,7 +15,7 @@
 //     wedged proxy never blocks a Claude session.
 
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -126,18 +126,14 @@ fn entry_matches_dispatch(entry: &Value, dispatch_prefix: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn install(
-    dir: Option<PathBuf>,
-    port: u16,
-    settings_path: Option<PathBuf>,
-) -> std::io::Result<()> {
+fn install(dir: Option<PathBuf>, port: u16, settings_path: Option<PathBuf>) -> std::io::Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     let settings_path = settings_path.unwrap_or_else(default_settings);
 
     fs::create_dir_all(&dir)?;
     let dp = dispatch_path(&dir);
     fs::write(&dp, DISPATCH_SCRIPT)?;
-    
+
     #[cfg(unix)]
     {
         let mut perms = fs::metadata(&dp)?.permissions();
@@ -153,9 +149,8 @@ fn install(
     }
 
     let mut s: Value = if settings_path.exists() {
-        serde_json::from_slice(&fs::read(&settings_path)?).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?
+        serde_json::from_slice(&fs::read(&settings_path)?)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
     } else {
         json!({})
     };
@@ -190,9 +185,9 @@ fn install(
                 )
             })?;
 
-        let already = arr.iter().any(|entry| {
-            entry_matches_dispatch(entry, &dispatch_str)
-        });
+        let already = arr
+            .iter()
+            .any(|entry| entry_matches_dispatch(entry, &dispatch_str));
 
         if !already {
             let mut entry = json!({
@@ -251,20 +246,12 @@ fn uninstall(
         let mut s: Value = serde_json::from_slice(&fs::read(&settings_path)?)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-        if let Some(hooks) =
-            s.get_mut("hooks").and_then(|h| h.as_object_mut())
-        {
+        if let Some(hooks) = s.get_mut("hooks").and_then(|h| h.as_object_mut()) {
             let event_keys: Vec<String> = hooks.keys().cloned().collect();
             for event in event_keys {
-                let arr = hooks
-                    .get_mut(&event)
-                    .unwrap()
-                    .as_array_mut()
-                    .unwrap();
+                let arr = hooks.get_mut(&event).unwrap().as_array_mut().unwrap();
                 let before = arr.len();
-                arr.retain(|entry| {
-                    !entry_matches_dispatch(entry, &dispatch_str)
-                });
+                arr.retain(|entry| !entry_matches_dispatch(entry, &dispatch_str));
                 removed_total += before - arr.len();
                 if arr.is_empty() {
                     hooks.remove(&event);
@@ -299,11 +286,7 @@ fn uninstall(
     Ok(())
 }
 
-fn status(
-    dir: Option<PathBuf>,
-    port: u16,
-    settings_path: Option<PathBuf>,
-) -> std::io::Result<()> {
+fn status(dir: Option<PathBuf>, port: u16, settings_path: Option<PathBuf>) -> std::io::Result<()> {
     let dir = dir.unwrap_or_else(default_dir);
     let settings_path = settings_path.unwrap_or_else(default_settings);
     let dp = dispatch_path(&dir);
@@ -322,9 +305,8 @@ fn status(
     println!("Proxy URL:        http://127.0.0.1:{}", port);
 
     let s: Value = if settings_path.exists() {
-        serde_json::from_slice(&fs::read(&settings_path)?).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?
+        serde_json::from_slice(&fs::read(&settings_path)?)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
     } else {
         json!({})
     };
@@ -336,9 +318,7 @@ fn status(
         let installed = hooks
             .and_then(|h| h.get(*event))
             .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter().any(|e| entry_matches_dispatch(e, &dispatch_str))
-            })
+            .map(|arr| arr.iter().any(|e| entry_matches_dispatch(e, &dispatch_str)))
             .unwrap_or(false);
         let mark = if installed { "✓" } else { "✗" };
         println!("  {} {}", mark, event);
@@ -375,10 +355,7 @@ fn status(
             // Live proxy without endpoint -> 404 (older binary).
             // Down -> empty stdout (curl exits non-zero, stdout empty).
             match code.trim() {
-                "400" => println!(
-                    "✓ proxy alive at :{} — /hook/event endpoint present",
-                    port
-                ),
+                "400" => println!("✓ proxy alive at :{} — /hook/event endpoint present", port),
                 "404" => println!(
                     "⚠ proxy alive at :{} but /hook/event not found — restart with the latest binary",
                     port
@@ -429,12 +406,7 @@ mod tests {
     fn run_install(temp: &tempfile::TempDir) -> PathBuf {
         let settings_path = temp.path().join("settings.json");
         let hooks_dir = temp.path().join("hooks");
-        install(
-            Some(hooks_dir.clone()),
-            8080,
-            Some(settings_path.clone()),
-        )
-        .unwrap();
+        install(Some(hooks_dir.clone()), 8080, Some(settings_path.clone())).unwrap();
         settings_path
     }
 
@@ -524,7 +496,13 @@ mod tests {
         assert!(s.get("permissions").is_some());
 
         // Pre-existing hooks preserved alongside our new entries.
-        let pretool = s.get("hooks").unwrap().get("PreToolUse").unwrap().as_array().unwrap();
+        let pretool = s
+            .get("hooks")
+            .unwrap()
+            .get("PreToolUse")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(pretool.len(), 2);
         assert_eq!(pretool[0].get("matcher").unwrap(), "Edit|Write");
         assert_eq!(
@@ -532,7 +510,13 @@ mod tests {
             "my-other-tool pre"
         );
 
-        let stop = s.get("hooks").unwrap().get("Stop").unwrap().as_array().unwrap();
+        let stop = s
+            .get("hooks")
+            .unwrap()
+            .get("Stop")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(stop.len(), 2);
         assert_eq!(
             stop[0].get("hooks").unwrap()[0].get("command").unwrap(),
@@ -565,14 +549,25 @@ mod tests {
         uninstall(Some(hooks_dir.clone()), false, Some(settings_path.clone())).unwrap();
 
         let s: Value = serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
-        let stop = s.get("hooks").unwrap().get("Stop").unwrap().as_array().unwrap();
+        let stop = s
+            .get("hooks")
+            .unwrap()
+            .get("Stop")
+            .unwrap()
+            .as_array()
+            .unwrap();
         assert_eq!(stop.len(), 1);
         assert_eq!(
             stop[0].get("hooks").unwrap()[0].get("command").unwrap(),
             "keep-me"
         );
         // Events that had only our entry are removed entirely.
-        for ev in &["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"] {
+        for ev in &[
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+        ] {
             assert!(
                 s.get("hooks").unwrap().get(*ev).is_none(),
                 "{} event should be gone",

@@ -61,8 +61,7 @@ const ORIENTATION_HEADER_MARKER: &str = "# ostk-cache kernel orientation";
 ///
 /// Returns true if a block was appended; false otherwise.
 pub fn append_kernel_orientation_to_system(value: &mut Value, ttl: &str) -> bool {
-    let with_cache_control =
-        count_cache_control_fields(value) < ANTHROPIC_CACHE_CONTROL_LIMIT;
+    let with_cache_control = count_cache_control_fields(value) < ANTHROPIC_CACHE_CONTROL_LIMIT;
     let new_block = if with_cache_control {
         json!({
             "type": "text",
@@ -416,7 +415,10 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
     // was never sent at all). Anthropic 400s on these.
     let orphans = repair_orphaned_tool_results(messages);
     if orphans > 0 {
-        eprintln!("[proxy] rebuild: stripped {} orphaned tool_result blocks", orphans);
+        eprintln!(
+            "[proxy] rebuild: stripped {} orphaned tool_result blocks",
+            orphans
+        );
     }
 
     RebuildOutcome::Applied(RebuildReport {
@@ -569,12 +571,18 @@ fn eject_large_tool_results(value: &mut Value, soft_cap_bytes: u64, report: &mut
         let Some(messages) = value.get_mut("messages").and_then(|m| m.as_array_mut()) else {
             break;
         };
-        let Some(msg) = messages.get_mut(mi) else { break };
+        let Some(msg) = messages.get_mut(mi) else {
+            break;
+        };
         let Some(arr) = msg.get_mut("content").and_then(|c| c.as_array_mut()) else {
             continue;
         };
-        let Some(block) = arr.get_mut(bi) else { continue };
-        let Some(obj) = block.as_object_mut() else { continue };
+        let Some(block) = arr.get_mut(bi) else {
+            continue;
+        };
+        let Some(obj) = block.as_object_mut() else {
+            continue;
+        };
         obj.insert(
             "content".to_string(),
             serde_json::json!([{"type": "text", "text": stub_text}]),
@@ -640,9 +648,9 @@ fn message_contains_tool_use(msg: &Value) -> bool {
 
 fn message_only_tool_results(msg: &Value) -> bool {
     match msg.get("content") {
-        Some(Value::Array(arr)) if !arr.is_empty() => arr.iter().all(|b| {
-            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-        }),
+        Some(Value::Array(arr)) if !arr.is_empty() => arr
+            .iter()
+            .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result")),
         _ => false,
     }
 }
@@ -801,8 +809,7 @@ pub fn repair_orphaned_tool_results(messages: &mut Vec<Value>) -> usize {
         };
         let before = arr.len();
         arr.retain(|block| {
-            let is_tool_result =
-                block.get("type").and_then(|t| t.as_str()) == Some("tool_result");
+            let is_tool_result = block.get("type").and_then(|t| t.as_str()) == Some("tool_result");
             if !is_tool_result {
                 return true;
             }
@@ -1047,7 +1054,10 @@ fn summarize_native_tools(messages: &[Value], cap: usize) -> Vec<NativeToolCall>
                     if id.is_empty() {
                         continue;
                     }
-                    let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_error = block
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let (output_size, output_text) = match block.get("content") {
                         Some(Value::String(s)) => (s.len(), Some(s.clone())),
                         Some(Value::Array(arr)) => {
@@ -1076,7 +1086,11 @@ fn summarize_native_tools(messages: &[Value], cap: usize) -> Vec<NativeToolCall>
                     };
                     if let Some(call) = by_id.get_mut(&id) {
                         call.output_size = output_size;
-                        call.status = if is_error { "error".into() } else { "ok".into() };
+                        call.status = if is_error {
+                            "error".into()
+                        } else {
+                            "ok".into()
+                        };
                         // Inline error bodies under budget. [ok]
                         // results stay shape-only — handle / recall /
                         // re-run paths cover those.
@@ -1274,7 +1288,8 @@ fn render_tool_signature(call: &NativeToolCall) -> String {
             let op = str_arg("op")
                 .or_else(|| {
                     // CAS edit (old_str + new_str) → infer "str_replace"
-                    args.and_then(|a| a.get("old_str")).and(Some("str_replace".to_string()))
+                    args.and_then(|a| a.get("old_str"))
+                        .and(Some("str_replace".to_string()))
                 })
                 .unwrap_or_else(|| "edit".into());
             format!("**fs_ops** {} op={}", path, op)
@@ -1332,7 +1347,10 @@ fn render_tool_signature(call: &NativeToolCall) -> String {
         }
     };
 
-    let mut head = format!("{} [{}] (out:{}b)", signature, call.status, call.output_size);
+    let mut head = format!(
+        "{} [{}] (out:{}b)",
+        signature, call.status, call.output_size
+    );
     if let Some(tag) = short_tool_tag(&call.id) {
         head.push_str(&format!(" [{}]", tag));
     }
@@ -1550,20 +1568,28 @@ mod tests {
         // Soft cap 1MB → must eject "big" (and likely "medium" too) but
         // preserve "small". Even after ejecting, pairings stay intact.
         let r = enforce_soft_cap(&mut req, 1024 * 1024);
-        assert!(r.tier_a_ejected >= 1, "expected ≥1 ejection, got {}", r.tier_a_ejected);
+        assert!(
+            r.tier_a_ejected >= 1,
+            "expected ≥1 ejection, got {}",
+            r.tier_a_ejected
+        );
         assert!(!r.irreducible, "should not be irreducible after Tier A");
         assert!(r.tier_a_bytes_recovered >= 2 * 1024 * 1024);
 
         // Find the big result and verify it's a stub now.
         let msgs = req["messages"].as_array().unwrap();
-        let big_result = msgs[2]["content"][0]["content"][0]["text"].as_str().unwrap();
+        let big_result = msgs[2]["content"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         assert!(
             big_result.starts_with("[ejected"),
             "tu_big should be ejected, got: {}",
             &big_result[..big_result.len().min(80)]
         );
         // Small result stayed inline.
-        let small_result = msgs[2]["content"][2]["content"][0]["text"].as_str().unwrap();
+        let small_result = msgs[2]["content"][2]["content"][0]["text"]
+            .as_str()
+            .unwrap();
         assert_eq!(small_result.len(), 50 * 1024);
     }
 
@@ -1583,7 +1609,9 @@ mod tests {
             ],
         });
         let _r = enforce_soft_cap(&mut req, 50 * 1024);
-        let ejected_id = req["messages"][2]["content"][0]["tool_use_id"].as_str().unwrap();
+        let ejected_id = req["messages"][2]["content"][0]["tool_use_id"]
+            .as_str()
+            .unwrap();
         assert_eq!(ejected_id, "tu_42", "tool_use_id must survive Tier A");
     }
 
@@ -1631,12 +1659,10 @@ mod tests {
 
     #[test]
     fn cycle_boundary_handles_mixed_content_user_msg() {
-        let messages = vec![
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "X", "content": "old"},
-                {"type": "text", "text": "and also a follow-up question"}
-            ]}),
-        ];
+        let messages = vec![json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "X", "content": "old"},
+            {"type": "text", "text": "and also a follow-up question"}
+        ]})];
         // Has text alongside tool_result — counts as real user message.
         assert_eq!(find_cycle_boundary_idx(&messages), Some(0));
     }
@@ -1680,7 +1706,10 @@ mod tests {
             }]
         })];
         let env = extract_latest_envelope(&messages);
-        assert!(env.is_some(), "expected envelope from array tool_result content");
+        assert!(
+            env.is_some(),
+            "expected envelope from array tool_result content"
+        );
     }
 
     #[test]
@@ -1758,7 +1787,10 @@ mod tests {
         assert!(!text.contains("templates-section-marker"));
         assert!(!text.contains("tail-section-marker"));
         assert!(!text.contains("digest-section-marker"));
-        assert!(text.contains("Kernel projection"), "core sections never elided");
+        assert!(
+            text.contains("Kernel projection"),
+            "core sections never elided"
+        );
     }
 
     // →2032: a generous budget elides nothing — WARM-equivalent
@@ -1829,15 +1861,17 @@ mod tests {
         // synthetic + "do it" + assistant tool_use + tool_result
         assert_eq!(messages.len(), 4, "synthetic + 3-turn in-flight chain");
         // tool_use_id must round-trip
-        let tool_use_id = messages[2]
-            .get("content").unwrap()
-            .as_array().unwrap()[0]
-            .get("id").unwrap().as_str().unwrap();
+        let tool_use_id = messages[2].get("content").unwrap().as_array().unwrap()[0]
+            .get("id")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert_eq!(tool_use_id, "tu_1");
-        let tool_result_id = messages[3]
-            .get("content").unwrap()
-            .as_array().unwrap()[0]
-            .get("tool_use_id").unwrap().as_str().unwrap();
+        let tool_result_id = messages[3].get("content").unwrap().as_array().unwrap()[0]
+            .get("tool_use_id")
+            .unwrap()
+            .as_str()
+            .unwrap();
         assert_eq!(tool_result_id, "tu_1");
     }
 
@@ -1939,8 +1973,14 @@ mod tests {
             id: String::new(),
         };
         let line = render_tool_signature(&call);
-        assert!(line.contains("/abs/native_read.rs"), "must extract file_path");
-        assert!(!line.contains(" ?"), "no `?` placeholder when file_path is set");
+        assert!(
+            line.contains("/abs/native_read.rs"),
+            "must extract file_path"
+        );
+        assert!(
+            !line.contains(" ?"),
+            "no `?` placeholder when file_path is set"
+        );
         assert!(line.contains("limit:80"));
     }
 
@@ -2166,7 +2206,10 @@ mod tests {
         let line = render_tool_signature(&call);
         // Last 8 chars, lowercased.
         assert!(line.ends_with(" [a8b99e0d]"), "got: {}", line);
-        assert!(line.contains("(out:31b) ["), "tag follows the (out:Nb) marker");
+        assert!(
+            line.contains("(out:31b) ["),
+            "tag follows the (out:Nb) marker"
+        );
     }
 
     #[test]
@@ -2180,7 +2223,11 @@ mod tests {
             error_body: None,
         };
         let line = render_tool_signature(&call);
-        assert!(line.ends_with("(out:12b)"), "no tag suffix when id empty: {}", line);
+        assert!(
+            line.ends_with("(out:12b)"),
+            "no tag suffix when id empty: {}",
+            line
+        );
     }
 
     #[test]
@@ -2194,7 +2241,11 @@ mod tests {
             error_body: None,
         };
         let line = render_tool_signature(&call);
-        assert!(line.ends_with("(out:5b)"), "no tag suffix when id <8 chars: {}", line);
+        assert!(
+            line.ends_with("(out:5b)"),
+            "no tag suffix when id <8 chars: {}",
+            line
+        );
     }
 
     #[test]
@@ -2240,8 +2291,7 @@ mod tests {
         // The synthetic still has a small framing reference pointing
         // the model to its system orientation:
         assert!(
-            synthetic.contains("system orientation")
-                || synthetic.contains("system prompt"),
+            synthetic.contains("system orientation") || synthetic.contains("system prompt"),
             "synthetic must reference where discipline lives"
         );
     }
@@ -2267,10 +2317,18 @@ mod tests {
         // Our orientation block is appended at the end with cache_control:
         let last = arr.last().unwrap();
         assert_eq!(
-            last.get("cache_control").and_then(|c| c.get("ttl")).and_then(|t| t.as_str()),
+            last.get("cache_control")
+                .and_then(|c| c.get("ttl"))
+                .and_then(|t| t.as_str()),
             Some("1h")
         );
-        assert!(last.get("text").unwrap().as_str().unwrap().contains("kernel orientation"));
+        assert!(
+            last.get("text")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("kernel orientation")
+        );
     }
 
     #[test]
@@ -2320,7 +2378,10 @@ mod tests {
             ]
         });
         let appended = append_kernel_orientation_to_system(&mut req, "1h");
-        assert!(!appended, "orientation already present — must not double-append");
+        assert!(
+            !appended,
+            "orientation already present — must not double-append"
+        );
         let arr = req.get("system").unwrap().as_array().unwrap();
         assert_eq!(arr.len(), 2);
     }
@@ -2371,15 +2432,30 @@ mod tests {
                 ]}
             ]
         });
-        assert_eq!(count_cache_control_fields(&req), ANTHROPIC_CACHE_CONTROL_LIMIT);
+        assert_eq!(
+            count_cache_control_fields(&req),
+            ANTHROPIC_CACHE_CONTROL_LIMIT
+        );
         let appended = append_kernel_orientation_to_system(&mut req, "1h");
         assert!(appended, "orientation text must still be appended");
-        let last = req.get("system").unwrap().as_array().unwrap().last().unwrap();
+        let last = req
+            .get("system")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
         assert!(
             last.get("cache_control").is_none(),
             "no cache_control marker when at limit (would 400)"
         );
-        assert!(last.get("text").unwrap().as_str().unwrap().contains("kernel orientation"));
+        assert!(
+            last.get("text")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("kernel orientation")
+        );
         // Total markers must remain at the limit (we did not add one):
         assert_eq!(
             count_cache_control_fields(&req),
@@ -2470,7 +2546,8 @@ mod tests {
             live_envelope_override: None,
             transcript_tail_summary: None,
             recent_assistant_digests: Some(
-                "## Recent assistant turns (digest)\n\n- **[t-0]** [agreed] did the thing [a.rs]\n".into(),
+                "## Recent assistant turns (digest)\n\n- **[t-0]** [agreed] did the thing [a.rs]\n"
+                    .into(),
             ),
             templates_summary: None,
             prior_user_turns_override: None,
@@ -2660,7 +2737,10 @@ mod tests {
         assert_eq!(stripped, 1, "exactly one orphan stripped");
         let content = msgs[1].get("content").unwrap().as_array().unwrap();
         assert_eq!(content.len(), 2);
-        assert_eq!(content[0].get("tool_use_id").unwrap().as_str(), Some("tu_X"));
+        assert_eq!(
+            content[0].get("tool_use_id").unwrap().as_str(),
+            Some("tu_X")
+        );
         assert_eq!(content[1].get("type").unwrap().as_str(), Some("text"));
     }
 
@@ -2683,12 +2763,10 @@ mod tests {
 
     #[test]
     fn repair_idempotent() {
-        let mut msgs = vec![
-            json!({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "ghost", "content": "x"},
-                {"type": "text", "text": "hi"}
-            ]}),
-        ];
+        let mut msgs = vec![json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "ghost", "content": "x"},
+            {"type": "text", "text": "hi"}
+        ]})];
         let first = repair_orphaned_tool_results(&mut msgs);
         let second = repair_orphaned_tool_results(&mut msgs);
         assert_eq!(first, 1);
@@ -3044,10 +3122,19 @@ mod tests {
         let outcome = apply_rebuild(&mut req, &k_config(18));
         assert!(matches!(outcome, RebuildOutcome::Applied(_)));
         let synthetic = req["messages"][0]["content"][0]["text"].as_str().unwrap();
-        assert!(synthetic.contains("## Unresolved"), "missing section:\n{synthetic}");
-        assert!(synthetic.contains("in-flight tool_use"), "pending call not surfaced");
+        assert!(
+            synthetic.contains("## Unresolved"),
+            "missing section:\n{synthetic}"
+        );
+        assert!(
+            synthetic.contains("in-flight tool_use"),
+            "pending call not surfaced"
+        );
         assert!(synthetic.contains("armed monitor"), "monitor not surfaced");
-        assert!(synthetic.contains("watch deploy log"), "monitor description lost");
+        assert!(
+            synthetic.contains("watch deploy log"),
+            "monitor description lost"
+        );
         assert!(
             synthetic.contains("lock held: lane-1979-p89507"),
             "lane claim not surfaced"
@@ -3192,6 +3279,9 @@ mod tests {
             old_bytes as i64 - new_bytes as i64,
             100.0 * (old_bytes as f64 - new_bytes as f64) / old_bytes as f64
         );
-        assert!(new_bytes <= old_bytes, "rebudget must not grow the synthetic");
+        assert!(
+            new_bytes <= old_bytes,
+            "rebudget must not grow the synthetic"
+        );
     }
 }

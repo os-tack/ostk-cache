@@ -6,11 +6,10 @@
 //! - Re-exports of all public core types needed by `main.rs`.
 
 pub use ostk_cache_core::capture::{
-    CaptureMsg, CaptureMetadata, CaptureSink, DedupeCache, HttpCapture,
-    UpstreamErrorRow, check_upstream_self_loop, default_capture_dir,
-    dropped_captures, increment_dropped_captures, log_upstream_error,
-    handle_capture_msg, rotate_capture_dir, entry_dir, shard_dir,
-    HOP_HEADER, HOP_HEADER_VALUE, DEFAULT_CAPTURE_MAX_ENTRIES,
+    CaptureMetadata, CaptureMsg, CaptureSink, DEFAULT_CAPTURE_MAX_ENTRIES, DedupeCache, HOP_HEADER,
+    HOP_HEADER_VALUE, HttpCapture, UpstreamErrorRow, check_upstream_self_loop, default_capture_dir,
+    dropped_captures, entry_dir, handle_capture_msg, increment_dropped_captures,
+    log_upstream_error, rotate_capture_dir, shard_dir,
 };
 
 use std::sync::Arc;
@@ -47,8 +46,7 @@ pub fn spawn_capture_writer() -> Arc<dyn CaptureSink> {
 
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let result =
-                tokio::task::spawn_blocking(move || handle_capture_msg(msg)).await;
+            let result = tokio::task::spawn_blocking(move || handle_capture_msg(msg)).await;
             if let Err(e) = result {
                 eprintln!("[proxy] capture writer task panicked: {:?}", e);
             }

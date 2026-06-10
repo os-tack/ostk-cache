@@ -229,8 +229,9 @@ fn parse_event(line: &str) -> Option<TailEvent> {
                 .map(|v| truncate_chars(&v.to_string(), 120))
                 .unwrap_or_default()
         ),
-        TailEventKind::ToolResult => extract_tool_result_summary(&raw.message)
-            .unwrap_or_else(|| "(tool_result)".to_string()),
+        TailEventKind::ToolResult => {
+            extract_tool_result_summary(&raw.message).unwrap_or_else(|| "(tool_result)".to_string())
+        }
         TailEventKind::Other(_) => String::new(),
     };
 
@@ -279,7 +280,11 @@ fn extract_assistant_summary(message: &Option<serde_json::Value>) -> Option<Stri
             other => parts.push(format!("({})", other)),
         }
     }
-    if parts.is_empty() { None } else { Some(parts.join(" ")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 fn extract_tool_result_summary(message: &Option<serde_json::Value>) -> Option<String> {
@@ -392,7 +397,10 @@ fn is_tool_result_user_event(message: &Option<serde_json::Value>) -> bool {
 
 /// Compose a cross-session activity summary from tail events. Returns
 /// None if there's nothing useful to report.
-pub fn render_cross_session_summary(events: &[TailEvent], current_session_marker: Option<&str>) -> Option<String> {
+pub fn render_cross_session_summary(
+    events: &[TailEvent],
+    current_session_marker: Option<&str>,
+) -> Option<String> {
     if events.is_empty() {
         return None;
     }
@@ -403,10 +411,7 @@ pub fn render_cross_session_summary(events: &[TailEvent], current_session_marker
     let mut count = 0usize;
     for ev in events {
         if let Some(marker) = current_session_marker
-            && ev
-                .timestamp
-                .as_deref()
-                .is_some_and(|ts| ts >= marker)
+            && ev.timestamp.as_deref().is_some_and(|ts| ts >= marker)
         {
             continue;
         }
@@ -505,8 +510,7 @@ pub fn build_tail_index(path: &Path, limit: usize) -> TailIndex {
             // the summary to 240; re-extract from raw for fidelity.
             if matches!(ev.kind, TailEventKind::User)
                 && let Ok(raw_val) = serde_json::from_str::<serde_json::Value>(&line)
-                && let Some(text) =
-                    extract_message_text(&raw_val.get("message").cloned())
+                && let Some(text) = extract_message_text(&raw_val.get("message").cloned())
             {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
@@ -524,9 +528,8 @@ pub fn build_tail_index(path: &Path, limit: usize) -> TailIndex {
                             .and_then(|m| m.get("content"))
                             .and_then(|c| c.as_array())
                             .and_then(|arr| {
-                                arr.iter().find_map(|b| {
-                                    b.get("is_error").and_then(|e| e.as_bool())
-                                })
+                                arr.iter()
+                                    .find_map(|b| b.get("is_error").and_then(|e| e.as_bool()))
                             })
                     })
                     .unwrap_or(false);
@@ -571,10 +574,7 @@ pub fn build_tail_index(path: &Path, limit: usize) -> TailIndex {
 /// eye.
 pub fn short_tag(tool_use_id: &str) -> String {
     let len = tool_use_id.chars().count();
-    let tail: String = tool_use_id
-        .chars()
-        .skip(len.saturating_sub(8))
-        .collect();
+    let tail: String = tool_use_id.chars().skip(len.saturating_sub(8)).collect();
     tail.to_lowercase()
 }
 
@@ -657,10 +657,7 @@ mod tests {
                 )
             })
             .collect();
-        write_jsonl(
-            &f,
-            &lines.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-        );
+        write_jsonl(&f, &lines.iter().map(|s| s.as_str()).collect::<Vec<_>>());
 
         let events = read_tail_events(&f, 3);
         assert_eq!(events.len(), 3);
@@ -701,8 +698,7 @@ mod tests {
                 timestamp: Some("2026-05-07T15:00:00Z".into()),
             },
         ];
-        let out =
-            render_cross_session_summary(&events, Some("2026-05-07T12:00:00Z")).unwrap();
+        let out = render_cross_session_summary(&events, Some("2026-05-07T12:00:00Z")).unwrap();
         assert!(out.contains("old"));
         assert!(!out.contains("new"));
     }
@@ -750,10 +746,7 @@ mod tests {
         write_jsonl(
             &f,
             &[
-                &format!(
-                    r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
-                    long
-                ),
+                &format!(r#"{{"type":"user","message":{{"content":"{}"}}}}"#, long),
                 r#"{"type":"user","message":{"content":"current cycle trigger"}}"#,
             ],
         );

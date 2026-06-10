@@ -146,7 +146,11 @@ async fn rewrite_middleware_swaps_inline_to_file_id() {
 
     // Telemetry log should exist with at least one row.
     let log = ostk_dir.join("rewrite-events.jsonl");
-    assert!(log.exists(), "telemetry log should exist at {}", log.display());
+    assert!(
+        log.exists(),
+        "telemetry log should exist at {}",
+        log.display()
+    );
     let log_content = std::fs::read_to_string(&log).unwrap();
     assert!(
         log_content.lines().count() >= 1,

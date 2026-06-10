@@ -56,7 +56,10 @@ fn missing_ostk_dir_falls_back_to_original_body() {
         other => panic!("expected CacheLoadFailed, got {:?}", other),
     }
 
-    assert_eq!(body, original, "body must be unchanged on cache load failure");
+    assert_eq!(
+        body, original,
+        "body must be unchanged on cache load failure"
+    );
 
     // No telemetry log should have been created (the dir doesn't exist).
     let log = nonexistent.join("rewrite-events.jsonl");

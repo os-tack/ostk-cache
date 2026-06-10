@@ -46,11 +46,7 @@ pub fn estimate_tokens(body_bytes: u64, bytes_per_token: f64) -> u64 {
 /// request with no session header can never allowlist-hit. Empty
 /// allowlist with the global flag off is byte-identical to pre-allowlist
 /// behavior: non-listed sessions see zero diff.
-pub fn enabled_for_session(
-    global: bool,
-    allowlist: &[String],
-    wire_session: Option<&str>,
-) -> bool {
+pub fn enabled_for_session(global: bool, allowlist: &[String], wire_session: Option<&str>) -> bool {
     if global {
         return true;
     }
@@ -163,7 +159,9 @@ impl SseUsageRewriter {
         let mut rewritten = String::with_capacity(text.len() + 16);
         let mut changed = false;
         for line in text.split_inclusive('\n') {
-            let stripped = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"));
+            let stripped = line
+                .strip_prefix("data: ")
+                .or_else(|| line.strip_prefix("data:"));
             if let Some(payload) = stripped
                 && let Ok(mut json) = serde_json::from_str::<Value>(payload.trim_end())
                 && self.bump_usage(&mut json)
@@ -230,10 +228,7 @@ impl SseUsageRewriter {
 /// length of the first complete SSE event including its delimiter.
 fn find_double_newline(buf: &[u8]) -> Option<usize> {
     let lf = buf.windows(2).position(|w| w == b"\n\n").map(|p| p + 2);
-    let crlf = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4);
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
     match (lf, crlf) {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
@@ -241,9 +236,7 @@ fn find_double_newline(buf: &[u8]) -> Option<usize> {
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .any(|w| w == needle)
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -307,7 +300,9 @@ mod tests {
             .unwrap_or(rest.len());
         let actual: u64 = rest[..end].parse().ok()?;
         let rest = rest[end..].trim_start();
-        let rest = rest.strip_prefix("tokens").or_else(|| rest.strip_prefix("token"))?;
+        let rest = rest
+            .strip_prefix("tokens")
+            .or_else(|| rest.strip_prefix("token"))?;
         let rest = rest.trim_start().strip_prefix('>')?.trim_start();
         let end = rest
             .find(|c: char| !c.is_ascii_digit())

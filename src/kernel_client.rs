@@ -80,7 +80,7 @@ pub struct KernelProjection {
 /// Re-export so consumers can `use ostk_cache::kernel_client::Projection`
 /// without learning the ostk-abi path. The type is owned by ostk-abi (the
 /// shared contract crate); ostk-cache merely consumes it.
-pub use ostk_abi::projection::{Projection, ProjectionLine, PROJECTION_WIRE_VERSION};
+pub use ostk_abi::projection::{PROJECTION_WIRE_VERSION, Projection, ProjectionLine};
 
 fn default_wire_version() -> u32 {
     1
@@ -254,10 +254,7 @@ async fn fetch_projection_inner(
         .write_all(&wire)
         .await
         .map_err(|e| format!("write: {}", e))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush: {}", e))?;
+    stream.flush().await.map_err(|e| format!("flush: {}", e))?;
 
     // Newline-delimited: read one line for the response.
     let (read_half, _write_half) = stream.split();
@@ -355,7 +352,12 @@ pub async fn fetch_templates(
     }
     let timeout_dur = std::time::Duration::from_millis(500);
     for socket_path in &candidates {
-        match timeout(timeout_dur, fetch_templates_inner(socket_path, &lines, &opts)).await {
+        match timeout(
+            timeout_dur,
+            fetch_templates_inner(socket_path, &lines, &opts),
+        )
+        .await
+        {
             Ok(Ok(t)) => return Some(t),
             Ok(Err(reason)) => {
                 eprintln!(
@@ -421,10 +423,7 @@ async fn fetch_templates_inner(
         .write_all(&wire)
         .await
         .map_err(|e| format!("write: {}", e))?;
-    stream
-        .flush()
-        .await
-        .map_err(|e| format!("flush: {}", e))?;
+    stream.flush().await.map_err(|e| format!("flush: {}", e))?;
 
     let (read_half, _write_half) = stream.split();
     let mut reader = BufReader::new(read_half);
@@ -631,8 +630,7 @@ mod tests {
             "envelope": "[procs] x:1",
             "wire_version": 1
         }"#;
-        let kp: KernelProjection =
-            serde_json::from_str(json).expect("legacy wire still decodes");
+        let kp: KernelProjection = serde_json::from_str(json).expect("legacy wire still decodes");
         assert!(
             kp.projection.is_none(),
             "legacy kernels must yield projection=None"

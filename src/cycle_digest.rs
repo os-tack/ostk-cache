@@ -241,11 +241,7 @@ pub fn render_peer_section(digests: &[CycleDigest]) -> Option<String> {
         let tag: String = d.session.chars().take(8).collect();
         let tag = if tag.is_empty() { "?".to_string() } else { tag };
         let outcome = d.outcome.as_deref().unwrap_or("?");
-        let text = d
-            .narrative
-            .as_deref()
-            .or(d.intent.as_deref())
-            .unwrap_or("");
+        let text = d.narrative.as_deref().or(d.intent.as_deref()).unwrap_or("");
         let artifacts = if d.artifacts.is_empty() {
             String::new()
         } else {
@@ -274,10 +270,7 @@ fn chrono_iso8601() -> String {
     let s = secs_in_day % 60;
     let days_since_epoch = secs / 86400;
     let (y, mo, d) = days_to_ymd(days_since_epoch as i64);
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y, mo, d, h, m, s
-    )
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, m, s)
 }
 
 fn days_to_ymd(days: i64) -> (i32, u32, u32) {

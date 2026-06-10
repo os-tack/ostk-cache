@@ -147,8 +147,16 @@ async fn proxy_forwards_authorization_and_api_key_headers() {
     let lower = received_str.to_lowercase();
     let api_key_count = lower.matches("x-api-key: my-api-key").count();
     let auth_count = lower.matches("authorization: bearer test-token").count();
-    assert_eq!(api_key_count, 1, "x-api-key header should appear exactly once, got {}", api_key_count);
-    assert_eq!(auth_count, 1, "authorization header should appear exactly once, got {}", auth_count);
+    assert_eq!(
+        api_key_count, 1,
+        "x-api-key header should appear exactly once, got {}",
+        api_key_count
+    );
+    assert_eq!(
+        auth_count, 1,
+        "authorization header should appear exactly once, got {}",
+        auth_count
+    );
 }
 
 #[tokio::test]
@@ -212,18 +220,27 @@ async fn proxy_does_not_prepend_hud_when_user_message_has_tool_results() {
         .as_array()
         .and_then(|a| a.last())
         .expect("messages array should have last");
-    let content = last_msg["content"].as_array().expect("content should be array");
+    let content = last_msg["content"]
+        .as_array()
+        .expect("content should be array");
 
-    assert_eq!(content[0]["type"], "tool_result",
+    assert_eq!(
+        content[0]["type"], "tool_result",
         "first block of tool_result-bearing user message must be tool_result, got {:?}",
-        content[0]);
+        content[0]
+    );
 
     let has_text_with_hud = content.iter().any(|b| {
         b.get("type").and_then(|t| t.as_str()) == Some("text")
-            && b.get("text").and_then(|t| t.as_str()).map(|s| s.contains("cache:")).unwrap_or(false)
+            && b.get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.contains("cache:"))
+                .unwrap_or(false)
     });
-    assert!(!has_text_with_hud,
-        "no HUD text block should be inserted into a tool_result-bearing user message");
+    assert!(
+        !has_text_with_hud,
+        "no HUD text block should be inserted into a tool_result-bearing user message"
+    );
 }
 
 #[tokio::test]
@@ -279,10 +296,16 @@ async fn proxy_sends_identity_accept_encoding_upstream() {
     let identity_count = lower.matches("accept-encoding: identity").count();
     let gzip_count = lower.matches("accept-encoding: gzip").count();
 
-    assert_eq!(identity_count, 1,
-        "expected accept-encoding: identity exactly once upstream, got {}", identity_count);
-    assert_eq!(gzip_count, 0,
-        "expected no accept-encoding: gzip upstream (caller's gzip preference must be stripped), got {}", gzip_count);
+    assert_eq!(
+        identity_count, 1,
+        "expected accept-encoding: identity exactly once upstream, got {}",
+        identity_count
+    );
+    assert_eq!(
+        gzip_count, 0,
+        "expected no accept-encoding: gzip upstream (caller's gzip preference must be stripped), got {}",
+        gzip_count
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -421,14 +444,19 @@ fn spawn_proxy_with_env(
 }
 
 async fn wait_for_proxy(port: u16, timeout_ms: u64) {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             return;
         }
         if std::time::Instant::now() >= deadline {
-            panic!("proxy did not come up on port {} within {}ms", port, timeout_ms);
+            panic!(
+                "proxy did not come up on port {} within {}ms",
+                port, timeout_ms
+            );
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
@@ -483,7 +511,10 @@ async fn gpt_adapter_adds_cache_knobs_and_records_cached_usage() {
     assert_eq!(body["model"], json!("gpt-5.5"));
     assert_eq!(body["prompt_cache_retention"], json!("24h"));
     assert_eq!(
-        body["prompt_cache_key"].as_str().unwrap().starts_with("ostk:gpt:"),
+        body["prompt_cache_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("ostk:gpt:"),
         true,
         "prompt_cache_key should be generated from workspace identity: {}",
         body
@@ -628,16 +659,26 @@ async fn capture_http_writes_request_response_bodies_and_redacted_metadata() {
         "passthrough capture should preserve the exact outbound body"
     );
     let response_body = std::fs::read_to_string(&response_body_path).unwrap();
-    assert!(response_body.contains("\"usage\""), "response body should be captured: {}", response_body);
+    assert!(
+        response_body.contains("\"usage\""),
+        "response body should be captured: {}",
+        response_body
+    );
 
-    let metadata: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
     assert_eq!(metadata["session"], json!("capture-session"));
     assert_eq!(metadata["status"], json!(200));
-    assert_eq!(metadata["request_in"]["bytes"], json!(req_body.len() as u64));
+    assert_eq!(
+        metadata["request_in"]["bytes"],
+        json!(req_body.len() as u64)
+    );
     assert!(
-        metadata["request_headers"].as_array().unwrap().iter().any(|h| {
-            h["name"] == json!("x-api-key") && h["value"] == json!("[redacted]")
-        }),
+        metadata["request_headers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| { h["name"] == json!("x-api-key") && h["value"] == json!("[redacted]") }),
         "x-api-key must be redacted in metadata: {}",
         metadata
     );
@@ -727,14 +768,32 @@ async fn proxy_isolates_per_session_amp_accumulators_and_ledger_rows() {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).expect("each ledger line is valid JSON"))
         .collect();
-    assert_eq!(rows.len(), 2, "expected exactly two ledger rows, got {}: {}", rows.len(), content);
+    assert_eq!(
+        rows.len(),
+        2,
+        "expected exactly two ledger rows, got {}: {}",
+        rows.len(),
+        content
+    );
 
-    let sessions: Vec<&str> = rows.iter()
+    let sessions: Vec<&str> = rows
+        .iter()
         .map(|r| r["session"].as_str().expect("session field is a string"))
         .collect();
-    assert!(sessions.contains(&"session-a"), "ledger missing session-a: {:?}", sessions);
-    assert!(sessions.contains(&"session-b"), "ledger missing session-b: {:?}", sessions);
-    assert_ne!(sessions[0], sessions[1], "two rows must carry different session ids");
+    assert!(
+        sessions.contains(&"session-a"),
+        "ledger missing session-a: {:?}",
+        sessions
+    );
+    assert!(
+        sessions.contains(&"session-b"),
+        "ledger missing session-b: {:?}",
+        sessions
+    );
+    assert_ne!(
+        sessions[0], sessions[1],
+        "two rows must carry different session ids"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -791,13 +850,19 @@ async fn proxy_accepts_charset_qualified_content_type_and_normalizes_upstream() 
     let _ = proxy.kill();
     let _ = proxy.wait();
 
-    assert_eq!(status.as_u16(), 200, "proxy must accept charset-qualified content-type and return 200");
+    assert_eq!(
+        status.as_u16(),
+        200,
+        "proxy must accept charset-qualified content-type and return 200"
+    );
 
     let received = String::from_utf8_lossy(&req_bytes);
     let lower = received.to_lowercase();
 
     let canonical = lower.matches("content-type: application/json\r\n").count();
-    let with_charset = lower.matches("content-type: application/json; charset=utf-8").count();
+    let with_charset = lower
+        .matches("content-type: application/json; charset=utf-8")
+        .count();
     assert_eq!(
         canonical, 1,
         "upstream must see canonical `content-type: application/json` exactly once, got {} (raw: {:?})",
@@ -811,10 +876,16 @@ async fn proxy_accepts_charset_qualified_content_type_and_normalizes_upstream() 
 
     // Body before the headers/body split must be parseable JSON — confirms the
     // proxy did not mangle the payload while normalizing the content-type.
-    let body_idx = find_subseq(&req_bytes, b"\r\n\r\n").expect("upstream req has body separator") + 4;
+    let body_idx =
+        find_subseq(&req_bytes, b"\r\n\r\n").expect("upstream req has body separator") + 4;
     let body = &req_bytes[body_idx..];
-    let parsed: serde_json::Value = serde_json::from_slice(body)
-        .unwrap_or_else(|e| panic!("upstream body must be valid JSON, got error {}: {:?}", e, String::from_utf8_lossy(body)));
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|e| {
+        panic!(
+            "upstream body must be valid JSON, got error {}: {:?}",
+            e,
+            String::from_utf8_lossy(body)
+        )
+    });
     assert_eq!(parsed["messages"][0]["role"], "user");
 }
 
@@ -874,11 +945,12 @@ async fn ledger_jsonl_survives_proxy_sigkill_and_remains_appendable() {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         tries += 1;
     }
-    let pre_crash = std::fs::read_to_string(&ledger_path)
-        .expect("ledger.jsonl must exist before crash");
+    let pre_crash =
+        std::fs::read_to_string(&ledger_path).expect("ledger.jsonl must exist before crash");
     assert!(
         pre_crash.lines().filter(|l| !l.trim().is_empty()).count() >= 1,
-        "expected at least one ledger row before SIGKILL, got: {:?}", pre_crash
+        "expected at least one ledger row before SIGKILL, got: {:?}",
+        pre_crash
     );
 
     // ---- Phase 2: SIGKILL (force kill — no chance for graceful shutdown) ----
@@ -898,20 +970,26 @@ async fn ledger_jsonl_survives_proxy_sigkill_and_remains_appendable() {
         .output();
     // Wait for the port to actually free.
     for _ in 0..50 {
-        if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port_a)).await.is_err() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", proxy_port_a))
+            .await
+            .is_err()
+        {
             break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     // The pre-crash ledger contents must still be on disk and parseable.
-    let after_crash = std::fs::read_to_string(&ledger_path)
-        .expect("ledger.jsonl must still exist after SIGKILL");
+    let after_crash =
+        std::fs::read_to_string(&ledger_path).expect("ledger.jsonl must still exist after SIGKILL");
     let rows_after_crash: Vec<serde_json::Value> = after_crash
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l)
-             .unwrap_or_else(|e| panic!("ledger row corrupted after crash: {} (line: {:?})", e, l)))
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| {
+                panic!("ledger row corrupted after crash: {} (line: {:?})", e, l)
+            })
+        })
         .collect();
     assert!(
         !rows_after_crash.is_empty(),
@@ -964,13 +1042,21 @@ async fn ledger_jsonl_survives_proxy_sigkill_and_remains_appendable() {
     let final_rows: Vec<serde_json::Value> = final_content
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l)
-             .unwrap_or_else(|e| panic!("ledger row not valid JSON after restart: {} (line: {:?})", e, l)))
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| {
+                panic!(
+                    "ledger row not valid JSON after restart: {} (line: {:?})",
+                    e, l
+                )
+            })
+        })
         .collect();
     assert!(
         final_rows.len() > pre_count,
         "expected new ledger row appended after restart (had {}, now {}): {}",
-        pre_count, final_rows.len(), final_content
+        pre_count,
+        final_rows.len(),
+        final_content
     );
     // Confirm pre-crash rows are still byte-identical at the front of the file
     // — no truncation, no rewrite during restart.
@@ -1002,7 +1088,10 @@ async fn spawn_hook_proxy(port: u16) -> (std::process::Child, tempfile::TempDir)
     // Wait for the port to come up; if the binary fails to start, surface that.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
     loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -1021,8 +1110,10 @@ fn read_hooks_jsonl(dir: &std::path::Path) -> Vec<serde_json::Value> {
     content
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l)
-             .unwrap_or_else(|e| panic!("hooks.jsonl row not valid JSON: {} (line: {:?})", e, l)))
+        .map(|l| {
+            serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("hooks.jsonl row not valid JSON: {} (line: {:?})", e, l))
+        })
         .collect()
 }
 
@@ -1052,16 +1143,25 @@ async fn hook_endpoint_accepts_all_five_event_types_and_writes_correct_rows() {
             "session_id": format!("sess-hook-{}", idx),
             "payload": payload,
         });
-        let resp = client.post(url).json(&body).send().await
+        let resp = client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
             .unwrap_or_else(|e| panic!("POST /hook/event failed for {}: {}", kind, e));
         assert_eq!(
             resp.status().as_u16(),
             200,
             "expected 200 for valid event {}, got {}",
-            kind, resp.status()
+            kind,
+            resp.status()
         );
         let body: serde_json::Value = resp.json().await.expect("response is JSON");
-        assert_eq!(body["ok"], json!(true), "valid event response should include {{\"ok\":true}}");
+        assert_eq!(
+            body["ok"],
+            json!(true),
+            "valid event response should include {{\"ok\":true}}"
+        );
     }
 
     // Allow filesystem flush before reading.
@@ -1075,24 +1175,44 @@ async fn hook_endpoint_accepts_all_five_event_types_and_writes_correct_rows() {
         rows.len(),
         events.len(),
         "expected one hooks.jsonl row per event, got {} rows for {} events",
-        rows.len(), events.len()
+        rows.len(),
+        events.len()
     );
 
     for (idx, (kind, payload)) in events.iter().enumerate() {
         let row = &rows[idx];
-        assert_eq!(row["event_type"].as_str(), Some(*kind),
-            "row {} has wrong event_type: {:?}", idx, row);
-        assert_eq!(row["workspace_id"].as_str(), Some("ws-hook-test"),
-            "row {} has wrong workspace_id: {:?}", idx, row);
+        assert_eq!(
+            row["event_type"].as_str(),
+            Some(*kind),
+            "row {} has wrong event_type: {:?}",
+            idx,
+            row
+        );
+        assert_eq!(
+            row["workspace_id"].as_str(),
+            Some("ws-hook-test"),
+            "row {} has wrong workspace_id: {:?}",
+            idx,
+            row
+        );
         assert_eq!(
             row["session_id"].as_str(),
             Some(format!("sess-hook-{}", idx).as_str()),
-            "row {} has wrong session_id: {:?}", idx, row
+            "row {} has wrong session_id: {:?}",
+            idx,
+            row
         );
-        assert_eq!(&row["payload"], payload,
-            "row {} payload mismatch: {:?} vs {:?}", idx, row["payload"], payload);
-        assert!(row["timestamp"].is_string() || row["timestamp"].is_number(),
-            "row {} timestamp should be present: {:?}", idx, row);
+        assert_eq!(
+            &row["payload"], payload,
+            "row {} payload mismatch: {:?} vs {:?}",
+            idx, row["payload"], payload
+        );
+        assert!(
+            row["timestamp"].is_string() || row["timestamp"].is_number(),
+            "row {} timestamp should be present: {:?}",
+            idx,
+            row
+        );
     }
 }
 
@@ -1113,15 +1233,23 @@ async fn hook_endpoint_accepts_snake_case_event_aliases() {
     ];
 
     for (snake, _expected) in aliases.iter() {
-        let resp = client.post(url)
+        let resp = client
+            .post(url)
             .json(&json!({
                 "type": snake,
                 "workspace_id": "w",
                 "session_id": "s",
             }))
-            .send().await.expect("send");
-        assert_eq!(resp.status().as_u16(), 200,
-            "snake_case alias {} should be accepted, got {}", snake, resp.status());
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "snake_case alias {} should be accepted, got {}",
+            snake,
+            resp.status()
+        );
     }
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -1129,12 +1257,22 @@ async fn hook_endpoint_accepts_snake_case_event_aliases() {
     let _ = proxy.wait();
 
     let rows = read_hooks_jsonl(tmp.path());
-    assert_eq!(rows.len(), aliases.len(),
-        "expected one row per alias, got {}: {:?}", rows.len(), rows);
+    assert_eq!(
+        rows.len(),
+        aliases.len(),
+        "expected one row per alias, got {}: {:?}",
+        rows.len(),
+        rows
+    );
     for (idx, (_, expected)) in aliases.iter().enumerate() {
-        assert_eq!(rows[idx]["event_type"].as_str(), Some(*expected),
+        assert_eq!(
+            rows[idx]["event_type"].as_str(),
+            Some(*expected),
             "row {} should normalize snake_case alias to {}: {:?}",
-            idx, expected, rows[idx]);
+            idx,
+            expected,
+            rows[idx]
+        );
     }
 }
 
@@ -1146,29 +1284,40 @@ async fn hook_endpoint_rejects_unknown_event_type_with_400() {
     let url = "http://127.0.0.1:8099/hook/event";
     let client = reqwest::Client::new();
 
-    let resp = client.post(url)
+    let resp = client
+        .post(url)
         .json(&json!({
             "type": "NotARealHookKind",
             "workspace_id": "w",
             "session_id": "s",
         }))
-        .send().await.expect("send");
+        .send()
+        .await
+        .expect("send");
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.expect("response is JSON");
 
     let _ = proxy.kill();
     let _ = proxy.wait();
 
-    assert_eq!(status, 400,
-        "unknown event type must return 400, got {} (body: {})", status, body);
-    assert_eq!(body["type"], json!("error"),
-        "400 body should be the proxy's error envelope: {}", body);
+    assert_eq!(
+        status, 400,
+        "unknown event type must return 400, got {} (body: {})",
+        status, body
+    );
+    assert_eq!(
+        body["type"],
+        json!("error"),
+        "400 body should be the proxy's error envelope: {}",
+        body
+    );
     assert!(
         body["error"]["message"]
             .as_str()
             .map(|m| m.contains("NotARealHookKind"))
             .unwrap_or(false),
-        "error message should name the offending type: {}", body
+        "error message should name the offending type: {}",
+        body
     );
     // No row should have been written.
     let path = tmp.path().join(".l1.5/hooks.jsonl");
@@ -1193,15 +1342,19 @@ async fn hook_endpoint_rejects_malformed_json_with_400() {
     ];
 
     for (label, body_str) in cases.iter() {
-        let resp = client.post(url)
+        let resp = client
+            .post(url)
             .header("content-type", "application/json")
             .body(body_str.to_string())
-            .send().await.expect("send");
+            .send()
+            .await
+            .expect("send");
         assert_eq!(
             resp.status().as_u16(),
             400,
             "case {:?}: malformed JSON must return 400, got {}",
-            label, resp.status()
+            label,
+            resp.status()
         );
     }
 
@@ -1227,26 +1380,37 @@ async fn hook_endpoint_rejects_missing_required_fields_with_4xx() {
     let client = reqwest::Client::new();
 
     let cases = [
-        ("missing workspace_id", json!({"type": "SessionStart", "session_id": "s"})),
-        ("missing session_id", json!({"type": "SessionStart", "workspace_id": "w"})),
-        ("missing type", json!({"workspace_id": "w", "session_id": "s"})),
+        (
+            "missing workspace_id",
+            json!({"type": "SessionStart", "session_id": "s"}),
+        ),
+        (
+            "missing session_id",
+            json!({"type": "SessionStart", "workspace_id": "w"}),
+        ),
+        (
+            "missing type",
+            json!({"workspace_id": "w", "session_id": "s"}),
+        ),
         ("empty object", json!({})),
     ];
 
     for (label, body) in cases.iter() {
-        let resp = client.post(url)
-            .json(body)
-            .send().await.expect("send");
+        let resp = client.post(url).json(body).send().await.expect("send");
         let status = resp.status().as_u16();
         assert!(
             (400..500).contains(&status),
             "case {:?}: missing required field must return a 4xx, got {} (body sent: {})",
-            label, status, body
+            label,
+            status,
+            body
         );
         // Specifically, the proxy must not return 200 for an incomplete event.
-        assert_ne!(status, 200,
+        assert_ne!(
+            status, 200,
             "case {:?}: must NOT return 200 for body missing required fields ({})",
-            label, body);
+            label, body
+        );
     }
 
     let _ = proxy.kill();
@@ -1268,24 +1432,40 @@ async fn hook_endpoint_writes_null_payload_when_omitted() {
     let url = "http://127.0.0.1:8102/hook/event";
     let client = reqwest::Client::new();
 
-    let resp = client.post(url)
+    let resp = client
+        .post(url)
         .json(&json!({
             "type": "SessionStart",
             "workspace_id": "w",
             "session_id": "s",
         }))
-        .send().await.expect("send");
-    assert_eq!(resp.status().as_u16(), 200,
-        "valid event with no payload must return 200, got {}", resp.status());
+        .send()
+        .await
+        .expect("send");
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "valid event with no payload must return 200, got {}",
+        resp.status()
+    );
 
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     let _ = proxy.kill();
     let _ = proxy.wait();
 
     let rows = read_hooks_jsonl(tmp.path());
-    assert_eq!(rows.len(), 1, "expected exactly one row, got {}", rows.len());
-    assert_eq!(rows[0]["payload"], serde_json::Value::Null,
-        "omitted payload must serialize as JSON null, got {:?}", rows[0]["payload"]);
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one row, got {}",
+        rows.len()
+    );
+    assert_eq!(
+        rows[0]["payload"],
+        serde_json::Value::Null,
+        "omitted payload must serialize as JSON null, got {:?}",
+        rows[0]["payload"]
+    );
     assert_eq!(rows[0]["event_type"].as_str(), Some("SessionStart"));
 }
 
@@ -1342,12 +1522,7 @@ async fn passthrough_mode_forwards_body_byte_identical_no_mutations() {
     let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
 
     let proxy_port = 8103;
-    let mut proxy = spawn_proxy_with_passthrough(
-        proxy_port,
-        &upstream_url,
-        Some("1"),
-        None,
-    );
+    let mut proxy = spawn_proxy_with_passthrough(proxy_port, &upstream_url, Some("1"), None);
     wait_for_proxy(proxy_port, 5000).await;
 
     let original_body = json!({
@@ -1393,11 +1568,16 @@ async fn passthrough_mode_forwards_body_byte_identical_no_mutations() {
     let _ = proxy.kill();
     let _ = proxy.wait();
 
-    let body_idx = find_subseq(&req_bytes, b"\r\n\r\n").expect("upstream req has body separator") + 4;
+    let body_idx =
+        find_subseq(&req_bytes, b"\r\n\r\n").expect("upstream req has body separator") + 4;
     let body = &req_bytes[body_idx..];
-    let parsed: serde_json::Value = serde_json::from_slice(body)
-        .unwrap_or_else(|e| panic!("upstream body must be valid JSON, got error {}: {:?}",
-            e, String::from_utf8_lossy(body)));
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|e| {
+        panic!(
+            "upstream body must be valid JSON, got error {}: {:?}",
+            e,
+            String::from_utf8_lossy(body)
+        )
+    });
 
     // (1) system field is the original plain string — NOT the
     //     [{type:"text", cache_control:{ttl:"1h"}}] mutate-mode wrapper.
@@ -1419,13 +1599,15 @@ async fn passthrough_mode_forwards_body_byte_identical_no_mutations() {
         .as_array()
         .and_then(|a| a.last())
         .expect("messages array should have last");
-    let content = last_msg["content"].as_array()
+    let content = last_msg["content"]
+        .as_array()
         .expect("user content should still be an array in passthrough mode");
     assert_eq!(
         content.len(),
         2,
         "passthrough must NOT prepend a HUD block; expected 2 user content blocks, got {}: {:?}",
-        content.len(), content
+        content.len(),
+        content
     );
 
     // (2b) None of the forwarded user blocks should be a HUD-style block
@@ -1523,9 +1705,13 @@ async fn mutate_mode_default_still_collapses_system_and_prepends_hud() {
 
     let body_idx = find_subseq(&req_bytes, b"\r\n\r\n").expect("body separator") + 4;
     let body = &req_bytes[body_idx..];
-    let parsed: serde_json::Value = serde_json::from_slice(body)
-        .unwrap_or_else(|e| panic!("upstream body must be valid JSON, got {}: {:?}",
-            e, String::from_utf8_lossy(body)));
+    let parsed: serde_json::Value = serde_json::from_slice(body).unwrap_or_else(|e| {
+        panic!(
+            "upstream body must be valid JSON, got {}: {:?}",
+            e,
+            String::from_utf8_lossy(body)
+        )
+    });
 
     // System collapsed into the wrapped array form with 1h cache_control.
     let sys = &parsed["system"];
@@ -1535,7 +1721,12 @@ async fn mutate_mode_default_still_collapses_system_and_prepends_hud() {
         sys
     );
     let sys_arr = sys.as_array().unwrap();
-    assert_eq!(sys_arr.len(), 1, "system array should have one element, got {:?}", sys_arr);
+    assert_eq!(
+        sys_arr.len(),
+        1,
+        "system array should have one element, got {:?}",
+        sys_arr
+    );
     assert_eq!(sys_arr[0]["type"], "text");
     assert_eq!(sys_arr[0]["text"], "Plain system string");
     assert_eq!(
@@ -1546,12 +1737,18 @@ async fn mutate_mode_default_still_collapses_system_and_prepends_hud() {
     );
 
     // HUD prepended to user content (now an array with a HUD block first).
-    let last_msg = parsed["messages"].as_array().and_then(|a| a.last())
+    let last_msg = parsed["messages"]
+        .as_array()
+        .and_then(|a| a.last())
         .expect("last message");
-    let content = last_msg["content"].as_array()
+    let content = last_msg["content"]
+        .as_array()
         .expect("default mode rewrites user content into an array");
-    assert!(content.len() >= 2,
-        "default mutate must prepend HUD block (≥2 entries), got {:?}", content);
+    assert!(
+        content.len() >= 2,
+        "default mutate must prepend HUD block (≥2 entries), got {:?}",
+        content
+    );
 
     let first = &content[0];
     assert_eq!(first["type"], "text");
@@ -1585,12 +1782,8 @@ async fn ledger_row_mode_field_reflects_passthrough_env_var() {
     // ---- Phase A: passthrough ----
     let tmp_a = tempfile::tempdir().expect("tempdir A");
     let proxy_port_a = 8105;
-    let mut proxy_a = spawn_proxy_with_passthrough(
-        proxy_port_a,
-        &upstream_url,
-        Some("1"),
-        Some(tmp_a.path()),
-    );
+    let mut proxy_a =
+        spawn_proxy_with_passthrough(proxy_port_a, &upstream_url, Some("1"), Some(tmp_a.path()));
     wait_for_proxy(proxy_port_a, 5000).await;
 
     let url_a = format!("http://127.0.0.1:{}/v1/messages", proxy_port_a);
@@ -1627,17 +1820,21 @@ async fn ledger_row_mode_field_reflects_passthrough_env_var() {
     let _ = proxy_a.kill();
     let _ = proxy_a.wait();
 
-    let content_a = std::fs::read_to_string(&ledger_a)
-        .expect("ledger.jsonl must exist after Phase A request");
+    let content_a =
+        std::fs::read_to_string(&ledger_a).expect("ledger.jsonl must exist after Phase A request");
     let rows_a: Vec<serde_json::Value> = content_a
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l)
-             .unwrap_or_else(|e| panic!("Phase A ledger row not valid JSON: {} (line: {:?})", e, l)))
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| {
+                panic!("Phase A ledger row not valid JSON: {} (line: {:?})", e, l)
+            })
+        })
         .collect();
     assert!(
         !rows_a.is_empty(),
-        "Phase A: expected at least one ledger row, got: {:?}", content_a
+        "Phase A: expected at least one ledger row, got: {:?}",
+        content_a
     );
     let mode_a = rows_a[0]["mode"]
         .as_str()
@@ -1648,19 +1845,17 @@ async fn ledger_row_mode_field_reflects_passthrough_env_var() {
         mode_a, rows_a[0]
     );
     assert_eq!(
-        rows_a[0]["session"].as_str(), Some("passthrough-ledger-a"),
-        "Phase A row should carry the session id we sent: {}", rows_a[0]
+        rows_a[0]["session"].as_str(),
+        Some("passthrough-ledger-a"),
+        "Phase A row should carry the session id we sent: {}",
+        rows_a[0]
     );
 
     // ---- Phase B: default mutate (env var unset) ----
     let tmp_b = tempfile::tempdir().expect("tempdir B");
     let proxy_port_b = 8106;
-    let mut proxy_b = spawn_proxy_with_passthrough(
-        proxy_port_b,
-        &upstream_url,
-        None,
-        Some(tmp_b.path()),
-    );
+    let mut proxy_b =
+        spawn_proxy_with_passthrough(proxy_port_b, &upstream_url, None, Some(tmp_b.path()));
     wait_for_proxy(proxy_port_b, 5000).await;
 
     let url_b = format!("http://127.0.0.1:{}/v1/messages", proxy_port_b);
@@ -1697,17 +1892,21 @@ async fn ledger_row_mode_field_reflects_passthrough_env_var() {
     let _ = proxy_b.kill();
     let _ = proxy_b.wait();
 
-    let content_b = std::fs::read_to_string(&ledger_b)
-        .expect("ledger.jsonl must exist after Phase B request");
+    let content_b =
+        std::fs::read_to_string(&ledger_b).expect("ledger.jsonl must exist after Phase B request");
     let rows_b: Vec<serde_json::Value> = content_b
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l)
-             .unwrap_or_else(|e| panic!("Phase B ledger row not valid JSON: {} (line: {:?})", e, l)))
+        .map(|l| {
+            serde_json::from_str(l).unwrap_or_else(|e| {
+                panic!("Phase B ledger row not valid JSON: {} (line: {:?})", e, l)
+            })
+        })
         .collect();
     assert!(
         !rows_b.is_empty(),
-        "Phase B: expected at least one ledger row, got: {:?}", content_b
+        "Phase B: expected at least one ledger row, got: {:?}",
+        content_b
     );
     let mode_b = rows_b[0]["mode"]
         .as_str()
@@ -1718,8 +1917,10 @@ async fn ledger_row_mode_field_reflects_passthrough_env_var() {
         mode_b, rows_b[0]
     );
     assert_eq!(
-        rows_b[0]["session"].as_str(), Some("mutate-ledger-b"),
-        "Phase B row should carry the session id we sent: {}", rows_b[0]
+        rows_b[0]["session"].as_str(),
+        Some("mutate-ledger-b"),
+        "Phase B row should carry the session id we sent: {}",
+        rows_b[0]
     );
 }
 

@@ -1,5 +1,5 @@
 use clap::Parser;
-use ostk_cache::{AmpRow, WorkspaceId, SessionId};
+use ostk_cache::{AmpRow, SessionId, WorkspaceId};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -63,12 +63,7 @@ fn main() {
     // Validate --mode before doing any work; surface bad values with a
     // pointed error rather than silently returning an empty result set.
     match args.mode.as_str() {
-        "mutate"
-        | "passthrough"
-        | "rebuild_local"
-        | "rebuild_kernel"
-        | "rebuild_skip"
-        | "all" => {}
+        "mutate" | "passthrough" | "rebuild_local" | "rebuild_kernel" | "rebuild_skip" | "all" => {}
         other => {
             eprintln!(
                 "Invalid --mode {:?}: expected one of mutate, passthrough, rebuild_local, rebuild_kernel, rebuild_skip, all",
@@ -107,55 +102,59 @@ fn main() {
 
     for line in reader.lines() {
         if let Ok(l) = line
-            && let Ok(row) = serde_json::from_str::<AmpRow>(&l) {
-                if let Some(ws) = &args.workspace
-                    && &row.workspace_id != ws {
-                        continue;
-                    }
-
-                if args.mode != "all" && row.mode != args.mode {
-                    continue;
-                }
-
-                if let Some(w_secs) = window_secs
-                    && row.timestamp > 0 && row.timestamp < now - w_secs {
-                        continue;
-                    }
-
-                let key = (row.workspace_id.clone(), row.session.clone());
-                let entry = stats_map.entry(key).or_insert_with(|| SessionStats {
-                    workspace_id: row.workspace_id.clone(),
-                    session_id: row.session.clone(),
-                    ..Default::default()
-                });
-
-                entry.turns += 1;
-                entry.input_tokens_total_sum += row.input_tokens_total;
-                entry.cache_read_total_sum += row.cache_read_tokens;
-                entry.cache_create_total_sum += row.cache_create_tokens;
-                entry.amp_ratios.push(row.amp_ratio);
-                
-                if row.hot_count > entry.hot_pages_max {
-                    entry.hot_pages_max = row.hot_count;
-                }
-                
-                if row.hot_count < entry.last_hot_count {
-                    entry.evictions += entry.last_hot_count - row.hot_count;
-                }
-                entry.last_hot_count = row.hot_count;
-                
-                entry.firmware_bytes = row.firmware_bytes;
-                entry.state_bytes_sum += row.state_bytes;
-
-                if let (Some(bi), Some(bo)) = (row.req_bytes_in, row.req_bytes_out) {
-                    entry.bytes_in_total_sum += bi;
-                    entry.bytes_out_total_sum += bo;
-                    entry.bytes_turns += 1;
-                }
-                if let Some(rb) = row.resp_bytes {
-                    entry.resp_bytes_total_sum += rb;
-                }
+            && let Ok(row) = serde_json::from_str::<AmpRow>(&l)
+        {
+            if let Some(ws) = &args.workspace
+                && &row.workspace_id != ws
+            {
+                continue;
             }
+
+            if args.mode != "all" && row.mode != args.mode {
+                continue;
+            }
+
+            if let Some(w_secs) = window_secs
+                && row.timestamp > 0
+                && row.timestamp < now - w_secs
+            {
+                continue;
+            }
+
+            let key = (row.workspace_id.clone(), row.session.clone());
+            let entry = stats_map.entry(key).or_insert_with(|| SessionStats {
+                workspace_id: row.workspace_id.clone(),
+                session_id: row.session.clone(),
+                ..Default::default()
+            });
+
+            entry.turns += 1;
+            entry.input_tokens_total_sum += row.input_tokens_total;
+            entry.cache_read_total_sum += row.cache_read_tokens;
+            entry.cache_create_total_sum += row.cache_create_tokens;
+            entry.amp_ratios.push(row.amp_ratio);
+
+            if row.hot_count > entry.hot_pages_max {
+                entry.hot_pages_max = row.hot_count;
+            }
+
+            if row.hot_count < entry.last_hot_count {
+                entry.evictions += entry.last_hot_count - row.hot_count;
+            }
+            entry.last_hot_count = row.hot_count;
+
+            entry.firmware_bytes = row.firmware_bytes;
+            entry.state_bytes_sum += row.state_bytes;
+
+            if let (Some(bi), Some(bo)) = (row.req_bytes_in, row.req_bytes_out) {
+                entry.bytes_in_total_sum += bi;
+                entry.bytes_out_total_sum += bo;
+                entry.bytes_turns += 1;
+            }
+            if let Some(rb) = row.resp_bytes {
+                entry.resp_bytes_total_sum += rb;
+            }
+        }
     }
 
     let mut results = Vec::new();
@@ -163,7 +162,7 @@ fn main() {
     for (_, stats) in stats_map {
         let mut sorted_amps = stats.amp_ratios.clone();
         sorted_amps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let turns_f = stats.turns as f64;
         let amp_mean = if stats.turns > 0 {
             stats.amp_ratios.iter().sum::<f64>() / turns_f
@@ -187,7 +186,8 @@ fn main() {
         let cache_hit_rate = if stats.cache_read_total_sum + stats.input_tokens_total_sum == 0 {
             0.0
         } else {
-            stats.cache_read_total_sum as f64 / (stats.cache_read_total_sum as f64 + stats.input_tokens_total_sum as f64)
+            stats.cache_read_total_sum as f64
+                / (stats.cache_read_total_sum as f64 + stats.input_tokens_total_sum as f64)
         };
 
         let state_bytes_mean = if stats.turns > 0 {
@@ -243,36 +243,38 @@ fn main() {
         for res in &results {
             println!("{}", serde_json::to_string(res).unwrap());
         }
-    } else if args.format == "csv"
-        && !results.is_empty() {
-            println!("workspace_id,session_id,mode,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,cache_read_tokens_total,cache_create_tokens_total,input_tokens_total,tokens_saved_input_eq,hot_pages_max,evictions,firmware_bytes,state_bytes_mean,bytes_in_total,bytes_out_total,resp_bytes_total,bytes_reduction_ratio,bytes_turns");
-            for res in results {
-                let obj = res.as_object().unwrap();
-                println!("{},{},{},{},{:.2},{:.2},{:.2},{:.4},{},{},{},{:.0},{},{},{},{:.2},{},{},{},{:.4},{}",
-                    obj["workspace_id"].as_str().unwrap_or(""),
-                    obj["session_id"].as_str().unwrap_or(""),
-                    obj["mode"].as_str().unwrap_or(""),
-                    obj["turns"],
-                    obj["amp_mean"].as_f64().unwrap_or(0.0),
-                    obj["amp_p50"].as_f64().unwrap_or(0.0),
-                    obj["amp_p95"].as_f64().unwrap_or(0.0),
-                    obj["cache_hit_rate"].as_f64().unwrap_or(0.0),
-                    obj["cache_read_tokens_total"],
-                    obj["cache_create_tokens_total"],
-                    obj["input_tokens_total"],
-                    obj["tokens_saved_input_eq"].as_f64().unwrap_or(0.0),
-                    obj["hot_pages_max"],
-                    obj["evictions"],
-                    obj["firmware_bytes"],
-                    obj["state_bytes_mean"].as_f64().unwrap_or(0.0),
-                    obj["bytes_in_total"],
-                    obj["bytes_out_total"],
-                    obj["resp_bytes_total"],
-                    obj["bytes_reduction_ratio"].as_f64().unwrap_or(1.0),
-                    obj["bytes_turns"],
-                );
-            }
+    } else if args.format == "csv" && !results.is_empty() {
+        println!(
+            "workspace_id,session_id,mode,turns,amp_mean,amp_p50,amp_p95,cache_hit_rate,cache_read_tokens_total,cache_create_tokens_total,input_tokens_total,tokens_saved_input_eq,hot_pages_max,evictions,firmware_bytes,state_bytes_mean,bytes_in_total,bytes_out_total,resp_bytes_total,bytes_reduction_ratio,bytes_turns"
+        );
+        for res in results {
+            let obj = res.as_object().unwrap();
+            println!(
+                "{},{},{},{},{:.2},{:.2},{:.2},{:.4},{},{},{},{:.0},{},{},{},{:.2},{},{},{},{:.4},{}",
+                obj["workspace_id"].as_str().unwrap_or(""),
+                obj["session_id"].as_str().unwrap_or(""),
+                obj["mode"].as_str().unwrap_or(""),
+                obj["turns"],
+                obj["amp_mean"].as_f64().unwrap_or(0.0),
+                obj["amp_p50"].as_f64().unwrap_or(0.0),
+                obj["amp_p95"].as_f64().unwrap_or(0.0),
+                obj["cache_hit_rate"].as_f64().unwrap_or(0.0),
+                obj["cache_read_tokens_total"],
+                obj["cache_create_tokens_total"],
+                obj["input_tokens_total"],
+                obj["tokens_saved_input_eq"].as_f64().unwrap_or(0.0),
+                obj["hot_pages_max"],
+                obj["evictions"],
+                obj["firmware_bytes"],
+                obj["state_bytes_mean"].as_f64().unwrap_or(0.0),
+                obj["bytes_in_total"],
+                obj["bytes_out_total"],
+                obj["resp_bytes_total"],
+                obj["bytes_reduction_ratio"].as_f64().unwrap_or(1.0),
+                obj["bytes_turns"],
+            );
         }
+    }
 }
 
 #[cfg(test)]
@@ -282,7 +284,7 @@ mod tests {
     #[test]
     fn test_stats_computation() {
         let mut stats_map: HashMap<(WorkspaceId, SessionId), SessionStats> = HashMap::new();
-        
+
         let key = ("ws1".to_string(), "sess1".to_string());
         let mut entry = SessionStats {
             workspace_id: "ws1".to_string(),
@@ -296,13 +298,15 @@ mod tests {
             entry.cache_read_total_sum += 50;
             entry.amp_ratios.push(i as f64);
         }
-        
+
         stats_map.insert(key, entry);
-        
-        let stats = stats_map.get(&("ws1".to_string(), "sess1".to_string())).unwrap();
+
+        let stats = stats_map
+            .get(&("ws1".to_string(), "sess1".to_string()))
+            .unwrap();
         let mut sorted_amps = stats.amp_ratios.clone();
         sorted_amps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let turns_f = stats.turns as f64;
         let amp_mean = stats.amp_ratios.iter().sum::<f64>() / turns_f;
         let amp_p50 = sorted_amps[sorted_amps.len() / 2];

@@ -442,19 +442,21 @@ impl Config {
     pub fn resolve(cli: CliArgs, cwd: &Path) -> Self {
         let config_path = cli.config.clone().or_else(|| {
             let default = cwd.join(".ostk").join("cache.toml");
-            if default.exists() { Some(default) } else { None }
+            if default.exists() {
+                Some(default)
+            } else {
+                None
+            }
         });
         let file = config_path.as_deref().and_then(load_file_config);
         let file = file.as_ref();
 
         // Helper: env_var that returns Option<String>, ignoring empty values.
-        let env_str = |k: &str| -> Option<String> {
-            std::env::var(k).ok().filter(|s| !s.is_empty())
-        };
+        let env_str =
+            |k: &str| -> Option<String> { std::env::var(k).ok().filter(|s| !s.is_empty()) };
         let env_truthy = |k: &str| -> Option<bool> {
-            env_str(k).map(|v| {
-                matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
-            })
+            env_str(k)
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         };
         let env_num = |k: &str| -> Option<u64> { env_str(k).and_then(|s| s.parse().ok()) };
 
@@ -741,7 +743,11 @@ impl Config {
             &self.tail_transcript.value,
             self.tail_transcript.source,
         ));
-        out.push_str(&row("tail.limit", &self.tail_limit.value, self.tail_limit.source));
+        out.push_str(&row(
+            "tail.limit",
+            &self.tail_limit.value,
+            self.tail_limit.source,
+        ));
         out.push_str(&row(
             "tail.claude_projects_dir",
             &self.claude_projects_dir.value.display(),
@@ -866,7 +872,11 @@ impl Config {
             self.mode.value,
             cap,
             tail,
-            if self.rewrite_enabled.value { "on" } else { "off" },
+            if self.rewrite_enabled.value {
+                "on"
+            } else {
+                "off"
+            },
             capture,
             self.kernel_timeout_ms.value,
         )
@@ -1029,7 +1039,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".ostk");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("cache.toml"), "[truth]\nsessions = [\"abc-123\"]\n").unwrap();
+        std::fs::write(
+            dir.join("cache.toml"),
+            "[truth]\nsessions = [\"abc-123\"]\n",
+        )
+        .unwrap();
         let cfg = Config::resolve(empty_cli(), tmp.path());
         assert_eq!(cfg.usage_truth_sessions.value, vec!["abc-123".to_string()]);
         assert_eq!(cfg.usage_truth_sessions.source, Source::Toml);
@@ -1148,11 +1162,7 @@ enabled = false
         cli.no_soft_cap = true;
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".ostk")).unwrap();
-        std::fs::write(
-            tmp.path().join(".ostk").join("cache.toml"),
-            "port = 7777\n",
-        )
-        .unwrap();
+        std::fs::write(tmp.path().join(".ostk").join("cache.toml"), "port = 7777\n").unwrap();
 
         let cfg = Config::resolve(cli, tmp.path());
         assert_eq!(cfg.port.value, 4242);
