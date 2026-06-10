@@ -145,6 +145,21 @@ pub struct RewriteEventRow {
     /// Source of the cadence classification: "observed" | "identity_hint" | "default".
     #[serde(default = "default_cadence_source")]
     pub cadence_source: String,
+    // →2032 active write-policy telemetry fields. serde defaults so old
+    // rows (missing these fields) still parse — the defaults are the
+    // policy-dark null state.
+    /// Lane class for this request: "warm" | "dead" | "off" (policy dark).
+    #[serde(default = "default_lane_class")]
+    pub lane_class: String,
+    /// Write-time TTL tier the policy put on this request's markers:
+    /// "5m" | "1h". Empty when the policy is dark (the status-quo
+    /// 1h/5m literals went out instead — no single tier to report).
+    #[serde(default)]
+    pub ttl_tier: String,
+    /// DEAD only: the faithful-projection size target (tokens). None
+    /// when WARM or policy dark.
+    #[serde(default)]
+    pub compact_target: Option<u64>,
 }
 
 fn default_ttl_decision() -> String {
@@ -153,6 +168,10 @@ fn default_ttl_decision() -> String {
 
 fn default_cadence_source() -> String {
     "default".to_string()
+}
+
+fn default_lane_class() -> String {
+    "off".to_string()
 }
 
 /// Outcome of [`apply_rewrite`].
@@ -190,6 +209,17 @@ pub fn apply_rewrite_with_ttl(
     config: &RewriteConfig,
     forecast: Option<&crate::ttl_forecast::ForecastResult>,
 ) -> RewriteOutcome {
+    apply_rewrite_full(req, config, forecast, None)
+}
+
+/// Like [`apply_rewrite_with_ttl`] but also records the →2032 active
+/// write-policy decision in telemetry.
+pub fn apply_rewrite_full(
+    req: &mut Value,
+    config: &RewriteConfig,
+    forecast: Option<&crate::ttl_forecast::ForecastResult>,
+    policy: Option<&crate::write_policy::PolicyDecision>,
+) -> RewriteOutcome {
     if !config.enabled {
         return RewriteOutcome::Disabled;
     }
@@ -211,7 +241,7 @@ pub fn apply_rewrite_with_ttl(
 
     // Best-effort telemetry. If the log write fails (e.g. read-only fs)
     // we still report success — the rewrite already mutated the body.
-    if let Err(e) = emit_telemetry_with_ttl(&report, config, forecast) {
+    if let Err(e) = emit_telemetry_full(&report, config, forecast, policy) {
         eprintln!(
             "[ostk-cache rewrite] telemetry write failed (continuing): {}",
             e
@@ -235,7 +265,18 @@ pub fn emit_telemetry_with_ttl(
     config: &RewriteConfig,
     forecast: Option<&crate::ttl_forecast::ForecastResult>,
 ) -> std::io::Result<()> {
-    let row = build_event_row_with_ttl(report, &config.session_id, forecast);
+    emit_telemetry_full(report, config, forecast, None)
+}
+
+/// Like [`emit_telemetry_with_ttl`] but also records the →2032 active
+/// write-policy decision.
+pub fn emit_telemetry_full(
+    report: &RewriteReport,
+    config: &RewriteConfig,
+    forecast: Option<&crate::ttl_forecast::ForecastResult>,
+    policy: Option<&crate::write_policy::PolicyDecision>,
+) -> std::io::Result<()> {
+    let row = build_event_row_full(report, &config.session_id, forecast, policy);
     let path = config.ostk_dir.join(REWRITE_EVENTS_FILENAME);
     write_event_row(&path, &row)
 }
@@ -254,6 +295,17 @@ pub fn build_event_row_with_ttl(
     session: &str,
     forecast: Option<&crate::ttl_forecast::ForecastResult>,
 ) -> RewriteEventRow {
+    build_event_row_full(report, session, forecast, None)
+}
+
+/// Build a [`RewriteEventRow`] including the →2030(a) forecast AND the
+/// →2032 active write-policy fields.
+pub fn build_event_row_full(
+    report: &RewriteReport,
+    session: &str,
+    forecast: Option<&crate::ttl_forecast::ForecastResult>,
+    policy: Option<&crate::write_policy::PolicyDecision>,
+) -> RewriteEventRow {
     let tokens_saved_estimate = report.bytes_in.saturating_sub(report.bytes_out) / 4;
 
     let (ttl_decision, observed_gap_s, cadence_source) = match forecast {
@@ -263,6 +315,15 @@ pub fn build_event_row_with_ttl(
             f.source.as_str().to_string(),
         ),
         None => ("keep1h".to_string(), None, "default".to_string()),
+    };
+
+    let (lane_class, ttl_tier, compact_target) = match policy {
+        Some(d) => (
+            d.class.as_str().to_string(),
+            d.tier.wire_str().to_string(),
+            d.compact_target,
+        ),
+        None => (default_lane_class(), String::new(), None),
     };
 
     RewriteEventRow {
@@ -280,6 +341,9 @@ pub fn build_event_row_with_ttl(
         ttl_decision,
         observed_gap_s,
         cadence_source,
+        lane_class,
+        ttl_tier,
+        compact_target,
     }
 }
 

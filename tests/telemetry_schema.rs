@@ -10,7 +10,8 @@
 //! * Multiple writes append (don't overwrite).
 
 use ostk_cache::rewrite_middleware::{
-    RewriteConfig, RewriteEventRow, build_event_row, emit_telemetry, iso8601_utc_from_secs,
+    RewriteConfig, RewriteEventRow, build_event_row, build_event_row_full, emit_telemetry,
+    iso8601_utc_from_secs,
 };
 use ostk_files_light::{RewriteOptions, RewriteReport};
 
@@ -76,12 +77,49 @@ fn one_row_parses_as_documented_schema() {
         "skipped_below_threshold",
         "errors",
         "tokens_saved_estimate",
+        // →2032 write-policy fields (always serialized; defaults = dark).
+        "lane_class",
+        "ttl_tier",
+        "compact_target",
     ] {
         assert!(
             obj.contains_key(key),
             "schema field missing from row: {key}"
         );
     }
+}
+
+// →2032: policy telemetry fields — dark defaults, decision round-trip,
+// and back-compat parse of pre-feature rows.
+#[test]
+fn policy_fields_dark_defaults_and_roundtrip() {
+    // Dark path: no policy decision → "off"/""/None.
+    let row = build_event_row(&fixture_report(0, 0, 0), "s");
+    assert_eq!(row.lane_class, "off");
+    assert_eq!(row.ttl_tier, "");
+    assert_eq!(row.compact_target, None);
+
+    // Active path: a DEAD decision carries class/tier/target.
+    let mut lane = ostk_cache::write_policy::LaneState::default();
+    let params = ostk_cache::write_policy::WritePolicyParams::default();
+    let decision = ostk_cache::write_policy::decide(&mut lane, 1_000_000, 180_000, &params);
+    let row = build_event_row_full(&fixture_report(1, 100, 4), "s", None, Some(&decision));
+    assert_eq!(row.lane_class, decision.class.as_str());
+    assert_eq!(row.ttl_tier, decision.tier.wire_str());
+    assert_eq!(row.compact_target, decision.compact_target);
+
+    // Round-trip through JSON preserves the fields.
+    let json = serde_json::to_string(&row).unwrap();
+    let parsed: RewriteEventRow = serde_json::from_str(&json).unwrap();
+    assert_eq!(parsed, row);
+
+    // Back-compat: a pre-→2032 row (no policy fields) parses with the
+    // dark defaults.
+    let legacy = r#"{"ts":"2026-05-06T12:34:56Z","session":"s","rewrites_applied":1,"bytes_in":100,"bytes_out":4,"hits":1,"misses":0,"skipped_stale":0,"skipped_below_threshold":0,"errors":0,"tokens_saved_estimate":24}"#;
+    let parsed: RewriteEventRow = serde_json::from_str(legacy).unwrap();
+    assert_eq!(parsed.lane_class, "off");
+    assert_eq!(parsed.ttl_tier, "");
+    assert_eq!(parsed.compact_target, None);
 }
 
 #[test]

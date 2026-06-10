@@ -788,10 +788,11 @@ async fn handle_anthropic_message(
 
             // Pass 2: file-handle rewrite.
             let rewrite_config = RewriteConfig::from_resolved(&config, session_id.clone());
-            match ostk_cache::rewrite_middleware::apply_rewrite_with_ttl(
+            match ostk_cache::rewrite_middleware::apply_rewrite_full(
                 &mut value,
                 &rewrite_config,
                 Some(&ttl_forecast_result),
+                policy_decision.as_ref(),
             ) {
                 RewriteOutcome::Applied(report) => {
                     if report.rewrites_applied > 0 {
