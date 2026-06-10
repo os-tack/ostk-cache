@@ -310,6 +310,8 @@ impl Default for RotationState {
     }
 }
 
+// Process-wide: correct while the production proxy has exactly one capture root; a second
+// in-process root would alias this state (tests avoid it via local RotationState instances).
 static GLOBAL_ROTATION: RotationState = RotationState::new();
 
 /// Count total capture entries (across shards) under `root` and delete
