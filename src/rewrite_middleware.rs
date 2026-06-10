@@ -130,6 +130,27 @@ pub struct RewriteEventRow {
     /// Saturates at 0 if `bytes_out > bytes_in` (theoretically
     /// impossible but defended against).
     pub tokens_saved_estimate: u64,
+    // →2030(a) TTL forecast telemetry fields. Added with serde defaults so
+    // old rows (missing these fields) still parse — they get the default
+    // "keep5m"/"default"/None values which match pre-feature behavior.
+    /// TTL forecast decision: "keep5m" | "promote1h" | "die_cold".
+    #[serde(default = "default_ttl_decision")]
+    pub ttl_decision: String,
+    /// Median observed inter-request gap in seconds; None when the
+    /// decision came from an identity hint or the default path.
+    #[serde(default)]
+    pub observed_gap_s: Option<u64>,
+    /// Source of the cadence classification: "observed" | "identity_hint" | "default".
+    #[serde(default = "default_cadence_source")]
+    pub cadence_source: String,
+}
+
+fn default_ttl_decision() -> String {
+    "keep5m".to_string()
+}
+
+fn default_cadence_source() -> String {
+    "default".to_string()
 }
 
 /// Outcome of [`apply_rewrite`].
@@ -158,6 +179,15 @@ pub enum RewriteOutcome {
 /// here because that would hide programmer errors during dev; the
 /// rewriter's contract is "no panics."
 pub fn apply_rewrite(req: &mut Value, config: &RewriteConfig) -> RewriteOutcome {
+    apply_rewrite_with_ttl(req, config, None)
+}
+
+/// Like [`apply_rewrite`] but also records the →2030(a) TTL forecast in telemetry.
+pub fn apply_rewrite_with_ttl(
+    req: &mut Value,
+    config: &RewriteConfig,
+    forecast: Option<&crate::ttl_forecast::ForecastResult>,
+) -> RewriteOutcome {
     if !config.enabled {
         return RewriteOutcome::Disabled;
     }
@@ -179,7 +209,7 @@ pub fn apply_rewrite(req: &mut Value, config: &RewriteConfig) -> RewriteOutcome 
 
     // Best-effort telemetry. If the log write fails (e.g. read-only fs)
     // we still report success — the rewrite already mutated the body.
-    if let Err(e) = emit_telemetry(&report, config) {
+    if let Err(e) = emit_telemetry_with_ttl(&report, config, forecast) {
         eprintln!(
             "[ostk-cache rewrite] telemetry write failed (continuing): {}",
             e
@@ -193,11 +223,17 @@ pub fn apply_rewrite(req: &mut Value, config: &RewriteConfig) -> RewriteOutcome 
 ///
 /// Public so tests can call it directly without going through
 /// `apply_rewrite`.
-pub fn emit_telemetry(
+pub fn emit_telemetry(report: &RewriteReport, config: &RewriteConfig) -> std::io::Result<()> {
+    emit_telemetry_with_ttl(report, config, None)
+}
+
+/// Like [`emit_telemetry`] but also records the →2030(a) TTL forecast.
+pub fn emit_telemetry_with_ttl(
     report: &RewriteReport,
     config: &RewriteConfig,
+    forecast: Option<&crate::ttl_forecast::ForecastResult>,
 ) -> std::io::Result<()> {
-    let row = build_event_row(report, &config.session_id);
+    let row = build_event_row_with_ttl(report, &config.session_id, forecast);
     let path = config.ostk_dir.join(REWRITE_EVENTS_FILENAME);
     write_event_row(&path, &row)
 }
@@ -207,10 +243,25 @@ pub fn emit_telemetry(
 /// Public so tests can verify the schema deterministically without
 /// touching disk.
 pub fn build_event_row(report: &RewriteReport, session: &str) -> RewriteEventRow {
-    let tokens_saved_estimate = report
-        .bytes_in
-        .saturating_sub(report.bytes_out)
-        / 4;
+    build_event_row_with_ttl(report, session, None)
+}
+
+/// Build a [`RewriteEventRow`] including →2030(a) TTL forecast fields.
+pub fn build_event_row_with_ttl(
+    report: &RewriteReport,
+    session: &str,
+    forecast: Option<&crate::ttl_forecast::ForecastResult>,
+) -> RewriteEventRow {
+    let tokens_saved_estimate = report.bytes_in.saturating_sub(report.bytes_out) / 4;
+
+    let (ttl_decision, observed_gap_s, cadence_source) = match forecast {
+        Some(f) => (
+            f.forecast.as_str().to_string(),
+            f.observed_gap_s,
+            f.source.as_str().to_string(),
+        ),
+        None => ("keep5m".to_string(), None, "default".to_string()),
+    };
 
     RewriteEventRow {
         ts: iso8601_utc_now(),
@@ -224,6 +275,9 @@ pub fn build_event_row(report: &RewriteReport, session: &str) -> RewriteEventRow
         skipped_below_threshold: report.skipped_below_threshold,
         errors: report.errors,
         tokens_saved_estimate,
+        ttl_decision,
+        observed_gap_s,
+        cadence_source,
     }
 }
 
@@ -238,13 +292,9 @@ fn write_event_row(path: &Path, row: &RewriteEventRow) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    let mut line = serde_json::to_string(row).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-    })?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut line = serde_json::to_string(row)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     line.push('\n');
     file.write_all(line.as_bytes())
 }

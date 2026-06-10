@@ -11,11 +11,12 @@ use clap::Parser;
 use dashmap::DashMap;
 use ostk_cache::config::{CliArgs, Config, Mode};
 use ostk_cache::rebuild::{RebuildConfig, RebuildOutcome, apply_rebuild};
-use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome, apply_rewrite};
+use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome};
+use ostk_cache::ttl_forecast::{IdentityHintCache, SeatCadence, forecast_ttl};
 use ostk_cache::{
     AccountInput, AnthropicRequest, DaemonAdapter, HookAdapter, HookEvent, HookEventKind,
-    InMemoryPageTable, ProviderUsage, SessionId, SizeMetrics, account, fmt_bytes,
-    persist_amp_row, project_hud,
+    InMemoryPageTable, ProviderUsage, SessionId, SizeMetrics, account, fmt_bytes, persist_amp_row,
+    project_hud,
 };
 use ostk_cache_core::{
     http::{is_hop_by_hop_request_header, is_sse_content_type, should_forward_response_header},
@@ -36,11 +37,15 @@ struct AmpAccumulator {
 }
 
 type AmpStore = Arc<DashMap<SessionId, AmpAccumulator>>;
+/// Per-session cadence state for →2030(a) TTL forecast.
+type CadenceStore = Arc<DashMap<SessionId, SeatCadence>>;
 type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 
 #[derive(Clone)]
 struct AppState {
     amp_store: AmpStore,
+    cadence_store: CadenceStore,
+    hint_cache: Arc<IdentityHintCache>,
     hook_adapter: HookAdapterHandle,
     config: Arc<Config>,
 }
@@ -73,11 +78,16 @@ async fn main() {
     );
     println!("{}", config.banner());
     if let Some(path) = &config.config_path {
-        println!("  config: {} (use --print-config for full resolution)", path.display());
+        println!(
+            "  config: {} (use --print-config for full resolution)",
+            path.display()
+        );
     }
 
     let state = AppState {
         amp_store: Arc::new(DashMap::new()),
+        cadence_store: Arc::new(DashMap::new()),
+        hint_cache: Arc::new(IdentityHintCache::new()),
         hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
         config: Arc::new(config),
     };
@@ -86,8 +96,7 @@ async fn main() {
     // the fleet's REAL transport wall (413 pre-handler, pre-capture,
     // invisible to every log surface). The proxy must always see the
     // body; the X2 overflow guard below decides what to do with it.
-    let body_limit_bytes = (state.config.body_limit_mb.value as usize)
-        .saturating_mul(1024 * 1024);
+    let body_limit_bytes = (state.config.body_limit_mb.value as usize).saturating_mul(1024 * 1024);
     let app = Router::new()
         .route("/v1/messages", post(handle_anthropic_message))
         .route("/v1/responses", post(handle_openai_response))
@@ -260,6 +269,31 @@ async fn handle_anthropic_message(
             .unwrap_or_default()
     };
 
+    // →2030(a) TTL forecast: compute once per request, before breakpoint
+    // emission. Uses per-session cadence state (same lifecycle as amp_store).
+    let ttl_forecast_result = {
+        let cadence_store = state.cadence_store.clone();
+        let hint_cache = state.hint_cache.clone();
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ostk_dir_opt = config.ostk_dir.value.clone();
+        let mut cadence = cadence_store
+            .get(&session_id)
+            .map(|r| r.clone())
+            .unwrap_or_default();
+        let result = forecast_ttl(
+            &session_id,
+            now_secs,
+            &mut cadence,
+            Some(&hint_cache),
+            ostk_dir_opt.as_deref(),
+        );
+        cadence_store.insert(session_id.clone(), cadence);
+        result
+    };
+
     let body_str = String::from_utf8_lossy(&body_bytes);
     let mut firmware_len = 0;
     let mut state_len = 0;
@@ -327,14 +361,12 @@ async fn handle_anthropic_message(
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let opts = ostk_cache::kernel_client::ProjectionOpts {
             socket: config.kernel_socket.value.clone(),
-            timeout: Some(std::time::Duration::from_millis(config.kernel_timeout_ms.value)),
+            timeout: Some(std::time::Duration::from_millis(
+                config.kernel_timeout_ms.value,
+            )),
         };
-        if let Some(projection) = ostk_cache::kernel_client::fetch_projection_with(
-            &cwd,
-            "ostk-cache",
-            opts,
-        )
-        .await
+        if let Some(projection) =
+            ostk_cache::kernel_client::fetch_projection_with(&cwd, "ostk-cache", opts).await
         {
             rebuild_config.live_envelope_override = Some(projection.envelope);
             if config.verbose.value {
@@ -364,11 +396,8 @@ async fn handle_anthropic_message(
                     ostk_cache::kernel_client::fetch_templates(&cwd, history_lines, templates_opts)
                         .await
                 {
-                    let cluster_sum: usize = kt
-                        .templates
-                        .iter()
-                        .map(|t| t.source_indices.len())
-                        .sum();
+                    let cluster_sum: usize =
+                        kt.templates.iter().map(|t| t.source_indices.len()).sum();
                     let biggest = kt
                         .templates
                         .iter()
@@ -417,10 +446,9 @@ async fn handle_anthropic_message(
             std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let recent =
             ostk_cache::cycle_digest::read_recent_for_session(&cwd_for_digests, &session_id, 5);
-        let mut section = ostk_cache::cycle_digest::render_recent_section(&recent)
-            .unwrap_or_default();
-        let peers =
-            ostk_cache::cycle_digest::read_recent_peers(&cwd_for_digests, &session_id, 3);
+        let mut section =
+            ostk_cache::cycle_digest::render_recent_section(&recent).unwrap_or_default();
+        let peers = ostk_cache::cycle_digest::read_recent_peers(&cwd_for_digests, &session_id, 3);
         if let Some(peer_section) = ostk_cache::cycle_digest::render_peer_section(&peers) {
             section.push_str(&peer_section);
         }
@@ -473,10 +501,8 @@ async fn handle_anthropic_message(
                 // truncate at a word boundary with a roomier per-msg
                 // budget. The K-tail cap is applied inside the rebuild
                 // when this override is honored.
-                let user_msgs = ostk_cache::transcript_tail::read_recent_user_messages(
-                    &session_path,
-                    1000,
-                );
+                let user_msgs =
+                    ostk_cache::transcript_tail::read_recent_user_messages(&session_path, 1000);
                 if !user_msgs.is_empty() {
                     if config.verbose.value {
                         println!(
@@ -513,222 +539,223 @@ async fn handle_anthropic_message(
     // for downstream code. Breaking the proxy is far worse than missing
     // a rewrite opportunity.
     // ----------------------------------------------------------------
-    let rewritten_body_str: std::borrow::Cow<'_, str> =
-        match serde_json::from_str::<serde_json::Value>(&body_str) {
-            Ok(mut value) => {
-                let mut mutated = false;
+    let rewritten_body_str: std::borrow::Cow<'_, str> = match serde_json::from_str::<
+        serde_json::Value,
+    >(&body_str)
+    {
+        Ok(mut value) => {
+            let mut mutated = false;
 
-                // Pass A: strip Claude Code's volatile per-turn
-                // `cch=<hex>;` billing token from every string in the
-                // request body (→1856 P1.B diagnostic + Issue #40652
-                // full fix). The token lives INSIDE cache_control:1h
-                // ephemeral on system AND can be embedded in
-                // historical tool_result content the CLI rewrites
-                // every turn. Recursive walk covers both. Unconditional
-                // — applies to every mode. See src/billing_strip.rs
-                // for the full narrative.
-                let cch_stripped =
-                    ostk_cache::billing_strip::strip_volatile_billing_tokens(&mut value);
-                if cch_stripped > 0 {
-                    if config.verbose.value {
-                        println!(
-                            "[proxy] cch-strip: removed {} volatile billing token(s) from request body",
-                            cch_stripped
-                        );
-                    }
-                    mutated = true;
-                }
-
-                // Pass A.5: strip <system-reminder>...</system-reminder>
-                // blocks from past user turns. Anthropic/Claude Code
-                // inject these out-of-band into user messages; they
-                // accumulate in conversation history and bill against
-                // input tokens every turn. The current user turn is
-                // preserved (a load-bearing reminder may need to be
-                // acted on this turn). See src/system_reminder_strip.rs
-                // for the full narrative. Unconditional — applies to
-                // every mode.
-                let sr_stats =
-                    ostk_cache::system_reminder_strip::strip_system_reminders_from_past_turns(
-                        &mut value,
+            // Pass A: strip Claude Code's volatile per-turn
+            // `cch=<hex>;` billing token from every string in the
+            // request body (→1856 P1.B diagnostic + Issue #40652
+            // full fix). The token lives INSIDE cache_control:1h
+            // ephemeral on system AND can be embedded in
+            // historical tool_result content the CLI rewrites
+            // every turn. Recursive walk covers both. Unconditional
+            // — applies to every mode. See src/billing_strip.rs
+            // for the full narrative.
+            let cch_stripped = ostk_cache::billing_strip::strip_volatile_billing_tokens(&mut value);
+            if cch_stripped > 0 {
+                if config.verbose.value {
+                    println!(
+                        "[proxy] cch-strip: removed {} volatile billing token(s) from request body",
+                        cch_stripped
                     );
-                if !sr_stats.is_empty() {
-                    if config.verbose.value {
-                        println!(
-                            "[proxy] sr-strip: removed {} past-turn system-reminder block(s), ~{} bytes (~{} tokens); pruned {} empty text block(s), inserted {} placeholder(s)",
-                            sr_stats.blocks_removed,
-                            sr_stats.bytes_removed,
-                            sr_stats.tokens_estimate(),
-                            sr_stats.empty_blocks_pruned,
-                            sr_stats.placeholders_inserted
-                        );
-                    }
-                    mutated = true;
                 }
+                mutated = true;
+            }
 
-                // Pass 0: kernel orientation in system tier (→1830).
-                // Append the firmware-class discipline preamble to
-                // req.system with cache_control:1h so it cache-hits on
-                // every turn after the first. Idempotent — repeated
-                // requests do not double-append.
-                if rebuild_config.enabled
-                    && ostk_cache::rebuild::append_kernel_orientation_to_system(&mut value)
-                {
-                    if config.verbose.value {
-                        println!(
-                            "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl=1h)"
-                        );
-                    }
-                    mutated = true;
+            // Pass A.5: strip <system-reminder>...</system-reminder>
+            // blocks from past user turns. Anthropic/Claude Code
+            // inject these out-of-band into user messages; they
+            // accumulate in conversation history and bill against
+            // input tokens every turn. The current user turn is
+            // preserved (a load-bearing reminder may need to be
+            // acted on this turn). See src/system_reminder_strip.rs
+            // for the full narrative. Unconditional — applies to
+            // every mode.
+            let sr_stats =
+                ostk_cache::system_reminder_strip::strip_system_reminders_from_past_turns(
+                    &mut value,
+                );
+            if !sr_stats.is_empty() {
+                if config.verbose.value {
+                    println!(
+                        "[proxy] sr-strip: removed {} past-turn system-reminder block(s), ~{} bytes (~{} tokens); pruned {} empty text block(s), inserted {} placeholder(s)",
+                        sr_stats.blocks_removed,
+                        sr_stats.bytes_removed,
+                        sr_stats.tokens_estimate(),
+                        sr_stats.empty_blocks_pruned,
+                        sr_stats.placeholders_inserted
+                    );
                 }
+                mutated = true;
+            }
 
-                // Pass 1: rebuild (Layer 1 standalone or Layer 2
-                // federated — distinguished by rebuild_config.mode_tag
-                // and the optional live_envelope_override populated
-                // above when mode == "rebuild_kernel").
-                if rebuild_config.enabled {
-                    match apply_rebuild(&mut value, &rebuild_config) {
-                        RebuildOutcome::Applied(report) => {
-                            if config.verbose.value {
-                                println!(
-                                    "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}",
-                                    report.turns_dropped,
-                                    report.bytes_in,
-                                    report.bytes_out,
-                                    report.envelope_found,
-                                    report.native_tool_calls_summarized,
-                                    report.user_messages_summarized,
-                                );
-                            }
-                            rebuild_mode_tag = Some(rebuild_config.mode_tag.clone());
-                            rebuild_report_capture = Some(report.clone());
-                            mutated = true;
-                            // Standalone-mode bookkeeping: append the
-                            // activation to ~/.ostk-cache/state/<hash>/
-                            // journal.jsonl so the run is auditable.
-                            let cwd = std::env::current_dir()
-                                .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                            ostk_cache::standalone::log_activation(
-                                &cwd,
-                                &rebuild_config.mode_tag,
-                                &session_id,
+            // Pass 0: kernel orientation in system tier (→1830).
+            // Append the firmware-class discipline preamble to
+            // req.system with cache_control:1h so it cache-hits on
+            // every turn after the first. Idempotent — repeated
+            // requests do not double-append.
+            if rebuild_config.enabled
+                && ostk_cache::rebuild::append_kernel_orientation_to_system(&mut value)
+            {
+                if config.verbose.value {
+                    println!(
+                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl=1h)"
+                    );
+                }
+                mutated = true;
+            }
+
+            // Pass 1: rebuild (Layer 1 standalone or Layer 2
+            // federated — distinguished by rebuild_config.mode_tag
+            // and the optional live_envelope_override populated
+            // above when mode == "rebuild_kernel").
+            if rebuild_config.enabled {
+                match apply_rebuild(&mut value, &rebuild_config) {
+                    RebuildOutcome::Applied(report) => {
+                        if config.verbose.value {
+                            println!(
+                                "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}",
                                 report.turns_dropped,
+                                report.bytes_in,
+                                report.bytes_out,
+                                report.envelope_found,
+                                report.native_tool_calls_summarized,
+                                report.user_messages_summarized,
                             );
                         }
-                        RebuildOutcome::Skipped(reason) => {
-                            if config.verbose.value {
-                                eprintln!("[proxy] rebuild skipped: {}", reason);
-                            }
-                            // Even when rebuild skips, claude-code's
-                            // history can contain orphaned tool_result
-                            // blocks (interrupt artifacts). Strip them
-                            // defensively so Anthropic doesn't 400.
-                            if let Some(messages) =
-                                value.get_mut("messages").and_then(|m| m.as_array_mut())
-                            {
-                                let orphans =
-                                    ostk_cache::rebuild::repair_orphaned_tool_results(messages);
-                                if orphans > 0 {
-                                    if config.verbose.value {
-                                        eprintln!(
-                                            "[proxy] rebuild_skip: stripped {} orphaned tool_result blocks",
-                                            orphans
-                                        );
-                                    }
-                                    mutated = true;
+                        rebuild_mode_tag = Some(rebuild_config.mode_tag.clone());
+                        rebuild_report_capture = Some(report.clone());
+                        mutated = true;
+                        // Standalone-mode bookkeeping: append the
+                        // activation to ~/.ostk-cache/state/<hash>/
+                        // journal.jsonl so the run is auditable.
+                        let cwd = std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+                        ostk_cache::standalone::log_activation(
+                            &cwd,
+                            &rebuild_config.mode_tag,
+                            &session_id,
+                            report.turns_dropped,
+                        );
+                    }
+                    RebuildOutcome::Skipped(reason) => {
+                        if config.verbose.value {
+                            eprintln!("[proxy] rebuild skipped: {}", reason);
+                        }
+                        // Even when rebuild skips, claude-code's
+                        // history can contain orphaned tool_result
+                        // blocks (interrupt artifacts). Strip them
+                        // defensively so Anthropic doesn't 400.
+                        if let Some(messages) =
+                            value.get_mut("messages").and_then(|m| m.as_array_mut())
+                        {
+                            let orphans =
+                                ostk_cache::rebuild::repair_orphaned_tool_results(messages);
+                            if orphans > 0 {
+                                if config.verbose.value {
+                                    eprintln!(
+                                        "[proxy] rebuild_skip: stripped {} orphaned tool_result blocks",
+                                        orphans
+                                    );
                                 }
+                                mutated = true;
                             }
                         }
-                        RebuildOutcome::Disabled => {}
                     }
+                    RebuildOutcome::Disabled => {}
                 }
+            }
 
-                // Pass 2: file-handle rewrite.
-                let rewrite_config = RewriteConfig::from_resolved(&config, session_id.clone());
-                match apply_rewrite(&mut value, &rewrite_config) {
-                    RewriteOutcome::Applied(report) => {
-                        if report.rewrites_applied > 0 {
-                            if config.verbose.value {
-                                println!(
-                                    "[proxy] rewrite: applied={} bytes_in={} bytes_out={} hits={} misses={}",
-                                    report.rewrites_applied,
-                                    report.bytes_in,
-                                    report.bytes_out,
-                                    report.hits,
-                                    report.misses,
-                                );
-                            }
-                            rewrite_stats_capture = Some((
+            // Pass 2: file-handle rewrite.
+            let rewrite_config = RewriteConfig::from_resolved(&config, session_id.clone());
+            match ostk_cache::rewrite_middleware::apply_rewrite_with_ttl(
+                &mut value,
+                &rewrite_config,
+                Some(&ttl_forecast_result),
+            ) {
+                RewriteOutcome::Applied(report) => {
+                    if report.rewrites_applied > 0 {
+                        if config.verbose.value {
+                            println!(
+                                "[proxy] rewrite: applied={} bytes_in={} bytes_out={} hits={} misses={}",
                                 report.rewrites_applied,
                                 report.bytes_in,
                                 report.bytes_out,
-                            ));
-                            mutated = true;
+                                report.hits,
+                                report.misses,
+                            );
                         }
-                    }
-                    RewriteOutcome::Disabled => {}
-                    RewriteOutcome::CacheLoadFailed(err) => {
-                        eprintln!(
-                            "[proxy] rewrite cache load failed (forwarding original): {}",
-                            err
-                        );
-                    }
-                }
-
-                // Pass 3: soft-cap enforcement. Runs only if a positive
-                // cap is configured and the post-rewrite serialized body
-                // exceeds it. Tiers A→C trim the request; Tier D leaves
-                // the body untouched and signals irreducible so we 413
-                // below.
-                let soft_cap_bytes =
-                    config.soft_cap_mb.value.saturating_mul(1024 * 1024);
-                let reduction = ostk_cache::rebuild::enforce_soft_cap(&mut value, soft_cap_bytes);
-                if reduction.applied_any() {
-                    if config.verbose.value {
-                        println!(
-                            "[proxy] soft-cap: {}→{} tier_a={}({}) tier_b={} tier_c={} irreducible={}",
-                            fmt_bytes(reduction.bytes_before),
-                            fmt_bytes(reduction.bytes_after),
-                            reduction.tier_a_ejected,
-                            fmt_bytes(reduction.tier_a_bytes_recovered),
-                            reduction.tier_b_pairs_pruned,
-                            reduction.tier_c_tools_dropped,
-                            reduction.irreducible,
-                        );
-                    }
-                    reduction_report_capture = Some(reduction.clone());
-                    if reduction.tier_a_ejected > 0
-                        || reduction.tier_b_pairs_pruned > 0
-                        || reduction.tier_c_tools_dropped > 0
-                    {
+                        rewrite_stats_capture =
+                            Some((report.rewrites_applied, report.bytes_in, report.bytes_out));
                         mutated = true;
                     }
                 }
-                let must_413 = reduction.irreducible;
-
-                // Capture post-rewrite + post-reduction section sizes
-                // for telemetry. synthetic_present iff rebuild::Applied
-                // this turn.
-                section_sizes_capture = Some(ostk_cache::rebuild::section_sizes(
-                    &value,
-                    rebuild_report_capture.is_some(),
-                ));
-
-                // Diagnostic: per-content-type breakdown of the final
-                // wire body (text / tool_use / tool_result / images).
-                // SectionSizes tells you WHERE bytes live structurally;
-                // this tells you WHAT they are. Verbose-only — pure
-                // observability.
-                if config.verbose.value {
-                    let bd = ostk_cache::body_breakdown::measure_body(&value);
-                    println!("[proxy] body: {}", bd.summarize());
+                RewriteOutcome::Disabled => {}
+                RewriteOutcome::CacheLoadFailed(err) => {
+                    eprintln!(
+                        "[proxy] rewrite cache load failed (forwarding original): {}",
+                        err
+                    );
                 }
+            }
 
-                if must_413 {
-                    let (dominant_name, dominant_bytes) = section_sizes_capture
-                        .map(|s| s.dominant())
-                        .unwrap_or(("?", 0));
-                    let body = serde_json::json!({
+            // Pass 3: soft-cap enforcement. Runs only if a positive
+            // cap is configured and the post-rewrite serialized body
+            // exceeds it. Tiers A→C trim the request; Tier D leaves
+            // the body untouched and signals irreducible so we 413
+            // below.
+            let soft_cap_bytes = config.soft_cap_mb.value.saturating_mul(1024 * 1024);
+            let reduction = ostk_cache::rebuild::enforce_soft_cap(&mut value, soft_cap_bytes);
+            if reduction.applied_any() {
+                if config.verbose.value {
+                    println!(
+                        "[proxy] soft-cap: {}→{} tier_a={}({}) tier_b={} tier_c={} irreducible={}",
+                        fmt_bytes(reduction.bytes_before),
+                        fmt_bytes(reduction.bytes_after),
+                        reduction.tier_a_ejected,
+                        fmt_bytes(reduction.tier_a_bytes_recovered),
+                        reduction.tier_b_pairs_pruned,
+                        reduction.tier_c_tools_dropped,
+                        reduction.irreducible,
+                    );
+                }
+                reduction_report_capture = Some(reduction.clone());
+                if reduction.tier_a_ejected > 0
+                    || reduction.tier_b_pairs_pruned > 0
+                    || reduction.tier_c_tools_dropped > 0
+                {
+                    mutated = true;
+                }
+            }
+            let must_413 = reduction.irreducible;
+
+            // Capture post-rewrite + post-reduction section sizes
+            // for telemetry. synthetic_present iff rebuild::Applied
+            // this turn.
+            section_sizes_capture = Some(ostk_cache::rebuild::section_sizes(
+                &value,
+                rebuild_report_capture.is_some(),
+            ));
+
+            // Diagnostic: per-content-type breakdown of the final
+            // wire body (text / tool_use / tool_result / images).
+            // SectionSizes tells you WHERE bytes live structurally;
+            // this tells you WHAT they are. Verbose-only — pure
+            // observability.
+            if config.verbose.value {
+                let bd = ostk_cache::body_breakdown::measure_body(&value);
+                println!("[proxy] body: {}", bd.summarize());
+            }
+
+            if must_413 {
+                let (dominant_name, dominant_bytes) = section_sizes_capture
+                    .map(|s| s.dominant())
+                    .unwrap_or(("?", 0));
+                let body = serde_json::json!({
                         "type": "error",
                         "error": {
                             "type": "request_too_large",
@@ -750,39 +777,39 @@ async fn handle_anthropic_message(
                         },
                     })
                     .to_string();
-                    if let Some(capture) = http_capture.take() {
-                        capture.finish(
-                            StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
-                            false,
-                            &HeaderMap::new(),
-                            body.as_bytes(),
-                            turn_started.elapsed(),
-                        );
-                    }
-                    return Ok((StatusCode::PAYLOAD_TOO_LARGE, body).into_response());
+                if let Some(capture) = http_capture.take() {
+                    capture.finish(
+                        StatusCode::PAYLOAD_TOO_LARGE.as_u16(),
+                        false,
+                        &HeaderMap::new(),
+                        body.as_bytes(),
+                        turn_started.elapsed(),
+                    );
                 }
-
-                if mutated {
-                    match serde_json::to_string(&value) {
-                        Ok(s) => std::borrow::Cow::Owned(s),
-                        Err(e) => {
-                            eprintln!(
-                                "[proxy] rewrite reserialize failed (forwarding original): {}",
-                                e
-                            );
-                            std::borrow::Cow::Borrowed(body_str.as_ref())
-                        }
-                    }
-                } else {
-                    std::borrow::Cow::Borrowed(body_str.as_ref())
-                }
+                return Ok((StatusCode::PAYLOAD_TOO_LARGE, body).into_response());
             }
-            Err(_) => {
-                // Body is not valid JSON; the existing parse-failed path
-                // below will surface a 400. Don't pre-empt it here.
+
+            if mutated {
+                match serde_json::to_string(&value) {
+                    Ok(s) => std::borrow::Cow::Owned(s),
+                    Err(e) => {
+                        eprintln!(
+                            "[proxy] rewrite reserialize failed (forwarding original): {}",
+                            e
+                        );
+                        std::borrow::Cow::Borrowed(body_str.as_ref())
+                    }
+                }
+            } else {
                 std::borrow::Cow::Borrowed(body_str.as_ref())
             }
-        };
+        }
+        Err(_) => {
+            // Body is not valid JSON; the existing parse-failed path
+            // below will surface a 400. Don't pre-empt it here.
+            std::borrow::Cow::Borrowed(body_str.as_ref())
+        }
+    };
     let body_str = rewritten_body_str;
 
     // When rebuild is **enabled**, treat the request as effective
@@ -803,93 +830,103 @@ async fn handle_anthropic_message(
         // the same way they do in mutate mode (the caller benefits from
         // the structured 400 response). Accounting (usage parsing,
         // ledger persist, amp_store update) still runs downstream.
+        //
+        // →2030(a): the TTL forecast is telemetry-only — harness-set
+        // cache_control markers are never rewritten (condition-1 sizing
+        // measured ~0 addressable spend; see ttl_forecast module doc).
         match serde_json::from_str::<serde_json::Value>(&body_str) {
             Ok(_) => (body_str.to_string(), false),
             Err(_) => (body_str.to_string(), true),
         }
     } else {
         match serde_json::from_str::<AnthropicRequest>(&body_str) {
-        Ok(mut req) => {
-            let firmware: String = match &req.system {
-                Some(sys) if sys.is_string() => sys.as_str().unwrap().to_string(),
-                Some(sys) if sys.is_array() => sys
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            };
+            Ok(mut req) => {
+                let firmware: String = match &req.system {
+                    Some(sys) if sys.is_string() => sys.as_str().unwrap().to_string(),
+                    Some(sys) if sys.is_array() => sys
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
 
-            firmware_len = firmware.len();
+                firmware_len = firmware.len();
 
-            req.system = Some(json!([
-                {
-                    "type": "text",
-                    "text": firmware,
-                    "cache_control": {"type": "ephemeral", "ttl": "1h"}
-                }
-            ]));
-
-            if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
-                let has_tool_result = last_msg
-                    .content
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter().any(|b| {
-                            b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                        })
-                    })
-                    .unwrap_or(false);
-
-                if has_tool_result {
-                    state_len = serde_json::to_string(&last_msg.content)
-                        .unwrap_or_default()
-                        .len();
-                } else {
-                    let amp_for_hud = if prior_amp.turns_seen == 0 {
-                        1.0
-                    } else {
-                        prior_amp.cumulative_amp_mean
-                    };
-                    let hud = project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
-
-                    let mut new_content_array = Vec::new();
-
-                    new_content_array.push(json!({
+                req.system = Some(json!([
+                    {
                         "type": "text",
-                        "text": format!("{}\n", hud),
-                        "cache_control": {"type": "ephemeral", "ttl": "5m"}
-                    }));
+                        "text": firmware,
+                        "cache_control": {"type": "ephemeral", "ttl": "1h"}
+                    }
+                ]));
 
-                    if let Some(s) = last_msg.content.as_str() {
+                if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
+                    let has_tool_result = last_msg
+                        .content
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter().any(|b| {
+                                b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                            })
+                        })
+                        .unwrap_or(false);
+
+                    if has_tool_result {
+                        state_len = serde_json::to_string(&last_msg.content)
+                            .unwrap_or_default()
+                            .len();
+                    } else {
+                        let amp_for_hud = if prior_amp.turns_seen == 0 {
+                            1.0
+                        } else {
+                            prior_amp.cumulative_amp_mean
+                        };
+                        let hud =
+                            project_hud(amp_for_hud, prior_amp.stored_count, prior_amp.hot_count);
+
+                        let mut new_content_array = Vec::new();
+
                         new_content_array.push(json!({
                             "type": "text",
-                            "text": s
-                        }));
-                    } else if let Some(arr) = last_msg.content.as_array() {
-                        for item in arr {
-                            let mut block = item.clone();
-                            if let Some(obj) = block.as_object_mut() {
-                                obj.remove("cache_control");
+                            "text": format!("{}\n", hud),
+                            // →2030(a): telemetry-only forecast — the HUD
+                            // breakpoint stays at the status-quo 5m TTL.
+                            "cache_control": {
+                                "type": "ephemeral",
+                                "ttl": "5m"
                             }
-                            new_content_array.push(block);
-                        }
-                    }
+                        }));
 
-                    let final_json = json!(new_content_array);
-                    state_len = serde_json::to_string(&final_json).unwrap_or_default().len();
-                    last_msg.content = final_json;
+                        if let Some(s) = last_msg.content.as_str() {
+                            new_content_array.push(json!({
+                                "type": "text",
+                                "text": s
+                            }));
+                        } else if let Some(arr) = last_msg.content.as_array() {
+                            for item in arr {
+                                let mut block = item.clone();
+                                if let Some(obj) = block.as_object_mut() {
+                                    obj.remove("cache_control");
+                                }
+                                new_content_array.push(block);
+                            }
+                        }
+
+                        let final_json = json!(new_content_array);
+                        state_len = serde_json::to_string(&final_json).unwrap_or_default().len();
+                        last_msg.content = final_json;
+                    }
+                }
+
+                match serde_json::to_string(&req) {
+                    Ok(s) => (s, false),
+                    Err(_) => (body_str.to_string(), false),
                 }
             }
-
-            match serde_json::to_string(&req) {
-                Ok(s) => (s, false),
-                Err(_) => (body_str.to_string(), false),
-            }
-        }
-        Err(_) => (body_str.to_string(), true),
+            Err(_) => (body_str.to_string(), true),
         }
     };
 
@@ -958,10 +995,7 @@ async fn handle_anthropic_message(
             if let Some(id) = capture_id {
                 row = row.with_capture_id(id);
             }
-            ostk_cache::http_capture::log_upstream_error(
-                &config.capture_http_dir.value,
-                &row,
-            );
+            ostk_cache::http_capture::log_upstream_error(&config.capture_http_dir.value, &row);
             return Ok((StatusCode::BAD_GATEWAY, body).into_response());
         }
     };
@@ -975,9 +1009,7 @@ async fn handle_anthropic_message(
         if !should_forward_response_header(k) {
             continue;
         }
-        if k.as_str().eq_ignore_ascii_case("content-type")
-            && is_sse_content_type(v)
-        {
+        if k.as_str().eq_ignore_ascii_case("content-type") && is_sse_content_type(v) {
             is_sse = true;
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
@@ -1007,10 +1039,7 @@ async fn handle_anthropic_message(
     // disables. Accounting and capture stay on the ORIGINAL upstream
     // bytes (accounting must stay honest).
     let truth_est_tokens = if usage_truth_on {
-        ostk_cache::usage_truth::estimate_tokens(
-            req_bytes_in,
-            config.truth_bytes_per_token.value,
-        )
+        ostk_cache::usage_truth::estimate_tokens(req_bytes_in, config.truth_bytes_per_token.value)
     } else {
         0
     };
@@ -1225,7 +1254,11 @@ async fn handle_openai_response(
                 .unwrap_or("");
             let mut h = sha2::Sha256::new();
             h.update(auth.as_bytes());
-            format!("{}:{}", workspace.priority_hash, &format!("{:x}", h.finalize())[..12])
+            format!(
+                "{}:{}",
+                workspace.priority_hash,
+                &format!("{:x}", h.finalize())[..12]
+            )
         });
 
     let prior_amp = amp_store
@@ -1645,8 +1678,7 @@ fn short_session(s: &str) -> &str {
 ///      fresh every cycle, so historical copies clustered in the
 ///      templates section are pure echo, not signal.
 fn template_has_signal(template: &str) -> bool {
-    const ENVELOPE_PREFIXES: &[&str] =
-        &["[procs]", "[loadavg]", "[meminfo]", "[ctx]", "[files]"];
+    const ENVELOPE_PREFIXES: &[&str] = &["[procs]", "[loadavg]", "[meminfo]", "[ctx]", "[files]"];
     let trimmed = template.trim_start();
     if ENVELOPE_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
         return false;
@@ -1661,11 +1693,7 @@ fn template_has_signal(template: &str) -> bool {
     }
     let informative = tokens
         .iter()
-        .filter(|t| {
-            **t != "<*>"
-                && t.len() >= 2
-                && t.chars().any(|c| c.is_alphanumeric())
-        })
+        .filter(|t| **t != "<*>" && t.len() >= 2 && t.chars().any(|c| c.is_alphanumeric()))
         .count();
     informative >= 3
 }
@@ -1675,9 +1703,7 @@ fn template_has_signal(template: &str) -> bool {
 /// "Recent tool activity". Skips singleton clusters (no compression
 /// value), drops low-signal clusters via [`template_has_signal`], and
 /// caps the result at 12 entries.
-fn render_templates_section(
-    templates: &[ostk_cache::kernel_client::KernelTemplate],
-) -> String {
+fn render_templates_section(templates: &[ostk_cache::kernel_client::KernelTemplate]) -> String {
     let mut multi: Vec<&ostk_cache::kernel_client::KernelTemplate> = templates
         .iter()
         .filter(|t| t.source_indices.len() >= 2)
@@ -1696,11 +1722,7 @@ fn render_templates_section(
         multi.len()
     ));
     for t in multi {
-        out.push_str(&format!(
-            "- ×{} `{}`\n",
-            t.source_indices.len(),
-            t.template
-        ));
+        out.push_str(&format!("- ×{} `{}`\n", t.source_indices.len(), t.template));
     }
     out.push('\n');
     out
@@ -1809,7 +1831,10 @@ mod history_extract_tests {
             }]
         }"#;
         let lines = extract_history_text_lines(body, 100);
-        assert_eq!(lines, vec!["+ exit:0", "stdout line one", "stdout line two"]);
+        assert_eq!(
+            lines,
+            vec!["+ exit:0", "stdout line one", "stdout line two"]
+        );
     }
 
     #[test]
@@ -1844,8 +1869,12 @@ mod template_signal_tests {
         // ≥3 informative tokens, <50% wildcards, no envelope prefix.
         assert!(template_has_signal("test result: ok. all passed clean"));
         assert!(template_has_signal("alpha beta gamma <*> delta"));
-        assert!(template_has_signal("collect_text_lines_into helper called twice"));
-        assert!(template_has_signal("fn render_templates_section() returns String"));
+        assert!(template_has_signal(
+            "collect_text_lines_into helper called twice"
+        ));
+        assert!(template_has_signal(
+            "fn render_templates_section() returns String"
+        ));
     }
 
     #[test]
@@ -1858,7 +1887,9 @@ mod template_signal_tests {
         assert!(!template_has_signal(
             "[loadavg] needles: 0 open (0 P0) | fleet: 0/0 alive | nudges: 0"
         ));
-        assert!(!template_has_signal("[meminfo] ctx: 0% 0k/800k Buffers:0k <*>"));
+        assert!(!template_has_signal(
+            "[meminfo] ctx: 0% 0k/800k Buffers:0k <*>"
+        ));
         assert!(!template_has_signal(
             "[ctx] Δ4t:13m | audit:+114 | needles:3 | fleet:2/2 | nudge:0"
         ));
@@ -1895,13 +1926,13 @@ mod template_signal_tests {
     #[test]
     fn render_drops_singletons_and_noise_keeps_signal() {
         let templates = vec![
-            tpl("<*> }", 18),                                  // noise
-            tpl("<*> <*> <*> <*> <*> <*>", 6),                 // all wildcard
-            tpl("[procs] count:2 active:1 <*>", 6),            // envelope, drop
-            tpl("<*> | gen <*> | <*>", 20),                    // 60% wildcards
-            tpl("alone with three keywords", 1),               // singleton
-            tpl("alpha beta gamma delta", 3),                  // 4 inform → keep
-            tpl("test result: ok. all passed clean", 5),       // keep
+            tpl("<*> }", 18),                            // noise
+            tpl("<*> <*> <*> <*> <*> <*>", 6),           // all wildcard
+            tpl("[procs] count:2 active:1 <*>", 6),      // envelope, drop
+            tpl("<*> | gen <*> | <*>", 20),              // 60% wildcards
+            tpl("alone with three keywords", 1),         // singleton
+            tpl("alpha beta gamma delta", 3),            // 4 inform → keep
+            tpl("test result: ok. all passed clean", 5), // keep
         ];
         let out = render_templates_section(&templates);
         assert!(out.contains("alpha beta gamma delta"));
@@ -1915,11 +1946,7 @@ mod template_signal_tests {
 
     #[test]
     fn render_returns_empty_when_everything_is_noise() {
-        let templates = vec![
-            tpl("<*>", 9),
-            tpl("<*> }", 12),
-            tpl("<*> <*> <*> {", 8),
-        ];
+        let templates = vec![tpl("<*>", 9), tpl("<*> }", 12), tpl("<*> <*> <*> {", 8)];
         assert_eq!(render_templates_section(&templates), "");
     }
 }
@@ -2027,4 +2054,3 @@ fn emit_turn_line(
         }
     }
 }
-

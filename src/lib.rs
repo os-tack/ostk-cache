@@ -9,6 +9,7 @@ pub mod rewrite_middleware;
 pub mod standalone;
 pub mod system_reminder_strip;
 pub mod transcript_tail;
+pub mod ttl_forecast;
 pub mod usage_truth;
 
 pub use ostk_cache_core::usage::ProviderUsage;
@@ -72,10 +73,7 @@ pub fn maybe_rotate_hooks_jsonl(dir: &Path) -> std::io::Result<()> {
             let archive_path = dir.join(format!("hooks-{}.jsonl.gz", created));
             let mut input = std::fs::File::open(&log_path)?;
             let output = std::fs::File::create(&archive_path)?;
-            let mut encoder = flate2::write::GzEncoder::new(
-                output,
-                flate2::Compression::default(),
-            );
+            let mut encoder = flate2::write::GzEncoder::new(output, flate2::Compression::default());
             std::io::copy(&mut input, &mut encoder)?;
             encoder.finish()?;
             // Truncate (preserves inode for append-mode opens).
@@ -135,16 +133,17 @@ impl Workspace {
             .args(["config", "--get", "remote.origin.url"])
             .output();
         if let Ok(out) = output
-            && out.status.success() {
-                let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !raw.is_empty() {
-                    let normalized = normalize_git_url(&raw);
-                    return Ok(Workspace {
-                        priority_hash: sha256_hex(normalized.as_bytes()),
-                        source: WorkspaceSource::GitOrigin,
-                    });
-                }
+            && out.status.success()
+        {
+            let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !raw.is_empty() {
+                let normalized = normalize_git_url(&raw);
+                return Ok(Workspace {
+                    priority_hash: sha256_hex(normalized.as_bytes()),
+                    source: WorkspaceSource::GitOrigin,
+                });
             }
+        }
 
         let canonical = p.canonicalize()?;
         let s = canonical.to_string_lossy().into_owned();
@@ -358,9 +357,10 @@ pub async fn materialize(content: &[u8], _ws: &WorkspaceId) -> FileId {
         if let Ok(response) = res {
             if response.status().is_success() {
                 if let Ok(json) = response.json::<serde_json::Value>().await
-                    && let Some(id) = json.get("id").and_then(|v| v.as_str()) {
-                        return id.to_string();
-                    }
+                    && let Some(id) = json.get("id").and_then(|v| v.as_str())
+                {
+                    return id.to_string();
+                }
             } else {
                 eprintln!("[proxy] materialize failed: HTTP {}", response.status());
             }
@@ -657,10 +657,7 @@ impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
         {
             Ok(mut f) => {
                 if let Err(e) = writeln!(f, "{}", row) {
-                    eprintln!(
-                        "[DaemonAdapter] Failed to write hooks.jsonl: {}",
-                        e
-                    );
+                    eprintln!("[DaemonAdapter] Failed to write hooks.jsonl: {}", e);
                 }
             }
             Err(e) => {
@@ -680,17 +677,11 @@ impl<T: PageTable> HookAdapter for DaemonAdapter<T> {
                         "session_id": event.session_id,
                     });
                     if let Err(e) = writeln!(file, "{}", status) {
-                        eprintln!(
-                            "[DaemonAdapter] Failed to write manifest.json: {}",
-                            e
-                        );
+                        eprintln!("[DaemonAdapter] Failed to write manifest.json: {}", e);
                     }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[DaemonAdapter] Failed to create manifest.json: {}",
-                        e
-                    );
+                    eprintln!("[DaemonAdapter] Failed to create manifest.json: {}", e);
                 }
             }
         }
@@ -1065,8 +1056,8 @@ mod tests {
 
     fn read_hooks_jsonl(dir: &Path) -> Vec<serde_json::Value> {
         let path = dir.join(".l1.5").join("hooks.jsonl");
-        let contents = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {:?}: {}", path, e));
+        let contents =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {:?}: {}", path, e));
         contents
             .lines()
             .filter(|l| !l.is_empty())
