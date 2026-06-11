@@ -462,12 +462,14 @@ mod tests {
 
     #[test]
     fn find_socket_returns_none_when_absent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         assert!(find_socket(dir.path()).is_none());
     }
 
     #[test]
     fn find_socket_walks_up_to_parent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempdir().unwrap();
         let ostk_dir = root.path().join(".ostk");
         fs::create_dir(&ostk_dir).unwrap();
@@ -484,6 +486,7 @@ mod tests {
 
     #[test]
     fn find_socket_finds_in_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let ostk_dir = dir.path().join(".ostk");
         fs::create_dir(&ostk_dir).unwrap();
