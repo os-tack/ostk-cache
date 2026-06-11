@@ -156,7 +156,7 @@ For wire-body investigations, run with `--capture-http` to write one directory p
 
 ## GPT adapter
 
-Run `ostk-cache --provider gpt` and point OpenAI-compatible clients at `/v1/responses` through the proxy. The GPT adapter preserves the caller's request shape, adds `prompt_cache_key` when absent, and adds `prompt_cache_retention = "24h"` for `gpt-5.5` requests when absent. Usage accounting reads OpenAI `usage.input_tokens_details.cached_tokens` into the shared ledger so cache hit rate can be compared with Anthropic runs.
+Run `ostk-cache --provider gpt` and point OpenAI-compatible clients at `/v1/responses` through the proxy. The GPT adapter preserves the caller's request shape and adds `prompt_cache_key` when absent. `prompt_cache_retention` is wire-gated: added only when the upstream host is exactly `api.openai.com` (Platform wire); the ChatGPT oauth backend rejects the parameter with a named-field 400, so on that wire the adapter never injects it. Usage accounting reads OpenAI `usage.input_tokens_details.cached_tokens` into the shared ledger so cache hit rate can be compared with Anthropic runs (note: GPT `input_tokens` is cache-inclusive; Anthropic's is cache-exclusive).
 
 ## Soft cap
 
