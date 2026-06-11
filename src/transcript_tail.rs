@@ -762,3 +762,438 @@ mod tests {
         assert!(msgs[0].starts_with("alpha"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Codex rollout tail (C1, cross-provider lane)
+// ---------------------------------------------------------------------------
+//
+// Codex stores sessions GLOBALLY at
+// `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl` — unlike
+// Claude Code there is no per-project directory, and a foreign-project
+// codex may be writing concurrently. Identity is therefore the TUPLE
+// {rollout UUID, session_meta.cwd, seat alias, PPID chain} — NEVER
+// mtime alone (spec-gpt-cache-lane-20260612.md §5; protocol
+// contributed by the codex seat, adopted 2026-06-11). The file-level
+// elements this tail can verify:
+//
+// - `session_meta.cwd` (first line) must equal the workspace root —
+//   the load-bearing filter against the foreign codex.
+// - the UUID embedded in the filename must equal `session_meta.id` —
+//   rejects renamed/copied rollouts.
+//
+// Seat alias and PPID chain are process-runtime elements verified by
+// the kernel, not recoverable from the file; this module's contract is
+// the file-level pair. There is deliberately NO most-recent-any
+// fallback (locate_session_file's step 4): in a global sessions dir a
+// recency fallback IS the foreign-codex bug. No cwd match → None.
+//
+// Recency among legitimate matches is resolved by the rollout
+// filename's embedded timestamp (lexicographically sortable
+// YYYY-MM-DDTHH-MM-SS), not mtime.
+
+/// Default codex sessions root: `~/.codex/sessions`.
+pub fn default_codex_sessions_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".codex").join("sessions")
+}
+
+/// File-level identity of a codex rollout: the verifiable half of the
+/// §5 identity tuple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexRolloutIdentity {
+    /// `session_meta.payload.id`, cross-checked against the filename.
+    pub uuid: String,
+    /// `session_meta.payload.cwd` — the workspace this rollout belongs to.
+    pub cwd: String,
+}
+
+/// Parse and verify the file-level identity of a rollout.
+///
+/// Returns `None` unless ALL hold: first line parses, `type` is
+/// `session_meta`, payload carries `id` + `cwd`, and the filename's
+/// embedded UUID equals `payload.id`.
+pub fn codex_rollout_identity(path: &Path) -> Option<CodexRolloutIdentity> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+
+    #[derive(Deserialize)]
+    struct MetaProbe {
+        #[serde(rename = "type")]
+        type_: String,
+        payload: MetaPayload,
+    }
+    #[derive(Deserialize)]
+    struct MetaPayload {
+        id: String,
+        cwd: String,
+    }
+    let probe: MetaProbe = serde_json::from_str(&line).ok()?;
+    if probe.type_ != "session_meta" {
+        return None;
+    }
+    // Filename shape: rollout-<YYYY-MM-DDTHH-MM-SS>-<uuid>.jsonl — the
+    // UUID is the trailing 36 chars of the stem.
+    let stem = path.file_stem()?.to_str()?;
+    let fname_uuid = stem.get(stem.len().checked_sub(36)?..)?;
+    if fname_uuid != probe.payload.id {
+        return None;
+    }
+    Some(CodexRolloutIdentity {
+        uuid: probe.payload.id,
+        cwd: probe.payload.cwd,
+    })
+}
+
+/// Locate the most recent codex rollout belonging to `workspace_cwd`.
+///
+/// Walks `<sessions_dir>/YYYY/MM/DD/rollout-*.jsonl`, keeps only files
+/// whose verified identity (`codex_rollout_identity`) has
+/// `cwd == workspace_cwd`, and resolves recency by filename timestamp
+/// (descending). Returns `None` when nothing matches — never falls
+/// back to recency-without-identity.
+pub fn locate_codex_rollout(sessions_dir: &Path, workspace_cwd: &Path) -> Option<PathBuf> {
+    let workspace = workspace_cwd.to_string_lossy();
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let mut stack = vec![sessions_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                && codex_rollout_identity(&p).is_some_and(|id| id.cwd == workspace)
+            {
+                matches.push(p);
+            }
+        }
+    }
+    // Filename embeds a lexicographically sortable timestamp; latest
+    // session = greatest filename. Deterministic, mtime-free.
+    matches.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    matches.into_iter().next()
+}
+
+/// Read the last `limit` *mapped* events from a codex rollout, parsed
+/// into the same [`TailEvent`] vocabulary the Claude tail produces.
+///
+/// Mapping (event shapes pinned from live rollout 019eb8a0,
+/// 2026-06-11):
+/// - `event_msg/user_message`        → [`TailEventKind::User`]
+/// - `event_msg/agent_message`       → [`TailEventKind::Assistant`]
+/// - `response_item/function_call`   → [`TailEventKind::ToolUse`]
+/// - `response_item/function_call_output` → [`TailEventKind::ToolResult`]
+/// - everything else (reasoning, token_count, turn_context, …) is
+///   skipped — same altitude as the Claude tail's summary stream.
+pub fn read_codex_tail_events(path: &Path, limit: usize) -> Vec<TailEvent> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let events: Vec<TailEvent> = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| parse_codex_event(&l))
+        .collect();
+    let start = events.len().saturating_sub(limit);
+    events[start..].to_vec()
+}
+
+fn parse_codex_event(line: &str) -> Option<TailEvent> {
+    #[derive(Deserialize)]
+    struct RawCodexEvent {
+        #[serde(rename = "type")]
+        type_: String,
+        timestamp: Option<String>,
+        payload: serde_json::Value,
+    }
+    let raw: RawCodexEvent = serde_json::from_str(line).ok()?;
+    let ptype = raw.payload.get("type").and_then(|t| t.as_str())?;
+    let event = match (raw.type_.as_str(), ptype) {
+        ("event_msg", "user_message") => TailEvent {
+            kind: TailEventKind::User,
+            tool_use_id: None,
+            tool_name: None,
+            summary: raw
+                .payload
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            timestamp: raw.timestamp,
+        },
+        ("event_msg", "agent_message") => TailEvent {
+            kind: TailEventKind::Assistant,
+            tool_use_id: None,
+            tool_name: None,
+            summary: raw
+                .payload
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            timestamp: raw.timestamp,
+        },
+        ("response_item", "function_call") => {
+            // Codex namespaces MCP tools (`namespace: "mcp__ostk"`,
+            // `name: "bash"`); render as namespace::name to match the
+            // fleet's qualified-tool vocabulary.
+            let name = raw.payload.get("name").and_then(|n| n.as_str());
+            let namespace = raw.payload.get("namespace").and_then(|n| n.as_str());
+            let qualified = match (namespace, name) {
+                (Some(ns), Some(n)) => format!("{ns}::{n}"),
+                (None, Some(n)) => n.to_string(),
+                _ => "?".to_string(),
+            };
+            let args = raw
+                .payload
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .unwrap_or_default();
+            TailEvent {
+                kind: TailEventKind::ToolUse,
+                tool_use_id: raw
+                    .payload
+                    .get("call_id")
+                    .and_then(|c| c.as_str())
+                    .map(String::from),
+                tool_name: Some(qualified.clone()),
+                summary: format!("{}: {}", qualified, truncate_chars(args, 120)),
+                timestamp: raw.timestamp,
+            }
+        }
+        ("response_item", "function_call_output") => {
+            let out_len = raw
+                .payload
+                .get("output")
+                .and_then(|o| o.as_str())
+                .map(str::len)
+                .unwrap_or(0);
+            TailEvent {
+                kind: TailEventKind::ToolResult,
+                tool_use_id: raw
+                    .payload
+                    .get("call_id")
+                    .and_then(|c| c.as_str())
+                    .map(String::from),
+                tool_name: None,
+                summary: format!("out:{out_len}b"),
+                timestamp: raw.timestamp,
+            }
+        }
+        _ => return None,
+    };
+    let summary = truncate_chars(&event.summary, 240);
+    Some(TailEvent { summary, ..event })
+}
+
+#[cfg(test)]
+mod codex_tests {
+    use super::*;
+
+    fn meta_line(uuid: &str, cwd: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-06-11T21:40:18.403Z","type":"session_meta","payload":{{"id":"{uuid}","cwd":"{cwd}","originator":"codex-tui","cli_version":"0.139.0","source":"cli","model_provider":"openai"}}}}"#
+        )
+    }
+
+    fn write_rollout(dir: &Path, ts: &str, uuid: &str, lines: &[String]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(format!("rollout-{ts}-{uuid}.jsonl"));
+        std::fs::write(&p, lines.join("\n")).unwrap();
+        p
+    }
+
+    const UUID_A: &str = "019eb8a0-d837-7ca3-bc9a-0ed5bb6ff73c";
+    const UUID_B: &str = "0199aaaa-bbbb-7ccc-8ddd-eeeeffff0000";
+
+    #[test]
+    fn identity_verifies_uuid_and_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        let p = write_rollout(
+            &day,
+            "2026-06-11T23-40-09",
+            UUID_A,
+            &[meta_line(UUID_A, "/work/haystack")],
+        );
+        let id = codex_rollout_identity(&p).unwrap();
+        assert_eq!(id.uuid, UUID_A);
+        assert_eq!(id.cwd, "/work/haystack");
+    }
+
+    #[test]
+    fn identity_rejects_filename_uuid_mismatch() {
+        // Renamed/copied rollout: payload.id != filename uuid.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        let p = write_rollout(
+            &day,
+            "2026-06-11T23-40-09",
+            UUID_B,
+            &[meta_line(UUID_A, "/work/haystack")],
+        );
+        assert_eq!(codex_rollout_identity(&p), None);
+    }
+
+    #[test]
+    fn identity_rejects_non_session_meta_first_line() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        let p = write_rollout(
+            &day,
+            "2026-06-11T23-40-09",
+            UUID_A,
+            &[
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"x"}}"#
+                    .to_string(),
+            ],
+        );
+        assert_eq!(codex_rollout_identity(&p), None);
+    }
+
+    #[test]
+    fn locate_filters_by_cwd_foreign_codex_negative() {
+        // The §5 scenario: global dir, foreign-project codex active.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        write_rollout(
+            &day,
+            "2026-06-11T23-50-00", // foreign is NEWER
+            UUID_B,
+            &[meta_line(UUID_B, "/work/other-project")],
+        );
+        let ours = write_rollout(
+            &day,
+            "2026-06-11T23-40-09",
+            UUID_A,
+            &[meta_line(UUID_A, "/work/haystack")],
+        );
+        let found = locate_codex_rollout(tmp.path(), Path::new("/work/haystack"));
+        assert_eq!(
+            found,
+            Some(ours),
+            "must pick ours despite foreign being newer"
+        );
+    }
+
+    #[test]
+    fn locate_no_match_returns_none_never_recency_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        write_rollout(
+            &day,
+            "2026-06-11T23-50-00",
+            UUID_B,
+            &[meta_line(UUID_B, "/work/other-project")],
+        );
+        assert_eq!(
+            locate_codex_rollout(tmp.path(), Path::new("/work/haystack")),
+            None,
+            "global sessions dir: recency fallback IS the foreign-codex bug"
+        );
+    }
+
+    #[test]
+    fn locate_picks_latest_among_matching_by_filename_ts() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let older_day = tmp.path().join("2026/06/10");
+        let newer_day = tmp.path().join("2026/06/11");
+        write_rollout(
+            &older_day,
+            "2026-06-10T09-00-00",
+            UUID_B,
+            &[meta_line(UUID_B, "/work/haystack")],
+        );
+        let newer = write_rollout(
+            &newer_day,
+            "2026-06-11T23-40-09",
+            UUID_A,
+            &[meta_line(UUID_A, "/work/haystack")],
+        );
+        assert_eq!(
+            locate_codex_rollout(tmp.path(), Path::new("/work/haystack")),
+            Some(newer)
+        );
+    }
+
+    #[test]
+    fn parses_live_wire_event_shapes() {
+        // Shapes verbatim-derived from live rollout 019eb8a0 (2026-06-11).
+        let user = r#"{"timestamp":"2026-06-11T21:40:20.000Z","type":"event_msg","payload":{"type":"user_message","message":":boot","images":[],"local_images":[],"text_elements":[]}}"#;
+        let e = parse_codex_event(user).unwrap();
+        assert_eq!(e.kind, TailEventKind::User);
+        assert_eq!(e.summary, ":boot");
+
+        let agent = r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Booting the project kernel now.","phase":"commentary","memory_citation":null}}"#;
+        let e = parse_codex_event(agent).unwrap();
+        assert_eq!(e.kind, TailEventKind::Assistant);
+        assert_eq!(e.summary, "Booting the project kernel now.");
+
+        let call = r#"{"type":"response_item","payload":{"type":"function_call","name":"bash","namespace":"mcp__ostk","arguments":"{\"cmd\":\"ostk boot\"}","call_id":"call_6yteRpHnR7O"}}"#;
+        let e = parse_codex_event(call).unwrap();
+        assert_eq!(e.kind, TailEventKind::ToolUse);
+        assert_eq!(e.tool_name.as_deref(), Some("mcp__ostk::bash"));
+        assert_eq!(e.tool_use_id.as_deref(), Some("call_6yteRpHnR7O"));
+        assert!(e.summary.starts_with("mcp__ostk::bash: "));
+
+        let output = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_6yteRpHnR7O","output":"Wall time: 4.65 seconds"}}"#;
+        let e = parse_codex_event(output).unwrap();
+        assert_eq!(e.kind, TailEventKind::ToolResult);
+        assert_eq!(e.tool_use_id.as_deref(), Some("call_6yteRpHnR7O"));
+        assert_eq!(e.summary, "out:23b");
+
+        // Skipped kinds: reasoning, token_count, turn_context.
+        for skipped in [
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{}}}"#,
+            r#"{"type":"turn_context","payload":{"type":"turn_context","cwd":"/x"}}"#,
+        ] {
+            assert!(parse_codex_event(skipped).is_none(), "must skip: {skipped}");
+        }
+    }
+
+    #[test]
+    fn codex_tail_respects_limit_and_order() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        let mut lines = vec![meta_line(UUID_A, "/work/haystack")];
+        for i in 0..10 {
+            lines.push(format!(
+                r#"{{"type":"event_msg","payload":{{"type":"user_message","message":"msg-{i}"}}}}"#
+            ));
+        }
+        let p = write_rollout(&day, "2026-06-11T23-40-09", UUID_A, &lines);
+        let tail = read_codex_tail_events(&p, 3);
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].summary, "msg-7");
+        assert_eq!(tail[2].summary, "msg-9");
+    }
+
+    /// Live smoke (inert without env): set OSTK_CODEX_SMOKE_DIR +
+    /// OSTK_CODEX_SMOKE_CWD to run the locate+tail path against a real
+    /// sessions tree.
+    #[test]
+    fn live_sessions_smoke_when_env_set() {
+        let (Ok(dir), Ok(cwd)) = (
+            std::env::var("OSTK_CODEX_SMOKE_DIR"),
+            std::env::var("OSTK_CODEX_SMOKE_CWD"),
+        ) else {
+            return;
+        };
+        let found = locate_codex_rollout(Path::new(&dir), Path::new(&cwd))
+            .expect("smoke: no rollout located for cwd");
+        let id = codex_rollout_identity(&found).expect("smoke: identity must verify");
+        assert_eq!(id.cwd, cwd);
+        let tail = read_codex_tail_events(&found, 10);
+        assert!(!tail.is_empty(), "smoke: tail must yield mapped events");
+    }
+}
