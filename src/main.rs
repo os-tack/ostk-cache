@@ -48,6 +48,22 @@ const LANE_IDLE_EVICT_SECS: u64 = 24 * 60 * 60;
 const LANE_SWEEP_MIN_LEN: usize = 64;
 type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 
+/// →2032 WARM freeze: last synthetic context served per conversation,
+/// keyed (session, fingerprint of the harness's first message). The
+/// fingerprint changes when the harness compacts its history — a
+/// natural re-projection boundary. Same idle-eviction lifecycle as the
+/// lane store.
+type ProjectionStore = Arc<DashMap<(SessionId, u64), FrozenProjection>>;
+
+#[derive(Clone)]
+struct FrozenProjection {
+    text: String,
+    /// Fingerprint of the cycle-boundary user message the projection
+    /// was rendered against; a boundary advance declines the freeze.
+    boundary_fp: u64,
+    last_ts: u64,
+}
+
 #[derive(Clone)]
 struct PendingPolicyCommit {
     key: (SessionId, String),
@@ -77,6 +93,8 @@ struct AppState {
     cadence_store: CadenceStore,
     /// →2032: write-policy lanes (same lifecycle as the cadence store).
     lane_store: LaneStore,
+    /// →2032 WARM freeze: frozen projections (see [`ProjectionStore`]).
+    projection_store: ProjectionStore,
     hint_cache: Arc<IdentityHintCache>,
     hook_adapter: HookAdapterHandle,
     config: Arc<Config>,
@@ -133,6 +151,7 @@ async fn main() {
         amp_store: Arc::new(DashMap::new()),
         cadence_store: Arc::new(DashMap::new()),
         lane_store: Arc::new(DashMap::new()),
+        projection_store: Arc::new(DashMap::new()),
         hint_cache: Arc::new(IdentityHintCache::new()),
         hook_adapter: Arc::new(Mutex::new(DaemonAdapter::new(InMemoryPageTable::new()))),
         // →2035 fix 2: spawn the background capture writer.
@@ -714,6 +733,17 @@ async fn handle_anthropic_message(
         Ok(mut value) => {
             let mut mutated = false;
 
+            // →2032 WARM freeze: fingerprint the conversation by its
+            // first harness-sent message BEFORE any rewrite pass
+            // mutates it. Harness compaction rewrites messages[0] →
+            // new fingerprint → fresh projection (correct: compaction
+            // is a cache-dead re-projection moment).
+            let conv_fp: Option<u64> = value
+                .get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|a| a.first())
+                .map(ostk_cache::rebuild::fingerprint_value);
+
             // Pass A: strip Claude Code's volatile per-turn
             // `cch=<hex>;` billing token from every string in the
             // request body (→1856 P1.B diagnostic + Issue #40652
@@ -806,23 +836,106 @@ async fn handle_anthropic_message(
             // federated — distinguished by rebuild_config.mode_tag
             // and the optional live_envelope_override populated
             // above when mode == "rebuild_kernel").
+            // →2032 WARM freeze: hand the prior projection to the
+            // rebuild pass while the lane is WARM. Policy dark or lane
+            // DEAD → None → fresh composition (status quo).
+            let proj_key = conv_fp.map(|fp| (session_id.clone(), fp));
+            if let (Some(decision), Some(key)) = (policy_decision.as_ref(), proj_key.as_ref()) {
+                if matches!(decision.class, write_policy::LaneClass::Warm) {
+                    match state.projection_store.get(key) {
+                        Some(frozen) => {
+                            rebuild_config.frozen_synthetic =
+                                Some(ostk_cache::rebuild::FrozenSynthetic {
+                                    text: frozen.text.clone(),
+                                    boundary_fp: frozen.boundary_fp,
+                                });
+                        }
+                        // Miss on a WARM lane means the freeze isn't
+                        // engaging (first sight, sweep, or fingerprint
+                        // churn) — log it so a silent regression to
+                        // status-quo churn stays observable.
+                        None => {
+                            if config.verbose.value {
+                                println!(
+                                    "[proxy] rebuild: warm lane, no frozen projection (first sight or fp churn)"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             if rebuild_config.enabled {
                 match apply_rebuild(&mut value, &rebuild_config) {
                     RebuildOutcome::Applied(report) => {
                         if config.verbose.value {
                             println!(
-                                "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}",
+                                "[proxy] rebuild: dropped={} bytes_in={} bytes_out={} envelope={} native={} user_thread={}{}",
                                 report.turns_dropped,
                                 report.bytes_in,
                                 report.bytes_out,
                                 report.envelope_found,
                                 report.native_tool_calls_summarized,
                                 report.user_messages_summarized,
+                                if report.served_frozen {
+                                    " frozen=warm-stable"
+                                } else {
+                                    ""
+                                },
                             );
                         }
                         rebuild_mode_tag = Some(rebuild_config.mode_tag.clone());
                         rebuild_report_capture = Some(report.clone());
                         mutated = true;
+                        // →2032 WARM freeze: persist the synthetic we
+                        // just served (fresh renders only) so the next
+                        // WARM turn emits it byte-identical. Policy
+                        // dark → no store, no behavior change.
+                        if policy_decision.is_some() {
+                            if let Some(key) = proj_key.clone() {
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                if report.served_frozen {
+                                    if let Some(mut e) = state.projection_store.get_mut(&key) {
+                                        e.last_ts = now_secs;
+                                    }
+                                } else {
+                                    // A frozen copy was offered but a
+                                    // fresh render happened anyway —
+                                    // the cycle boundary advanced.
+                                    if rebuild_config.frozen_synthetic.is_some()
+                                        && config.verbose.value
+                                    {
+                                        println!(
+                                            "[proxy] rebuild: frozen projection declined (cycle boundary advanced)"
+                                        );
+                                    }
+                                    if let Some(txt) = value
+                                        .get("messages")
+                                        .and_then(|m| m.get(0))
+                                        .and_then(|m| m.get("content"))
+                                        .and_then(|c| c.get(0))
+                                        .and_then(|b| b.get("text"))
+                                        .and_then(|t| t.as_str())
+                                    {
+                                        state.projection_store.insert(
+                                            key,
+                                            FrozenProjection {
+                                                text: txt.to_string(),
+                                                boundary_fp: report.boundary_fp,
+                                                last_ts: now_secs,
+                                            },
+                                        );
+                                    }
+                                }
+                                if state.projection_store.len() > LANE_SWEEP_MIN_LEN {
+                                    state.projection_store.retain(|_, p| {
+                                        now_secs.saturating_sub(p.last_ts) <= LANE_IDLE_EVICT_SECS
+                                    });
+                                }
+                            }
+                        }
                         // Standalone-mode bookkeeping: append the
                         // activation to ~/.ostk-cache/state/<hash>/
                         // journal.jsonl so the run is auditable.
@@ -864,13 +977,37 @@ async fn handle_anthropic_message(
             }
 
             // Pass 2: file-handle rewrite.
+            //
+            // →2032 WARM freeze: the rebuilt projection block at
+            // messages[0] is excluded from this pass — its byte
+            // stability across turns is the freeze guarantee, and a
+            // FileCache staleness flip would otherwise mutate it
+            // between turns. (Design intent was already "the surviving
+            // in-flight chain only"; the projection block was reachable
+            // incidentally.) Removed before the pass, reinserted
+            // unconditionally after.
+            let rebuilt_head: Option<serde_json::Value> = if rebuild_report_capture.is_some() {
+                value
+                    .get_mut("messages")
+                    .and_then(|m| m.as_array_mut())
+                    .filter(|a| !a.is_empty())
+                    .map(|a| a.remove(0))
+            } else {
+                None
+            };
             let rewrite_config = RewriteConfig::from_resolved(&config, session_id.clone());
-            match ostk_cache::rewrite_middleware::apply_rewrite_full(
+            let rewrite_outcome = ostk_cache::rewrite_middleware::apply_rewrite_full(
                 &mut value,
                 &rewrite_config,
                 Some(&ttl_forecast_result),
                 policy_decision.as_ref(),
-            ) {
+            );
+            if let Some(head) = rebuilt_head {
+                if let Some(arr) = value.get_mut("messages").and_then(|m| m.as_array_mut()) {
+                    arr.insert(0, head);
+                }
+            }
+            match rewrite_outcome {
                 RewriteOutcome::Applied(report) => {
                     if report.rewrites_applied > 0 {
                         if config.verbose.value {

@@ -200,6 +200,30 @@ pub struct RebuildConfig {
     /// the caller. None → fall back to in-process slice (e.g.
     /// non-claude-code harness, missing projects dir).
     pub prior_user_turns_override: Option<Vec<String>>,
+    /// →2032 WARM-tier byte stability: the synthetic context served to
+    /// this conversation on a previous turn of the SAME cycle. When the
+    /// stored boundary fingerprint matches the current cycle-boundary
+    /// user message, it is emitted VERBATIM instead of composing a
+    /// fresh one — any re-render of messages[0] invalidates every
+    /// cached byte downstream of it (the Jun-11 soak measured 83% of
+    /// write spend as exactly this churn: the sliding intent-thread /
+    /// transcript-tail windows shifted every turn while the cache read
+    /// stayed pinned at the system boundary).
+    ///
+    /// The freeze is scoped to one cycle: a boundary advance (new real
+    /// user turn) declines the frozen copy and renders fresh, so
+    /// intermediate cycles always fold into the projection and the
+    /// frontier invariant ("recomputed from message history on every
+    /// rebuild") holds across user turns. The intra-cycle agentic tool
+    /// loop is where the churn lives; a boundary re-render costs one
+    /// synthetic-sized write whose downstream bytes change anyway.
+    ///
+    /// The caller sets this only when the write policy is enabled AND
+    /// the lane is WARM; DEAD boundaries and first sight of a
+    /// conversation render fresh — those are →2032's licensed
+    /// re-projection moments. None → compose normally (status quo;
+    /// flag-dark behavior is unchanged).
+    pub frozen_synthetic: Option<FrozenSynthetic>,
     /// →1985 X3: true inbound request body size in bytes. When set, the
     /// projected `[meminfo]` line gains a ` body:<N.N>MB/32MB` gauge so
     /// seats and the lead can watch the march toward the transport wall.
@@ -239,6 +263,7 @@ impl RebuildConfig {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         }
@@ -267,6 +292,7 @@ impl RebuildConfig {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         }
@@ -306,6 +332,34 @@ pub struct RebuildReport {
     /// →2032: optional sections elided to meet `compact_target_bytes`
     /// (0 = no budget set or synthetic already fit).
     pub sections_elided: usize,
+    /// →2032 WARM freeze: true when `frozen_synthetic` was served
+    /// verbatim (composition skipped; the count fields above are 0).
+    pub served_frozen: bool,
+    /// →2032 WARM freeze: fingerprint of the cycle-boundary user
+    /// message this projection was rendered against. The caller stores
+    /// it with the synthetic so a later turn's frozen offer can be
+    /// matched (or declined) against the then-current boundary.
+    pub boundary_fp: u64,
+}
+
+/// →2032 WARM freeze: a previously served synthetic context plus the
+/// fingerprint of the cycle-boundary user message it was rendered
+/// against. See [`RebuildConfig::frozen_synthetic`].
+#[derive(Debug, Clone)]
+pub struct FrozenSynthetic {
+    pub text: String,
+    pub boundary_fp: u64,
+}
+
+/// Deterministic fingerprint of a JSON value (std `DefaultHasher` over
+/// its serialization — SipHash with fixed keys, stable within and
+/// across processes). Used for conversation identity (first harness
+/// message) and cycle-boundary identity (current real user message).
+pub fn fingerprint_value(v: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    v.to_string().hash(&mut h);
+    h.finish()
 }
 
 /// Run the rebuild rewriter against `req` in place.
@@ -342,83 +396,121 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         .map(|s| s.len())
         .unwrap_or(0);
 
-    // Federated mode: use the kernel-fetched envelope if provided.
-    // Standalone mode: extract the most recent envelope from the
-    // request body's tool_result text. Either may be None if neither
-    // source produced one — render a zeroed placeholder downstream.
-    let envelope = config
-        .live_envelope_override
-        .clone()
-        .or_else(|| extract_latest_envelope(dropped_slice))
-        // →1985 X3: stamp the true inbound body size onto the [meminfo]
-        // line so the projection carries the transport-wall gauge.
-        .map(|env| match config.body_bytes_in {
-            Some(bytes) => crate::usage_truth::augment_meminfo_body(&env, bytes),
-            None => env,
-        });
-    let native_summary = summarize_native_tools(dropped_slice, config.max_native_tool_summary);
-    // →1979 K3: frontier scan runs over the FULL dropped slice,
-    // deliberately uncapped — unresolved items are exempt from the
-    // paging budget above.
-    let unresolved = summarize_unresolved(dropped_slice);
-    let user_thread = match &config.prior_user_turns_override {
-        Some(turns) if !turns.is_empty() => {
-            // Transcript-sourced thread: full text, no chop. Cap at the
-            // last N turns to match in-process behavior.
-            let cap = config.max_user_intent_thread;
-            let start = turns.len().saturating_sub(cap);
-            turns[start..].to_vec()
-        }
-        _ => extract_user_intent_thread(dropped_slice, config.max_user_intent_thread),
-    };
+    // →2032 WARM freeze: while the lane is WARM *and the cycle
+    // boundary has not advanced*, serve the previously emitted
+    // synthetic context byte-identical instead of re-composing. The
+    // sliding sections below (intent thread, transcript tail,
+    // envelope) re-render every turn, and any byte change in
+    // messages[0] invalidates the cached conversation downstream of it
+    // — the Jun-11 soak measured 83% of write spend as exactly this
+    // intra-cycle churn. A boundary advance (new real user turn)
+    // declines the frozen copy: intermediate cycles must fold into the
+    // projection (conversation memory) and the frontier invariant
+    // requires recomputation from message history across user turns.
+    // Live state still reaches the model through the [ctx] envelopes
+    // inside the in-flight cycle's tool results.
+    //
+    // Precedence: a frozen serve ignores `compact_target_bytes` by
+    // design — the two are mutually exclusive at the caller (frozen ⇐
+    // WARM, budget ⇐ DEAD), and eliding a frozen copy would change its
+    // bytes, defeating the only reason to serve it.
+    let boundary_fp = fingerprint_value(&messages[user_idx]);
+    let frozen_match = config
+        .frozen_synthetic
+        .as_ref()
+        .filter(|f| f.boundary_fp == boundary_fp)
+        .map(|f| f.text.clone());
+    let (synthetic, sections_elided, envelope_found, native_count, user_count, served_frozen) =
+        if let Some(frozen) = frozen_match {
+            (frozen, 0usize, false, 0usize, 0usize, true)
+        } else {
+            // Federated mode: use the kernel-fetched envelope if provided.
+            // Standalone mode: extract the most recent envelope from the
+            // request body's tool_result text. Either may be None if neither
+            // source produced one — render a zeroed placeholder downstream.
+            let envelope = config
+                .live_envelope_override
+                .clone()
+                .or_else(|| extract_latest_envelope(dropped_slice))
+                // →1985 X3: stamp the true inbound body size onto the [meminfo]
+                // line so the projection carries the transport-wall gauge.
+                .map(|env| match config.body_bytes_in {
+                    Some(bytes) => crate::usage_truth::augment_meminfo_body(&env, bytes),
+                    None => env,
+                });
+            let native_summary =
+                summarize_native_tools(dropped_slice, config.max_native_tool_summary);
+            // →1979 K3: frontier scan runs over the FULL dropped slice,
+            // deliberately uncapped — unresolved items are exempt from the
+            // paging budget above.
+            let unresolved = summarize_unresolved(dropped_slice);
+            let user_thread = match &config.prior_user_turns_override {
+                Some(turns) if !turns.is_empty() => {
+                    // Transcript-sourced thread: full text, no chop. Cap at the
+                    // last N turns to match in-process behavior.
+                    let cap = config.max_user_intent_thread;
+                    let start = turns.len().saturating_sub(cap);
+                    turns[start..].to_vec()
+                }
+                _ => extract_user_intent_thread(dropped_slice, config.max_user_intent_thread),
+            };
 
-    let synthetic = compose_synthetic_context(
-        &envelope,
-        &native_summary,
-        &unresolved,
-        &user_thread,
-        config.transcript_tail_summary.as_deref(),
-        config.recent_assistant_digests.as_deref(),
-        config.templates_summary.as_deref(),
-    );
-
-    // →2032: DEAD-path compaction. A `compact_target_bytes` budget
-    // licenses a faithful re-projection — elide optional sections in
-    // fixed priority order (templates first: derived data; then
-    // transcript tail; then assistant digests) until the synthetic
-    // fits. All three are substrate-recoverable (recall / transcript
-    // JSONL / cycle_digests.jsonl), satisfying the →1985 faithfulness
-    // constraint. If the core projection alone still exceeds the
-    // budget, it stands as-is — never elide envelope, tool activity,
-    // frontier, or the user thread.
-    let mut synthetic = synthetic;
-    let mut sections_elided = 0usize;
-    if let Some(budget) = config.compact_target_bytes {
-        let mut templates = config.templates_summary.as_deref();
-        let mut tail = config.transcript_tail_summary.as_deref();
-        let mut digests = config.recent_assistant_digests.as_deref();
-        while synthetic.len() > budget {
-            if templates.is_some() {
-                templates = None;
-            } else if tail.is_some() {
-                tail = None;
-            } else if digests.is_some() {
-                digests = None;
-            } else {
-                break;
-            }
-            sections_elided += 1;
-            synthetic = compose_synthetic_context(
+            let synthetic = compose_synthetic_context(
                 &envelope,
                 &native_summary,
                 &unresolved,
                 &user_thread,
-                tail,
-                digests,
-                templates,
+                config.transcript_tail_summary.as_deref(),
+                config.recent_assistant_digests.as_deref(),
+                config.templates_summary.as_deref(),
             );
-        }
-    }
+
+            // →2032: DEAD-path compaction. A `compact_target_bytes` budget
+            // licenses a faithful re-projection — elide optional sections in
+            // fixed priority order (templates first: derived data; then
+            // transcript tail; then assistant digests) until the synthetic
+            // fits. All three are substrate-recoverable (recall / transcript
+            // JSONL / cycle_digests.jsonl), satisfying the →1985 faithfulness
+            // constraint. If the core projection alone still exceeds the
+            // budget, it stands as-is — never elide envelope, tool activity,
+            // frontier, or the user thread.
+            let mut synthetic = synthetic;
+            let mut sections_elided = 0usize;
+            if let Some(budget) = config.compact_target_bytes {
+                let mut templates = config.templates_summary.as_deref();
+                let mut tail = config.transcript_tail_summary.as_deref();
+                let mut digests = config.recent_assistant_digests.as_deref();
+                while synthetic.len() > budget {
+                    if templates.is_some() {
+                        templates = None;
+                    } else if tail.is_some() {
+                        tail = None;
+                    } else if digests.is_some() {
+                        digests = None;
+                    } else {
+                        break;
+                    }
+                    sections_elided += 1;
+                    synthetic = compose_synthetic_context(
+                        &envelope,
+                        &native_summary,
+                        &unresolved,
+                        &user_thread,
+                        tail,
+                        digests,
+                        templates,
+                    );
+                }
+            }
+            (
+                synthetic,
+                sections_elided,
+                envelope.is_some(),
+                native_summary.len(),
+                user_thread.len(),
+                false,
+            )
+        };
     let bytes_out = synthetic.len();
 
     let in_flight: Vec<Value> = messages[user_idx..].to_vec();
@@ -459,10 +551,12 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         turns_dropped,
         bytes_in,
         bytes_out,
-        envelope_found: envelope.is_some(),
-        native_tool_calls_summarized: native_summary.len(),
-        user_messages_summarized: user_thread.len(),
+        envelope_found,
+        native_tool_calls_summarized: native_count,
+        user_messages_summarized: user_count,
         sections_elided,
+        served_frozen,
+        boundary_fp,
     })
 }
 
@@ -1765,6 +1859,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -1781,6 +1876,206 @@ mod tests {
         assert_eq!(messages[0].get("role").unwrap().as_str(), Some("user"));
         assert_eq!(messages[1].get("role").unwrap().as_str(), Some("user"));
         assert_eq!(messages[1].get("content").unwrap().as_str(), Some("new"));
+    }
+
+    // ── →2032 WARM freeze: byte-stable projection serving ───────────────
+
+    fn freeze_test_config(frozen: Option<FrozenSynthetic>) -> RebuildConfig {
+        RebuildConfig {
+            enabled: true,
+            mode_tag: "rebuild_local".into(),
+            max_native_tool_summary: 18,
+            max_user_intent_thread: 10,
+            live_envelope_override: None,
+            transcript_tail_summary: None,
+            recent_assistant_digests: None,
+            templates_summary: None,
+            prior_user_turns_override: None,
+            frozen_synthetic: frozen,
+            body_bytes_in: None,
+            compact_target_bytes: None,
+        }
+    }
+
+    /// Boundary fingerprint of `{"role":"user","content":"new"}`, the
+    /// cycle-boundary message used by the simple test requests below.
+    fn fp_of_new() -> u64 {
+        fingerprint_value(&json!({"role": "user", "content": "new"}))
+    }
+
+    #[test]
+    fn frozen_synthetic_served_verbatim_same_boundary() {
+        // Regression for the Jun-11 soak churn: a WARM lane must emit
+        // the prior projection byte-identical — any re-render of
+        // messages[0] invalidates the cached conversation downstream.
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"}
+            ]
+        });
+        let config = freeze_test_config(Some(FrozenSynthetic {
+            text: "FROZEN PROJECTION BLOCK".into(),
+            boundary_fp: fp_of_new(),
+        }));
+        match apply_rebuild(&mut req, &config) {
+            RebuildOutcome::Applied(report) => {
+                assert!(report.served_frozen);
+                assert_eq!(report.bytes_out, "FROZEN PROJECTION BLOCK".len());
+                assert_eq!(report.boundary_fp, fp_of_new());
+                assert_eq!(report.native_tool_calls_summarized, 0);
+                assert_eq!(report.user_messages_summarized, 0);
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
+        let messages = req.get("messages").unwrap().as_array().unwrap();
+        assert_eq!(
+            messages[0]["content"][0]["text"].as_str(),
+            Some("FROZEN PROJECTION BLOCK")
+        );
+        // In-flight chain preserved after the frozen block:
+        assert_eq!(messages[1]["content"].as_str(), Some("new"));
+    }
+
+    #[test]
+    fn frozen_declined_when_cycle_boundary_advances() {
+        // F1 (review): a new real user turn must decline the frozen
+        // copy and render fresh — intermediate cycles fold into the
+        // projection and the frontier invariant requires recomputation
+        // across user turns.
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"},
+                {"role": "assistant", "content": "answer to new"},
+                {"role": "user", "content": "NEWER user turn"}
+            ]
+        });
+        let config = freeze_test_config(Some(FrozenSynthetic {
+            text: "STALE PROJECTION FROM PRIOR CYCLE".into(),
+            boundary_fp: fp_of_new(), // rendered against "new", boundary is now "NEWER user turn"
+        }));
+        match apply_rebuild(&mut req, &config) {
+            RebuildOutcome::Applied(report) => {
+                assert!(!report.served_frozen, "boundary advance must render fresh");
+                assert_ne!(report.boundary_fp, fp_of_new());
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
+        let head = req["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert_ne!(head, "STALE PROJECTION FROM PRIOR CYCLE");
+        // The intermediate cycle's user message folded into the fresh
+        // projection's intent thread:
+        assert!(
+            head.contains("new"),
+            "dropped turns must fold into the projection"
+        );
+    }
+
+    #[test]
+    fn frozen_round_trip_is_byte_stable_across_sliding_sources() {
+        // Full round trip (F6, review): render fresh on turn A, store
+        // what was actually served, offer it back on turn B of the SAME
+        // cycle with slid source windows — messages[0] must be
+        // byte-identical despite the drift.
+        let mut turn_a = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"}
+            ]
+        });
+        let mut cfg_a = freeze_test_config(None);
+        cfg_a.transcript_tail_summary = Some("## tail A".into());
+        let report_a = match apply_rebuild(&mut turn_a, &cfg_a) {
+            RebuildOutcome::Applied(r) => r,
+            other => panic!("expected Applied, got {:?}", other),
+        };
+        let served_a = turn_a["messages"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Turn B: same cycle boundary ("new" is still the last real
+        // user message — the cycle grew by an assistant tool exchange),
+        // but the tail window slid and more history piled up.
+        let mut turn_b = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "extra history — window slid"},
+                {"role": "assistant", "content": "r2"},
+                {"role": "user", "content": "new"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}
+            ]
+        });
+        let mut cfg_b = freeze_test_config(Some(FrozenSynthetic {
+            text: served_a.clone(),
+            boundary_fp: report_a.boundary_fp,
+        }));
+        cfg_b.transcript_tail_summary = Some("## tail B (slid)".into());
+        match apply_rebuild(&mut turn_b, &cfg_b) {
+            RebuildOutcome::Applied(r) => assert!(r.served_frozen),
+            other => panic!("expected Applied, got {:?}", other),
+        }
+        assert_eq!(
+            turn_b["messages"][0]["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+            served_a,
+            "round-tripped projection must be byte-identical despite source drift"
+        );
+    }
+
+    #[test]
+    fn frozen_wins_over_compact_target() {
+        // F3 (review): if both are ever set, the frozen copy is served
+        // unmodified — eliding it would change its bytes, defeating the
+        // only reason to serve it.
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"}
+            ]
+        });
+        let mut config = freeze_test_config(Some(FrozenSynthetic {
+            text: "FROZEN".into(),
+            boundary_fp: fp_of_new(),
+        }));
+        config.compact_target_bytes = Some(2); // absurdly tight budget
+        match apply_rebuild(&mut req, &config) {
+            RebuildOutcome::Applied(report) => {
+                assert!(report.served_frozen);
+                assert_eq!(report.sections_elided, 0);
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
+        assert_eq!(
+            req["messages"][0]["content"][0]["text"].as_str(),
+            Some("FROZEN")
+        );
+    }
+
+    #[test]
+    fn no_frozen_synthetic_renders_fresh() {
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "old"},
+                {"role": "assistant", "content": "old reply"},
+                {"role": "user", "content": "new"}
+            ]
+        });
+        match apply_rebuild(&mut req, &freeze_test_config(None)) {
+            RebuildOutcome::Applied(report) => {
+                assert!(!report.served_frozen);
+                assert_eq!(report.boundary_fp, fp_of_new());
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
     }
 
     // →2032: a compact_target_bytes budget elides optional sections in
@@ -1805,6 +2100,7 @@ mod tests {
             recent_assistant_digests: Some("digest-section-marker".into()),
             templates_summary: Some("templates-section-marker".into()),
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             // Impossible budget: every optional section must go and the
             // core projection still stands.
@@ -1848,6 +2144,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: Some(10_000_000),
         };
@@ -1886,6 +2183,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -1923,6 +2221,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -1945,6 +2244,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -1967,6 +2267,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -2301,6 +2602,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -2594,6 +2896,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -2646,6 +2949,7 @@ mod tests {
             ),
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -2702,6 +3006,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -2744,6 +3049,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -2982,6 +3288,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         };
@@ -3167,6 +3474,7 @@ mod tests {
             recent_assistant_digests: None,
             templates_summary: None,
             prior_user_turns_override: None,
+            frozen_synthetic: None,
             body_bytes_in: None,
             compact_target_bytes: None,
         }
