@@ -44,6 +44,31 @@
 
 use crate::config::Provider;
 use crate::write_policy::{self, LaneState, PolicyDecision, TtlTier, WritePolicyParams};
+use serde_json::Value;
+
+/// Provider-normalized view of one response's usage block —
+/// observational only (A2). Field semantics:
+///
+/// - `cached_tokens`: read-side cache hits. Anthropic
+///   `cache_read_input_tokens`; GPT `input_tokens_details.cached_tokens`
+///   (Responses shape, confirmed on the live chatgpt wire 2026-06-11)
+///   or `prompt_tokens_details.cached_tokens` (chat-completions shape,
+///   dormant until observed).
+/// - `cache_write_tokens`: priced cache writes. Anthropic
+///   `cache_creation_input_tokens`; always 0 on GPT — no write premium
+///   exists (codex-2034-review §48-55).
+/// - `input_tokens`: the provider's reported input-side count. NOTE:
+///   Anthropic reports input EXCLUSIVE of cache reads/writes; GPT
+///   reports input INCLUSIVE of cached_tokens. Consumers comparing
+///   across providers must normalize (e.g. uncached input = Anthropic
+///   `input_tokens` vs GPT `input_tokens - cached_tokens`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UsageSnapshot {
+    pub input_tokens: u64,
+    pub cached_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+}
 
 /// Provider-specific cache-policy backend.
 ///
@@ -80,12 +105,24 @@ pub trait PolicyBackend: Send + Sync {
     fn retention_wire(&self, tier: TtlTier) -> Option<&'static str>;
 
     /// Cache-routing affinity key for providers with automatic
-    /// caching, derived from the lane key.
+    /// caching.
     ///
-    /// GPT: `Some(prompt_cache_key)` so requests from one lane land on
-    /// the same cache shard. Anthropic: `None` — affinity is implicit
-    /// in the prefix bytes.
-    fn cache_key(&self, session_id: &str, model: &str) -> Option<String>;
+    /// `client_key` is the `prompt_cache_key` already present on the
+    /// inbound request, if any. Clients may key natively (codex sends
+    /// its session UUID — observed on the live wire 2026-06-11); the
+    /// client's key ALWAYS wins. Only when absent does the GPT backend
+    /// synthesize one from the lane key. Anthropic: `None` — affinity
+    /// is implicit in the prefix bytes.
+    ///
+    /// Computation only — emission is the caller's, and is gated off
+    /// entirely in passthrough mode (capture lanes stay byte-clean).
+    fn cache_key(&self, client_key: Option<&str>, session_id: &str, model: &str) -> Option<String>;
+
+    /// Parse a provider usage block (the `usage` object, already
+    /// located by the caller) into the normalized snapshot.
+    /// Observational only — never feeds a mutation path. Returns
+    /// `None` when the value doesn't carry this provider's input side.
+    fn parse_usage(&self, usage: &Value) -> Option<UsageSnapshot>;
 }
 
 /// Anthropic backend: pure delegation, byte-identical to the
@@ -117,8 +154,26 @@ impl PolicyBackend for AnthropicPolicy {
         None
     }
 
-    fn cache_key(&self, _session_id: &str, _model: &str) -> Option<String> {
+    fn cache_key(
+        &self,
+        _client_key: Option<&str>,
+        _session_id: &str,
+        _model: &str,
+    ) -> Option<String> {
         None
+    }
+
+    fn parse_usage(&self, usage: &Value) -> Option<UsageSnapshot> {
+        // Anthropic Messages shape: input_tokens is required; cache
+        // fields default to 0 (absent on uncached requests).
+        let input_tokens = usage.get("input_tokens")?.as_u64()?;
+        let get = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+        Some(UsageSnapshot {
+            input_tokens,
+            cached_tokens: get("cache_read_input_tokens"),
+            cache_write_tokens: get("cache_creation_input_tokens"),
+            output_tokens: get("output_tokens"),
+        })
     }
 }
 
@@ -168,10 +223,51 @@ impl PolicyBackend for GptPolicy {
         })
     }
 
-    fn cache_key(&self, session_id: &str, model: &str) -> Option<String> {
-        // Mirror the proxy's lane key (session, model) so cache-shard
-        // affinity follows lane identity.
-        Some(format!("ostk:{session_id}:{model}"))
+    fn cache_key(&self, client_key: Option<&str>, session_id: &str, model: &str) -> Option<String> {
+        // Client-set prompt_cache_key always wins (codex keys natively
+        // by session UUID). Synthesize from the lane key only when the
+        // client sent none.
+        match client_key {
+            Some(k) if !k.is_empty() => Some(k.to_string()),
+            _ => Some(format!("ostk:{session_id}:{model}")),
+        }
+    }
+
+    fn parse_usage(&self, usage: &Value) -> Option<UsageSnapshot> {
+        // Responses-API shape first — confirmed identical on the
+        // chatgpt backend wire (live capture 2026-06-11):
+        //   input_tokens, input_tokens_details.cached_tokens,
+        //   output_tokens, output_tokens_details.reasoning_tokens.
+        if let Some(input_tokens) = usage.get("input_tokens").and_then(Value::as_u64) {
+            return Some(UsageSnapshot {
+                input_tokens,
+                cached_tokens: usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                cache_write_tokens: 0, // no write premium on GPT
+                output_tokens: usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            });
+        }
+        // Chat-completions shape (dormant — not yet observed on the
+        // codex wire; kept for api.openai.com chat callers):
+        //   prompt_tokens, prompt_tokens_details.cached_tokens.
+        let input_tokens = usage.get("prompt_tokens")?.as_u64()?;
+        Some(UsageSnapshot {
+            input_tokens,
+            cached_tokens: usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_write_tokens: 0,
+            output_tokens: usage
+                .get("completion_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        })
     }
 }
 
@@ -276,7 +372,11 @@ mod tests {
     fn anthropic_has_no_gpt_levers() {
         assert_eq!(AnthropicPolicy.retention_wire(TtlTier::Ephemeral5m), None);
         assert_eq!(AnthropicPolicy.retention_wire(TtlTier::Ephemeral1h), None);
-        assert_eq!(AnthropicPolicy.cache_key("s", "m"), None);
+        assert_eq!(AnthropicPolicy.cache_key(None, "s", "m"), None);
+        assert_eq!(
+            AnthropicPolicy.cache_key(Some("client-key"), "s", "m"),
+            None
+        );
     }
 
     #[test]
@@ -297,10 +397,92 @@ mod tests {
             Some("in_memory")
         );
         assert_eq!(GptPolicy.retention_wire(TtlTier::Ephemeral1h), Some("24h"));
+    }
+
+    #[test]
+    fn gpt_cache_key_prefers_client_key() {
+        // Codex sends prompt_cache_key natively (= its session UUID,
+        // observed live 2026-06-11) — the client's key must win.
         assert_eq!(
-            GptPolicy.cache_key("sess-1", "gpt-5.2"),
-            Some("ostk:sess-1:gpt-5.2".to_string())
+            GptPolicy.cache_key(
+                Some("019eb8a0-d837-7ca3-bc9a-0ed5bb6ff73c"),
+                "sess-1",
+                "gpt-5.5"
+            ),
+            Some("019eb8a0-d837-7ca3-bc9a-0ed5bb6ff73c".to_string())
         );
+        // Absent (or empty) client key → synthesize from the lane key.
+        assert_eq!(
+            GptPolicy.cache_key(None, "sess-1", "gpt-5.5"),
+            Some("ostk:sess-1:gpt-5.5".to_string())
+        );
+        assert_eq!(
+            GptPolicy.cache_key(Some(""), "sess-1", "gpt-5.5"),
+            Some("ostk:sess-1:gpt-5.5".to_string())
+        );
+    }
+
+    #[test]
+    fn gpt_parses_responses_shape_from_live_wire_vector() {
+        // VERBATIM usage block from the chatgpt backend wire — capture
+        // 1781215373111-000001-e792b0924213, POST
+        // /backend-api/codex/responses, SSE `response.completed`,
+        // 2026-06-11.
+        let usage = serde_json::json!({
+            "input_tokens": 106206,
+            "input_tokens_details": {"cached_tokens": 21376},
+            "output_tokens": 594,
+            "output_tokens_details": {"reasoning_tokens": 516},
+            "total_tokens": 106800
+        });
+        let snap = GptPolicy.parse_usage(&usage).unwrap();
+        assert_eq!(snap.input_tokens, 106206);
+        assert_eq!(snap.cached_tokens, 21376);
+        assert_eq!(snap.cache_write_tokens, 0, "GPT has no write premium");
+        assert_eq!(snap.output_tokens, 594);
+    }
+
+    #[test]
+    fn gpt_parses_chat_completions_shape_dormant() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 400},
+            "completion_tokens": 25,
+            "total_tokens": 1025
+        });
+        let snap = GptPolicy.parse_usage(&usage).unwrap();
+        assert_eq!(snap.input_tokens, 1000);
+        assert_eq!(snap.cached_tokens, 400);
+        assert_eq!(snap.output_tokens, 25);
+    }
+
+    #[test]
+    fn gpt_usage_missing_details_defaults_zero_cached() {
+        let usage = serde_json::json!({"input_tokens": 50, "output_tokens": 5});
+        let snap = GptPolicy.parse_usage(&usage).unwrap();
+        assert_eq!(snap.cached_tokens, 0);
+        // No input side at all → None.
+        assert_eq!(GptPolicy.parse_usage(&serde_json::json!({"x": 1})), None);
+    }
+
+    #[test]
+    fn anthropic_parses_messages_usage_shape() {
+        let usage = serde_json::json!({
+            "input_tokens": 100,
+            "cache_read_input_tokens": 900,
+            "cache_creation_input_tokens": 300,
+            "output_tokens": 42
+        });
+        let snap = AnthropicPolicy.parse_usage(&usage).unwrap();
+        assert_eq!(snap.input_tokens, 100);
+        assert_eq!(snap.cached_tokens, 900);
+        assert_eq!(snap.cache_write_tokens, 300);
+        assert_eq!(snap.output_tokens, 42);
+        // Uncached request: cache fields absent → 0.
+        let bare = serde_json::json!({"input_tokens": 10, "output_tokens": 1});
+        let snap = AnthropicPolicy.parse_usage(&bare).unwrap();
+        assert_eq!(snap.cached_tokens, 0);
+        assert_eq!(snap.cache_write_tokens, 0);
     }
 
     #[test]
