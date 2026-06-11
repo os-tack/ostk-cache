@@ -196,17 +196,42 @@ fn prune_empty_text_blocks(value: &mut Value) -> (usize, usize) {
     (pruned, placeholders)
 }
 
+fn is_tool_result_user_message(msg: &Value) -> bool {
+    if msg.get("role").and_then(|r| r.as_str()) != Some("user") {
+        return false;
+    }
+    let Some(arr) = msg.get("content").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    !arr.is_empty()
+        && arr
+            .iter()
+            .all(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+}
+
+fn protected_current_user_idx(messages: &[Value]) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && !is_tool_result_user_message(m)
+        })
+        .or_else(|| {
+            messages
+                .iter()
+                .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+        })
+}
+
 pub fn strip_system_reminders_from_past_turns(value: &mut Value) -> SystemReminderStats {
     let messages = match value.get_mut("messages").and_then(|m| m.as_array_mut()) {
         Some(m) => m,
         None => return SystemReminderStats::default(),
     };
-    let last_user_idx = messages
-        .iter()
-        .rposition(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"));
+    let protected_user_idx = protected_current_user_idx(messages);
     let mut acc = SystemReminderStats::default();
     for (i, msg) in messages.iter_mut().enumerate() {
-        if Some(i) == last_user_idx {
+        if Some(i) == protected_user_idx {
             continue;
         }
         let Some(content) = msg.get_mut("content") else {
@@ -308,6 +333,51 @@ mod tests {
         let stats = strip_system_reminders_from_past_turns(&mut v);
         assert_eq!(stats.blocks_removed, 1);
         assert_eq!(v["messages"][0]["content"][0]["text"], "hello ");
+        assert_eq!(
+            v["messages"][2]["content"][0]["text"],
+            "current <system-reminder>load-bearing</system-reminder>"
+        );
+    }
+
+    #[test]
+    fn preserves_current_real_user_before_tool_result_wrapper() {
+        let mut v = json!({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "old <system-reminder>past</system-reminder>"
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "ack"}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "text",
+                        "text": "current <system-reminder>load-bearing</system-reminder>"
+                    }]
+                },
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_a", "name": "Read", "input": {}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_a",
+                        "content": [{"type": "text", "text": "ok"}]
+                    }]
+                }
+            ]
+        });
+        let stats = strip_system_reminders_from_past_turns(&mut v);
+        assert_eq!(stats.blocks_removed, 1);
+        assert_eq!(v["messages"][0]["content"][0]["text"], "old ");
         assert_eq!(
             v["messages"][2]["content"][0]["text"],
             "current <system-reminder>load-bearing</system-reminder>"
