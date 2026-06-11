@@ -18,7 +18,21 @@ Providers:
               simulate: caching is automatic prefix-match, no
               breakpoints, no write premium (codex-2034-review §48-55;
               live-wire confirmed 2026-06-11). AC: AC-G1 warm-turn hit
-              ratio >= 90% (observed baseline 96–98.5%).
+              ratio >= 90% (observed baseline 96–98.5%), SEGMENTED per
+              spec §7.4: lanes (prompt_cache_key) split at compaction
+              boundaries (input collapse >50% under the same key);
+              segment-opening turns are excluded from warm-hit, server
+              transients are INCLUDED (they are the real-world rate),
+              and each cold/dip turn carries a loss_class annotation
+              {cold_start, structural_reset, server_transient,
+              persistent_dip, client_churn, unresolved}. Dips are
+              classed by EVIDENCE first (byte-diff of request bodies vs
+              the previous usage-bearing turn settles server vs client
+              definitionally); shape heuristics apply only when bodies
+              are absent — there a dip persisting >=2 turns is the
+              alert class (would-be client churn, §7.4-ii), and a dip
+              with no recovery evidence (corpus end / reset boundary)
+              is unresolved, never persistent_dip.
               Pricing is wire-keyed (spec §7.1 verdict):
                 --gpt-wire oauth (default): NO dollar figures — AC-G2b
                   forbids $-ACs on oauth seats (no public evidence cached
@@ -71,6 +85,10 @@ GPT_PLATFORM_DEFAULTS = {
     "cached_per_mtok": 0.125,
     "output_per_mtok": 10.00,
 }
+
+# Spec §7.4 loss-taxonomy thresholds (CLI-overridable; gpt mode only).
+GPT_RESET_COLLAPSE = 0.50  # input < prev_input * this (same key) => structural_reset
+GPT_DIP_RATIO = 0.90  # non-opening turn hit ratio below this => dip
 
 
 def anthropic_rates(model: str) -> tuple[float, float]:
@@ -354,6 +372,7 @@ def extract_gpt_calls(capture_dir: str) -> tuple[list[dict], int]:
         calls.append(
             {
                 "entry": os.path.basename(entry),
+                "_dir": entry,  # retained for §7.4 evidence classification
                 "session": meta.get("session", "?"),
                 "ts": meta.get("ts"),
                 "model": req.get("model", "unknown"),
@@ -366,13 +385,153 @@ def extract_gpt_calls(capture_dir: str) -> tuple[list[dict], int]:
     return calls, skipped
 
 
+def _gpt_evidence_class(prev_dir, cur_dir):
+    """Byte-evidence dip classification (§7.4 preferred path).
+
+    When request bodies exist for the dip turn and its predecessor, the
+    append-only invariant — stable top-level fields (model,
+    instructions, prompt_cache_key) AND the prior input array an exact
+    prefix of the current one — proves the client resent a byte-stable
+    shared prefix, so the dip is server-side: server_transient
+    DEFINITIONALLY. (This is the same byte-diff that classed #14, #43
+    and #54 — including #43, which is shape-unresolvable because its
+    next usage-bearing turn is post-compaction.) A violated invariant
+    is mid-prefix mutation: client_churn (§7.4a — never yet observed;
+    a zero count is itself a receipt). Returns None when evidence is
+    unavailable, falling back to shape heuristics.
+    """
+    try:
+        prev_req = json.load(open(os.path.join(prev_dir, "request-out.body")))
+        cur_req = json.load(open(os.path.join(cur_dir, "request-out.body")))
+    except (OSError, json.JSONDecodeError):
+        return None
+    prev_in, cur_in = prev_req.get("input"), cur_req.get("input")
+    if not isinstance(prev_in, list) or not isinstance(cur_in, list):
+        return None
+    stable = all(
+        prev_req.get(k) == cur_req.get(k)
+        for k in ("model", "instructions", "prompt_cache_key")
+    )
+    if stable and cur_in[: len(prev_in)] == prev_in:
+        return "server_transient"
+    return "client_churn"
+
+
+def classify_gpt_lanes(calls, reset_collapse, dip_ratio):
+    """Spec §7.4 loss taxonomy over the capture stream.
+
+    Groups calls into lanes (prompt_cache_key, falling back to capture
+    session), orders each lane by timestamp, splits segments at
+    compaction boundaries (input collapse: cur < prev * reset_collapse
+    under the same key — §7.4c, codex auto-compact 215,818→26,175), and
+    annotates every turn in place:
+
+      lane          int   lane index
+      segment       int   lane-local segment index
+      segment_open  bool  first turn of a segment (excluded from warm-hit)
+      loss_class    str|None
+          cold_start        lane's first observed turn, zero cached
+          structural_reset  compaction boundary (excluded from warm-hit)
+          server_transient  byte-evidence append-only dip (§7.4b), or
+                            shape: single dip with observed recovery
+                            (INCLUDED in warm-hit)
+          client_churn      byte-evidence mid-prefix mutation (§7.4a)
+          persistent_dip    shape: dip run >=2 usage-bearing turns —
+                            alert class, §7.4-ii (INCLUDED in warm-hit)
+          unresolved        shape: single dip with NO recovery evidence
+                            (reset boundary or corpus end terminates the
+                            window) — never feeds the alert class
+
+    Dips are classed by EVIDENCE first (_gpt_evidence_class); shape
+    runs only cover evidence-less dips. Recovery windows are counted in
+    usage-bearing turns (no-usage capture entries never reach here).
+
+    Returns (lane_count, segment_count, loss_class_counts).
+    """
+    lanes: dict = {}
+    for c in calls:
+        lanes.setdefault(c["cache_key"] or c["session"], []).append(c)
+    seg_total = 0
+    loss = dict.fromkeys(
+        (
+            "cold_start",
+            "structural_reset",
+            "server_transient",
+            "persistent_dip",
+            "client_churn",
+            "unresolved",
+        ),
+        0,
+    )
+    for li, key in enumerate(sorted(lanes)):
+        turns = lanes[key]
+        turns.sort(key=lambda c: (c["ts"] or "", c["entry"]))
+        seg, prev = 0, None
+        for c in turns:
+            c["lane"], c["loss_class"] = li, None
+            if prev is None:
+                seg_total += 1
+                c["segment_open"] = True
+                if c["cached"] == 0:
+                    c["loss_class"] = "cold_start"
+            elif c["input"] < prev["input"] * reset_collapse:
+                seg += 1
+                seg_total += 1
+                c["segment_open"] = True
+                c["loss_class"] = "structural_reset"
+            else:
+                c["segment_open"] = False
+            c["segment"] = seg
+            c["_dip"] = (
+                not c["segment_open"]
+                and (c["cached"] / c["input"] if c["input"] else 0.0) < dip_ratio
+            )
+            if c["_dip"] and prev is not None:
+                # Evidence first: byte-diff vs the previous usage-bearing
+                # turn settles server vs client definitionally.
+                c["loss_class"] = _gpt_evidence_class(prev["_dir"], c["_dir"])
+            prev = c
+        # Shape fallback over evidence-less dips. A run flushed by a
+        # HEALTHY non-opening turn has observed recovery: 1 turn =>
+        # server_transient, >=2 => persistent_dip. A run flushed without
+        # recovery evidence (structural_reset boundary, corpus end, or
+        # an adjacent evidence-classed dip): single => unresolved (don't
+        # let corpus truncation feed the alert class), >=2 =>
+        # persistent_dip (persistence observed within the corpus).
+        run = []
+        for c in turns + [None]:  # None flushes the trailing run
+            if c is not None and c["_dip"] and c["loss_class"] is None:
+                run.append(c)
+                continue
+            recovered = c is not None and not c["segment_open"] and not c["_dip"]
+            cls = (
+                "persistent_dip"
+                if len(run) >= 2
+                else ("server_transient" if recovered else "unresolved")
+            )
+            for r in run:
+                r["loss_class"] = cls
+            run = []
+        for c in turns:
+            c.pop("_dip", None)
+            if c["loss_class"]:
+                loss[c["loss_class"]] += 1
+    return len(lanes), seg_total, loss
+
+
 def run_gpt(args) -> dict:
     calls, skipped = extract_gpt_calls(args.capture_dir)
     if not calls:
         sys.exit(f"no usable gpt captures in {args.capture_dir} ({skipped} skipped)")
 
-    warm = [c for c in calls if c["cached"] > 0]
-    cold = [c for c in calls if c["cached"] == 0]
+    n_lanes, n_segments, loss = classify_gpt_lanes(
+        calls, args.gpt_reset_collapse, args.gpt_dip_ratio
+    )
+    # §7.4 segmentation: warm set = every non-segment-opening turn.
+    # Lane starts + structural resets are excluded; server transients
+    # and persistent dips stay IN — they are the real-world hit rate.
+    warm = [c for c in calls if not c["segment_open"]]
+    opens = [c for c in calls if c["segment_open"]]
     t_in = sum(c["input"] for c in calls)
     t_cached = sum(c["cached"] for c in calls)
     t_out = sum(c["output"] for c in calls)
@@ -386,8 +545,11 @@ def run_gpt(args) -> dict:
         "window": {"capture_dir": args.capture_dir},
         "calls": len(calls),
         "skipped_no_usage": skipped,
+        "lanes": n_lanes,
+        "segments": n_segments,
         "warm_turns": len(warm),
-        "cold_turns": len(cold),
+        "segment_open_turns": len(opens),
+        "loss_classes": loss,
         "input_tokens_inclusive": t_in,
         "cached_tokens": t_cached,
         "uncached_input_tokens": t_in - t_cached,  # A2: input is cache-inclusive
@@ -398,9 +560,12 @@ def run_gpt(args) -> dict:
             {
                 "entry": c["entry"],
                 "model": c["model"],
+                "lane": c["lane"],
+                "segment": c["segment"],
                 "input": c["input"],
                 "cached": c["cached"],
                 "hit": c["cached"] / c["input"] if c["input"] else 0.0,
+                "loss_class": c["loss_class"],
             }
             for c in calls
         ],
@@ -452,6 +617,8 @@ def main() -> None:
     # gpt
     ap.add_argument("--capture-dir", default=os.path.expanduser("~/.cache/ostk-cache/http-capture-gpt"))
     ap.add_argument("--gpt-wire", choices=("oauth", "platform"), default="oauth")
+    ap.add_argument("--gpt-reset-collapse", type=float, default=GPT_RESET_COLLAPSE)
+    ap.add_argument("--gpt-dip-ratio", type=float, default=GPT_DIP_RATIO)
     ap.add_argument("--gpt-input-rate", type=float, default=GPT_PLATFORM_DEFAULTS["input_per_mtok"])
     ap.add_argument("--gpt-cached-rate", type=float, default=GPT_PLATFORM_DEFAULTS["cached_per_mtok"])
     ap.add_argument("--gpt-output-rate", type=float, default=GPT_PLATFORM_DEFAULTS["output_per_mtok"])
@@ -489,8 +656,12 @@ def main() -> None:
     else:
         print(
             f"gpt[{report['wire']}] calls={report['calls']} "
-            f"(warm {report['warm_turns']} / cold {report['cold_turns']}, "
+            f"(warm {report['warm_turns']} / segment-open {report['segment_open_turns']}, "
             f"{report['skipped_no_usage']} skipped no-usage)"
+        )
+        print(
+            f"lanes={report['lanes']} segments={report['segments']} loss: "
+            + " ".join(f"{k}={v}" for k, v in report["loss_classes"].items())
         )
         print(
             f"input(incl)={report['input_tokens_inclusive']/1e6:.2f}M "
@@ -499,7 +670,7 @@ def main() -> None:
             f"out={report['output_tokens']/1e3:.1f}k"
         )
         print(
-            f"warm-turn hit={report['warm_turn_hit_ratio']:.1%} "
+            f"warm-turn hit={report['warm_turn_hit_ratio']:.1%} (§7.4 segmented) "
             f"overall cached share={report['overall_cached_share']:.1%}"
         )
         if report.get("spend_provisional"):
