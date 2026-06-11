@@ -340,6 +340,9 @@ pub struct RebuildReport {
     /// it with the synthetic so a later turn's frozen offer can be
     /// matched (or declined) against the then-current boundary.
     pub boundary_fp: u64,
+    /// →2032 WARM freeze: index of the cycle-boundary message (see
+    /// [`FrozenSynthetic::boundary_idx`]).
+    pub boundary_idx: usize,
 }
 
 /// →2032 WARM freeze: a previously served synthetic context plus the
@@ -349,6 +352,14 @@ pub struct RebuildReport {
 pub struct FrozenSynthetic {
     pub text: String,
     pub boundary_fp: u64,
+    /// Index of the cycle-boundary message in the harness's history —
+    /// constant within a cycle, strictly increasing at every boundary
+    /// advance. Compared alongside the fingerprint so two byte-identical
+    /// consecutive user turns ("continue", "continue") can't falsely
+    /// match across an advance (review N1). Harness compaction shrinks
+    /// indices but re-keys via the conversation fingerprint, so no
+    /// false declines from that direction.
+    pub boundary_idx: usize,
 }
 
 /// Deterministic fingerprint of a JSON value (std `DefaultHasher` over
@@ -418,7 +429,7 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
     let frozen_match = config
         .frozen_synthetic
         .as_ref()
-        .filter(|f| f.boundary_fp == boundary_fp)
+        .filter(|f| f.boundary_fp == boundary_fp && f.boundary_idx == user_idx)
         .map(|f| f.text.clone());
     let (synthetic, sections_elided, envelope_found, native_count, user_count, served_frozen) =
         if let Some(frozen) = frozen_match {
@@ -557,6 +568,7 @@ pub fn apply_rebuild(req: &mut Value, config: &RebuildConfig) -> RebuildOutcome 
         sections_elided,
         served_frozen,
         boundary_fp,
+        boundary_idx: user_idx,
     })
 }
 
@@ -1918,6 +1930,7 @@ mod tests {
         let config = freeze_test_config(Some(FrozenSynthetic {
             text: "FROZEN PROJECTION BLOCK".into(),
             boundary_fp: fp_of_new(),
+            boundary_idx: 2,
         }));
         match apply_rebuild(&mut req, &config) {
             RebuildOutcome::Applied(report) => {
@@ -1956,6 +1969,7 @@ mod tests {
         let config = freeze_test_config(Some(FrozenSynthetic {
             text: "STALE PROJECTION FROM PRIOR CYCLE".into(),
             boundary_fp: fp_of_new(), // rendered against "new", boundary is now "NEWER user turn"
+            boundary_idx: 2,
         }));
         match apply_rebuild(&mut req, &config) {
             RebuildOutcome::Applied(report) => {
@@ -1999,14 +2013,14 @@ mod tests {
             .to_string();
 
         // Turn B: same cycle boundary ("new" is still the last real
-        // user message — the cycle grew by an assistant tool exchange),
-        // but the tail window slid and more history piled up.
+        // user message at the same index — mid-cycle the harness only
+        // APPENDS tool exchanges after it; pre-boundary history never
+        // changes outside compaction, which re-keys the conversation),
+        // but the proxy-side tail window slid.
         let mut turn_b = json!({
             "messages": [
                 {"role": "user", "content": "old"},
                 {"role": "assistant", "content": "old reply"},
-                {"role": "user", "content": "extra history — window slid"},
-                {"role": "assistant", "content": "r2"},
                 {"role": "user", "content": "new"},
                 {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}]},
                 {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}
@@ -2015,6 +2029,7 @@ mod tests {
         let mut cfg_b = freeze_test_config(Some(FrozenSynthetic {
             text: served_a.clone(),
             boundary_fp: report_a.boundary_fp,
+            boundary_idx: report_a.boundary_idx,
         }));
         cfg_b.transcript_tail_summary = Some("## tail B (slid)".into());
         match apply_rebuild(&mut turn_b, &cfg_b) {
@@ -2045,6 +2060,7 @@ mod tests {
         let mut config = freeze_test_config(Some(FrozenSynthetic {
             text: "FROZEN".into(),
             boundary_fp: fp_of_new(),
+            boundary_idx: 2,
         }));
         config.compact_target_bytes = Some(2); // absurdly tight budget
         match apply_rebuild(&mut req, &config) {
@@ -2058,6 +2074,38 @@ mod tests {
             req["messages"][0]["content"][0]["text"].as_str(),
             Some("FROZEN")
         );
+    }
+
+    #[test]
+    fn frozen_declined_for_identical_content_boundary_advance() {
+        // N1 (review): two byte-identical consecutive real user turns
+        // ("continue", "continue") collide on content fingerprint; the
+        // boundary INDEX disambiguates — it strictly increases at every
+        // advance — so the stale projection must still be declined.
+        let continue_msg = json!({"role": "user", "content": "continue"});
+        let mut req = json!({
+            "messages": [
+                {"role": "user", "content": "continue"},
+                {"role": "assistant", "content": "did a thing"},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+        let config = freeze_test_config(Some(FrozenSynthetic {
+            text: "STALE — rendered against the FIRST continue".into(),
+            boundary_fp: fingerprint_value(&continue_msg),
+            boundary_idx: 0,
+        }));
+        match apply_rebuild(&mut req, &config) {
+            RebuildOutcome::Applied(report) => {
+                assert!(
+                    !report.served_frozen,
+                    "identical-content boundary advance must render fresh"
+                );
+                assert_eq!(report.boundary_fp, fingerprint_value(&continue_msg));
+                assert_eq!(report.boundary_idx, 2);
+            }
+            other => panic!("expected Applied, got {:?}", other),
+        }
     }
 
     #[test]

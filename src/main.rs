@@ -61,6 +61,9 @@ struct FrozenProjection {
     /// Fingerprint of the cycle-boundary user message the projection
     /// was rendered against; a boundary advance declines the freeze.
     boundary_fp: u64,
+    /// Index of that boundary message (review N1: disambiguates
+    /// byte-identical consecutive user turns).
+    boundary_idx: usize,
     last_ts: u64,
 }
 
@@ -848,6 +851,7 @@ async fn handle_anthropic_message(
                                 Some(ostk_cache::rebuild::FrozenSynthetic {
                                     text: frozen.text.clone(),
                                     boundary_fp: frozen.boundary_fp,
+                                    boundary_idx: frozen.boundary_idx,
                                 });
                         }
                         // Miss on a WARM lane means the freeze isn't
@@ -924,6 +928,7 @@ async fn handle_anthropic_message(
                                             FrozenProjection {
                                                 text: txt.to_string(),
                                                 boundary_fp: report.boundary_fp,
+                                                boundary_idx: report.boundary_idx,
                                                 last_ts: now_secs,
                                             },
                                         );
