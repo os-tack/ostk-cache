@@ -479,6 +479,9 @@ async fn handle_anthropic_message(
     // Tier-driven TTLs for the breakpoints WE emit; status-quo
     // literals when the policy is dark. Harness-set markers are never
     // rewritten either way (→2030(a) condition-1 holds).
+    // NOTE (AC-G4): on a provider=gpt instance tier_wire() is None, so
+    // these fall back to the same literals — NOT an Anthropic behavior
+    // change; the GPT lane never emits cache_control at all.
     let firmware_ttl = policy_decision
         .and_then(|d| policy_backend.tier_wire(d.tier))
         .unwrap_or("1h");
