@@ -177,6 +177,20 @@ impl PolicyBackend for AnthropicPolicy {
     }
 }
 
+/// Which GPT wire this backend instance fronts. Retention semantics
+/// differ EMPIRICALLY between them (§7.1 experiment, 2026-06-11,
+/// receipts /tmp/ostk-exp-8082/log/): the chatgpt backend rejects
+/// `prompt_cache_retention` with 400 "Unsupported parameter"; the
+/// platform API documents it. Gate on upstream, not just provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GptWire {
+    /// chatgpt.com backend (oauth/codex seats). ONE retention tier —
+    /// keep-warm cadence is the only liveness lever.
+    ChatGpt,
+    /// api.openai.com platform (API-key seats). Two retention tiers.
+    Platform,
+}
+
 /// GPT/OpenAI backend skeleton (A2 lands the wire emission and usage
 /// parsing; nothing routes here while the resolved provider is
 /// Anthropic).
@@ -187,9 +201,21 @@ impl PolicyBackend for AnthropicPolicy {
 /// moment) classification — and the →1985-faithful compaction sizing —
 /// transfer unchanged. What does NOT transfer is pricing: there is no
 /// write premium, so the tier forecast governs *retention* selection
-/// rather than a priced TTL marker.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct GptPolicy;
+/// rather than a priced TTL marker — and only on the platform wire
+/// (see [`GptWire`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GptPolicy {
+    pub wire: GptWire,
+}
+
+/// chatgpt-backend instance (the only live GPT wire today).
+pub static GPT_CHATGPT: GptPolicy = GptPolicy {
+    wire: GptWire::ChatGpt,
+};
+/// platform-API instance (dormant until an API-key seat exists).
+pub static GPT_PLATFORM: GptPolicy = GptPolicy {
+    wire: GptWire::Platform,
+};
 
 impl PolicyBackend for GptPolicy {
     fn name(&self) -> &'static str {
@@ -212,15 +238,19 @@ impl PolicyBackend for GptPolicy {
     }
 
     fn retention_wire(&self, tier: TtlTier) -> Option<&'static str> {
-        // Mapping rationale: a 5m forecast (dense cadence or going
-        // cold) is served by default in-memory retention; a 1h
-        // forecast (sparse-but-alive cadence) wants the 24h extended
-        // tier. Exact request field path is pinned in A2 against
-        // codex empirical captures.
-        Some(match tier {
-            TtlTier::Ephemeral5m => "in_memory",
-            TtlTier::Ephemeral1h => "24h",
-        })
+        match self.wire {
+            // EMPIRICAL (§7.1, 2026-06-11): chatgpt backend returns
+            // 400 "Unsupported parameter: prompt_cache_retention".
+            // Permanently None on this wire — do not re-stub.
+            GptWire::ChatGpt => None,
+            // Platform mapping: 5m forecast (dense cadence or going
+            // cold) → default in-memory retention; 1h forecast
+            // (sparse-but-alive) → 24h extended tier.
+            GptWire::Platform => Some(match tier {
+                TtlTier::Ephemeral5m => "in_memory",
+                TtlTier::Ephemeral1h => "24h",
+            }),
+        }
     }
 
     fn cache_key(&self, client_key: Option<&str>, session_id: &str, model: &str) -> Option<String> {
@@ -271,11 +301,23 @@ impl PolicyBackend for GptPolicy {
     }
 }
 
-/// Resolve the backend for a configured provider.
-pub fn backend_for(provider: Provider) -> &'static dyn PolicyBackend {
+/// Resolve the backend for a configured provider + upstream.
+///
+/// The upstream string selects the GPT wire flavor: only an
+/// `api.openai.com` upstream gets platform semantics; everything else
+/// (chatgpt.com, unknown proxies) fails dark to the chatgpt backend
+/// — which emits no retention and no breakpoints — so a misconfigured
+/// upstream can never inject platform-only parameters.
+pub fn backend_for(provider: Provider, upstream: &str) -> &'static dyn PolicyBackend {
     match provider {
         Provider::Anthropic => &AnthropicPolicy,
-        Provider::Gpt => &GptPolicy,
+        Provider::Gpt => {
+            if upstream.contains("api.openai.com") {
+                &GPT_PLATFORM
+            } else {
+                &GPT_CHATGPT
+            }
+        }
     }
 }
 
@@ -384,19 +426,30 @@ mod tests {
         // Documented A1 choice: the GPT backend shares the →2032 lane
         // machine until A2 pins provider-specific params.
         for seq in reference_sequences() {
-            assert_equivalent_over(&GptPolicy, &seq);
+            assert_equivalent_over(&GPT_CHATGPT, &seq);
+            assert_equivalent_over(&GPT_PLATFORM, &seq);
         }
     }
 
     #[test]
     fn gpt_emits_no_breakpoints_maps_retention() {
-        assert_eq!(GptPolicy.tier_wire(TtlTier::Ephemeral5m), None);
-        assert_eq!(GptPolicy.tier_wire(TtlTier::Ephemeral1h), None);
+        for backend in [&GPT_CHATGPT, &GPT_PLATFORM] {
+            assert_eq!(backend.tier_wire(TtlTier::Ephemeral5m), None);
+            assert_eq!(backend.tier_wire(TtlTier::Ephemeral1h), None);
+        }
+        // §7.1 empirical verdict: chatgpt wire rejects
+        // prompt_cache_retention (400) — permanently None.
+        assert_eq!(GPT_CHATGPT.retention_wire(TtlTier::Ephemeral5m), None);
+        assert_eq!(GPT_CHATGPT.retention_wire(TtlTier::Ephemeral1h), None);
+        // Platform wire keeps the two-tier map.
         assert_eq!(
-            GptPolicy.retention_wire(TtlTier::Ephemeral5m),
+            GPT_PLATFORM.retention_wire(TtlTier::Ephemeral5m),
             Some("in_memory")
         );
-        assert_eq!(GptPolicy.retention_wire(TtlTier::Ephemeral1h), Some("24h"));
+        assert_eq!(
+            GPT_PLATFORM.retention_wire(TtlTier::Ephemeral1h),
+            Some("24h")
+        );
     }
 
     #[test]
@@ -404,7 +457,7 @@ mod tests {
         // Codex sends prompt_cache_key natively (= its session UUID,
         // observed live 2026-06-11) — the client's key must win.
         assert_eq!(
-            GptPolicy.cache_key(
+            GPT_CHATGPT.cache_key(
                 Some("019eb8a0-d837-7ca3-bc9a-0ed5bb6ff73c"),
                 "sess-1",
                 "gpt-5.5"
@@ -413,11 +466,11 @@ mod tests {
         );
         // Absent (or empty) client key → synthesize from the lane key.
         assert_eq!(
-            GptPolicy.cache_key(None, "sess-1", "gpt-5.5"),
+            GPT_CHATGPT.cache_key(None, "sess-1", "gpt-5.5"),
             Some("ostk:sess-1:gpt-5.5".to_string())
         );
         assert_eq!(
-            GptPolicy.cache_key(Some(""), "sess-1", "gpt-5.5"),
+            GPT_CHATGPT.cache_key(Some(""), "sess-1", "gpt-5.5"),
             Some("ostk:sess-1:gpt-5.5".to_string())
         );
     }
@@ -435,7 +488,7 @@ mod tests {
             "output_tokens_details": {"reasoning_tokens": 516},
             "total_tokens": 106800
         });
-        let snap = GptPolicy.parse_usage(&usage).unwrap();
+        let snap = GPT_CHATGPT.parse_usage(&usage).unwrap();
         assert_eq!(snap.input_tokens, 106206);
         assert_eq!(snap.cached_tokens, 21376);
         assert_eq!(snap.cache_write_tokens, 0, "GPT has no write premium");
@@ -450,7 +503,7 @@ mod tests {
             "completion_tokens": 25,
             "total_tokens": 1025
         });
-        let snap = GptPolicy.parse_usage(&usage).unwrap();
+        let snap = GPT_CHATGPT.parse_usage(&usage).unwrap();
         assert_eq!(snap.input_tokens, 1000);
         assert_eq!(snap.cached_tokens, 400);
         assert_eq!(snap.output_tokens, 25);
@@ -459,10 +512,10 @@ mod tests {
     #[test]
     fn gpt_usage_missing_details_defaults_zero_cached() {
         let usage = serde_json::json!({"input_tokens": 50, "output_tokens": 5});
-        let snap = GptPolicy.parse_usage(&usage).unwrap();
+        let snap = GPT_CHATGPT.parse_usage(&usage).unwrap();
         assert_eq!(snap.cached_tokens, 0);
         // No input side at all → None.
-        assert_eq!(GptPolicy.parse_usage(&serde_json::json!({"x": 1})), None);
+        assert_eq!(GPT_CHATGPT.parse_usage(&serde_json::json!({"x": 1})), None);
     }
 
     #[test]
@@ -486,16 +539,36 @@ mod tests {
     }
 
     #[test]
-    fn backend_for_resolves_by_provider() {
-        assert_eq!(backend_for(Provider::Anthropic).name(), "anthropic");
-        assert_eq!(backend_for(Provider::Gpt).name(), "gpt");
+    fn backend_for_resolves_by_provider_and_upstream() {
+        assert_eq!(
+            backend_for(Provider::Anthropic, "https://api.anthropic.com").name(),
+            "anthropic"
+        );
+        // Platform wire only on an api.openai.com upstream.
+        let platform = backend_for(Provider::Gpt, "https://api.openai.com/v1");
+        assert_eq!(platform.retention_wire(TtlTier::Ephemeral1h), Some("24h"));
+        // chatgpt.com — and any unknown upstream — fails dark.
+        for upstream in ["https://chatgpt.com", "http://127.0.0.1:9999", ""] {
+            let b = backend_for(Provider::Gpt, upstream);
+            assert_eq!(b.name(), "gpt");
+            assert_eq!(
+                b.retention_wire(TtlTier::Ephemeral1h),
+                None,
+                "non-platform upstream {upstream:?} must not emit retention"
+            );
+        }
     }
 
     #[test]
     fn first_request_classifies_dead_via_backend() {
         // Spot-check the delegation actually runs the real machine.
         let mut lane = LaneState::default();
-        let d = backend_for(Provider::Anthropic).decide(&mut lane, 1_000_000, 100_000, &params());
+        let d = backend_for(Provider::Anthropic, "https://api.anthropic.com").decide(
+            &mut lane,
+            1_000_000,
+            100_000,
+            &params(),
+        );
         assert_eq!(d.class, LaneClass::Dead);
         assert_eq!(d.compact_target, Some(27_800));
     }

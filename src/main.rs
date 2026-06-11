@@ -403,7 +403,8 @@ async fn handle_anthropic_message(
     // emission route through the provider backend. Anthropic (default)
     // is a pure delegation — byte-identical to the pre-trait path,
     // held by the equivalence tests in `provider_policy`.
-    let policy_backend = provider_policy::backend_for(config.provider.value);
+    let policy_backend =
+        provider_policy::backend_for(config.provider.value, &config.upstream.value);
     let (policy_decision, mut policy_commit): (
         Option<PolicyDecision>,
         Option<PendingPolicyCommit>,
