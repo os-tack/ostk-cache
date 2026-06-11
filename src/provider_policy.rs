@@ -301,18 +301,31 @@ impl PolicyBackend for GptPolicy {
     }
 }
 
+/// Host-equality check for the platform upstream (review nit on
+/// a7bfd8a): parse the authority out of the URL rather than substring-
+/// matching, so `https://proxy.example/api.openai.com` cannot acquire
+/// platform semantics.
+fn is_platform_upstream(upstream: &str) -> bool {
+    let rest = upstream.split("://").nth(1).unwrap_or(upstream);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    host.eq_ignore_ascii_case("api.openai.com")
+}
+
 /// Resolve the backend for a configured provider + upstream.
 ///
 /// The upstream string selects the GPT wire flavor: only an
-/// `api.openai.com` upstream gets platform semantics; everything else
-/// (chatgpt.com, unknown proxies) fails dark to the chatgpt backend
-/// — which emits no retention and no breakpoints — so a misconfigured
-/// upstream can never inject platform-only parameters.
+/// `api.openai.com` host (exact, case-insensitive) gets platform
+/// semantics; everything else (chatgpt.com, unknown proxies) fails
+/// dark to the chatgpt backend — which emits no retention and no
+/// breakpoints — so a misconfigured upstream can never inject
+/// platform-only parameters.
 pub fn backend_for(provider: Provider, upstream: &str) -> &'static dyn PolicyBackend {
     match provider {
         Provider::Anthropic => &AnthropicPolicy,
         Provider::Gpt => {
-            if upstream.contains("api.openai.com") {
+            if is_platform_upstream(upstream) {
                 &GPT_PLATFORM
             } else {
                 &GPT_CHATGPT
@@ -544,11 +557,29 @@ mod tests {
             backend_for(Provider::Anthropic, "https://api.anthropic.com").name(),
             "anthropic"
         );
-        // Platform wire only on an api.openai.com upstream.
-        let platform = backend_for(Provider::Gpt, "https://api.openai.com/v1");
-        assert_eq!(platform.retention_wire(TtlTier::Ephemeral1h), Some("24h"));
-        // chatgpt.com — and any unknown upstream — fails dark.
-        for upstream in ["https://chatgpt.com", "http://127.0.0.1:9999", ""] {
+        // Platform wire only on an api.openai.com HOST (anchored, not
+        // substring — a7bfd8a review nit).
+        for upstream in [
+            "https://api.openai.com/v1",
+            "https://api.openai.com:443/v1",
+            "https://API.OPENAI.COM",
+        ] {
+            let platform = backend_for(Provider::Gpt, upstream);
+            assert_eq!(
+                platform.retention_wire(TtlTier::Ephemeral1h),
+                Some("24h"),
+                "platform host {upstream:?} must get platform semantics"
+            );
+        }
+        // chatgpt.com, unknown upstreams — and PATH-EMBEDDED spoofs —
+        // fail dark.
+        for upstream in [
+            "https://chatgpt.com",
+            "http://127.0.0.1:9999",
+            "",
+            "https://proxy.example/api.openai.com",
+            "https://api.openai.com.evil.example",
+        ] {
             let b = backend_for(Provider::Gpt, upstream);
             assert_eq!(b.name(), "gpt");
             assert_eq!(
