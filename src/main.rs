@@ -376,76 +376,78 @@ async fn handle_anthropic_message(
     // failures must not mark a cache prefix as live.
     // Independent of the →2030(a) forecast above (telemetry-only);
     // this is the active policy with its own per-lane cadence.
-    let (policy_decision, policy_commit): (Option<PolicyDecision>, Option<PendingPolicyCommit>) =
-        if config.write_policy_enabled.value {
-            // Lane key needs the model id; serde has no prefix-parse mode
-            // so this is one extra full-body parse per request — local
-            // proxy at turn cadence, and only on the policy path.
-            #[derive(Deserialize)]
-            struct ModelProbe {
-                #[serde(default)]
-                model: String,
-            }
-            let model = serde_json::from_str::<ModelProbe>(&body_str)
-                .map(|p| p.model)
-                .unwrap_or_default();
-            let params = write_policy::WritePolicyParams {
-                compact: config.policy_compact.value,
-                min_prefix: config.policy_min_prefix.value,
-                cold_cap: config.policy_cold_cap.value,
-            };
-            let observed_prompt_tokens =
-                (req_bytes_in as f64 / config.truth_bytes_per_token.value.max(1.0)).round() as u64;
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let key = (session_id.clone(), model);
-            // Compute against a candidate lane so local rejections and upstream
-            // failures do not mark a cache prefix as committed. The candidate is
-            // written back only after a successful upstream response stream.
-            let mut candidate_lane = state
-                .lane_store
-                .get(&key)
-                .map(|lane| lane.clone())
-                .unwrap_or_default();
-            let decision = write_policy::decide(
-                &mut candidate_lane,
-                now_secs,
-                observed_prompt_tokens,
-                &params,
-            );
-            // Lanes are keyed (session, model) and otherwise accumulate for the
-            // proxy's lifetime; drop lanes idle past the eviction window.
-            if state.lane_store.len() > LANE_SWEEP_MIN_LEN {
-                state.lane_store.retain(|_, lane| {
-                    lane.last_ts
-                        .is_none_or(|ts| now_secs.saturating_sub(ts) <= LANE_IDLE_EVICT_SECS)
-                });
-            }
-            if config.verbose.value {
-                println!(
-                    "[proxy] policy: {} tier={} read~{} write~{}{}",
-                    decision.class.as_str(),
-                    decision.tier.wire_str(),
-                    decision.expected_read,
-                    decision.expected_write,
-                    decision
-                        .compact_target
-                        .map(|t| format!(" compact_target={}", t))
-                        .unwrap_or_default()
-                );
-            }
-            (
-                Some(decision),
-                Some(PendingPolicyCommit {
-                    key,
-                    lane: candidate_lane,
-                }),
-            )
-        } else {
-            (None, None)
+    let (policy_decision, mut policy_commit): (
+        Option<PolicyDecision>,
+        Option<PendingPolicyCommit>,
+    ) = if config.write_policy_enabled.value {
+        // Lane key needs the model id; serde has no prefix-parse mode
+        // so this is one extra full-body parse per request — local
+        // proxy at turn cadence, and only on the policy path.
+        #[derive(Deserialize)]
+        struct ModelProbe {
+            #[serde(default)]
+            model: String,
+        }
+        let model = serde_json::from_str::<ModelProbe>(&body_str)
+            .map(|p| p.model)
+            .unwrap_or_default();
+        let params = write_policy::WritePolicyParams {
+            compact: config.policy_compact.value,
+            min_prefix: config.policy_min_prefix.value,
+            cold_cap: config.policy_cold_cap.value,
         };
+        let observed_prompt_tokens =
+            (req_bytes_in as f64 / config.truth_bytes_per_token.value.max(1.0)).round() as u64;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let key = (session_id.clone(), model);
+        // Compute against a candidate lane so local rejections and upstream
+        // failures do not mark a cache prefix as committed. The candidate is
+        // written back only after a successful upstream response stream.
+        let mut candidate_lane = state
+            .lane_store
+            .get(&key)
+            .map(|lane| lane.clone())
+            .unwrap_or_default();
+        let decision = write_policy::decide(
+            &mut candidate_lane,
+            now_secs,
+            observed_prompt_tokens,
+            &params,
+        );
+        // Lanes are keyed (session, model) and otherwise accumulate for the
+        // proxy's lifetime; drop lanes idle past the eviction window.
+        if state.lane_store.len() > LANE_SWEEP_MIN_LEN {
+            state.lane_store.retain(|_, lane| {
+                lane.last_ts
+                    .is_none_or(|ts| now_secs.saturating_sub(ts) <= LANE_IDLE_EVICT_SECS)
+            });
+        }
+        if config.verbose.value {
+            println!(
+                "[proxy] policy: {} tier={} read~{} write~{}{}",
+                decision.class.as_str(),
+                decision.tier.wire_str(),
+                decision.expected_read,
+                decision.expected_write,
+                decision
+                    .compact_target
+                    .map(|t| format!(" compact_target={}", t))
+                    .unwrap_or_default()
+            );
+        }
+        (
+            Some(decision),
+            Some(PendingPolicyCommit {
+                key,
+                lane: candidate_lane,
+            }),
+        )
+    } else {
+        (None, None)
+    };
     // Tier-driven TTLs for the breakpoints WE emit; status-quo
     // literals when the policy is dark. Harness-set markers are never
     // rewritten either way (→2030(a) condition-1 holds).
@@ -764,16 +766,37 @@ async fn handle_anthropic_message(
             // req.system with cache_control:1h so it cache-hits on
             // every turn after the first. Idempotent — repeated
             // requests do not double-append.
+            //
+            // →2032: the policy tier is floored against harness-set 1h
+            // markers in `messages` — a 5m block in `system` upstream
+            // of a harness 1h marker is rejected by the API
+            // (non-increasing TTL order across tools/system/messages).
+            let orientation_ttl =
+                ostk_cache::rebuild::clamp_ttl_to_harness_floor(&value, firmware_ttl);
+            if orientation_ttl != firmware_ttl {
+                // The harness's 1h marker keeps this prefix alive for
+                // 1h whatever tier the policy picked; record the
+                // effective lifetime so the next request's WARM/DEAD
+                // call sees it.
+                if let Some(commit) = policy_commit.as_mut() {
+                    commit.lane.ttl_s = write_policy::TtlTier::Ephemeral1h.as_secs();
+                }
+            }
             if rebuild_config.enabled
                 && ostk_cache::rebuild::append_kernel_orientation_to_system(
                     &mut value,
-                    firmware_ttl,
+                    orientation_ttl,
                 )
             {
                 if config.verbose.value {
                     println!(
-                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl={})",
-                        firmware_ttl
+                        "[proxy] rebuild: appended kernel orientation to system (firmware-class, ttl={}{})",
+                        orientation_ttl,
+                        if orientation_ttl != firmware_ttl {
+                            " — clamped to harness 1h floor"
+                        } else {
+                            ""
+                        }
                     );
                 }
                 mutated = true;
@@ -1026,6 +1049,20 @@ async fn handle_anthropic_message(
 
                 firmware_len = firmware.len();
 
+                // →2032: same harness-floor rule as the rebuild path —
+                // never emit a 5m breakpoint upstream of a harness-set
+                // 1h marker (API rejects ascending TTL order).
+                let firmware_ttl = if firmware_ttl != "1h"
+                    && req
+                        .messages
+                        .iter()
+                        .any(|m| ostk_cache::rebuild::value_has_1h_marker(&m.content))
+                {
+                    "1h"
+                } else {
+                    firmware_ttl
+                };
+
                 req.system = Some(json!([
                     {
                         "type": "text",
@@ -1036,7 +1073,23 @@ async fn handle_anthropic_message(
                     }
                 ]));
 
-                if let Some(last_msg) = req.messages.iter_mut().rev().find(|m| m.role == "user") {
+                let last_user_idx = req.messages.iter().rposition(|m| m.role == "user");
+                // →2032 harness floor for the HUD breakpoint: markers on
+                // the HUD's own message are stripped below, so only
+                // messages AFTER the last user turn can sit downstream
+                // of it.
+                let hud_ttl = if hud_ttl != "1h"
+                    && last_user_idx.is_some_and(|i| {
+                        req.messages[i + 1..]
+                            .iter()
+                            .any(|m| ostk_cache::rebuild::value_has_1h_marker(&m.content))
+                    }) {
+                    "1h"
+                } else {
+                    hud_ttl
+                };
+
+                if let Some(last_msg) = last_user_idx.map(|i| &mut req.messages[i]) {
                     let has_tool_result = last_msg
                         .content
                         .as_array()

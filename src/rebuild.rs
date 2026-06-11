@@ -59,6 +59,40 @@ const ORIENTATION_HEADER_MARKER: &str = "# ostk-cache kernel orientation";
 /// of blocks). Idempotent — if the orientation marker is already
 /// present, no-op.
 ///
+/// True if `v` contains a `cache_control` block with `ttl: "1h"`
+/// anywhere in its tree.
+pub fn value_has_1h_marker(v: &Value) -> bool {
+    match v {
+        Value::Object(map) => {
+            map.get("cache_control")
+                .and_then(|c| c.get("ttl"))
+                .and_then(|t| t.as_str())
+                == Some("1h")
+                || map.values().any(value_has_1h_marker)
+        }
+        Value::Array(arr) => arr.iter().any(value_has_1h_marker),
+        _ => false,
+    }
+}
+
+/// →2032: floor a proxy-chosen wire TTL against harness-set markers.
+///
+/// Anthropic requires cache_control blocks in non-increasing TTL order
+/// across `tools` → `system` → `messages` (a 1h block after a 5m block
+/// is a 400). Harness-set markers are never rewritten (→2030(a)), so
+/// when the harness has pinned a 1h marker anywhere in `messages`,
+/// every proxy-owned breakpoint upstream of it must stay at 1h
+/// regardless of the policy tier. This costs nothing: the harness's
+/// 1h breakpoint already commits the whole prefix at 1h pricing, so a
+/// 5m tier had no spend left to save on this request.
+pub fn clamp_ttl_to_harness_floor(req: &Value, ttl: &'static str) -> &'static str {
+    if ttl != "1h" && req.get("messages").is_some_and(value_has_1h_marker) {
+        "1h"
+    } else {
+        ttl
+    }
+}
+
 /// Returns true if a block was appended; false otherwise.
 pub fn append_kernel_orientation_to_system(value: &mut Value, ttl: &str) -> bool {
     let with_cache_control = count_cache_control_fields(value) < ANTHROPIC_CACHE_CONTROL_LIMIT;
@@ -2294,6 +2328,67 @@ mod tests {
             synthetic.contains("system orientation") || synthetic.contains("system prompt"),
             "synthetic must reference where discipline lives"
         );
+    }
+
+    // ── →2032: harness TTL floor ─────────────────────────────────────────
+
+    #[test]
+    fn ttl_floor_clamps_5m_when_harness_pins_1h_in_messages() {
+        // Regression: the live Jun-11 flag-on 400 — claude-code pins
+        // ttl:1h on messages[0].content[1]; a tier-driven 5m orientation
+        // block at the end of `system` then violates the API's
+        // non-increasing TTL order.
+        let req = json!({
+            "system": [
+                {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "boot"},
+                    {"type": "text", "text": "ctx", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]
+        });
+        assert_eq!(clamp_ttl_to_harness_floor(&req, "5m"), "1h");
+        assert_eq!(clamp_ttl_to_harness_floor(&req, "1h"), "1h");
+    }
+
+    #[test]
+    fn ttl_floor_keeps_5m_without_downstream_1h() {
+        // Default-ttl (5m) harness markers downstream don't force 1h —
+        // 5m followed by 5m is legal.
+        let req = json!({
+            "system": [{"type": "text", "text": "sys"}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "boot", "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+        assert_eq!(clamp_ttl_to_harness_floor(&req, "5m"), "5m");
+        // 1h markers in `system` are upstream of our append-at-end
+        // site only when ours is also in system — but they're not in
+        // `messages`, so no clamp either way:
+        let req2 = json!({
+            "system": [
+                {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert_eq!(clamp_ttl_to_harness_floor(&req2, "5m"), "5m");
+    }
+
+    #[test]
+    fn value_has_1h_marker_scans_nested_blocks() {
+        assert!(value_has_1h_marker(&json!([
+            {"type": "tool_result", "content": [
+                {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}
+        ])));
+        assert!(!value_has_1h_marker(&json!([
+            {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+        ])));
+        assert!(!value_has_1h_marker(&json!("plain string content")));
     }
 
     // ── →1830: system-tier kernel orientation ───────────────────────────
