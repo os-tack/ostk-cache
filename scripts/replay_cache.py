@@ -389,8 +389,9 @@ def _gpt_evidence_class(prev_dir, cur_dir):
     """Byte-evidence dip classification (§7.4 preferred path).
 
     When request bodies exist for the dip turn and its predecessor, the
-    append-only invariant — stable top-level fields (model,
-    instructions, prompt_cache_key) AND the prior input array an exact
+    append-only invariant — ALL top-level request fields except input
+    byte-stable (a tools or instructions change shifts the rendered
+    prompt prefix CLIENT-side) AND the prior input array an exact
     prefix of the current one — proves the client resent a byte-stable
     shared prefix, so the dip is server-side: server_transient
     DEFINITIONALLY. (This is the same byte-diff that classed #14, #43
@@ -408,10 +409,8 @@ def _gpt_evidence_class(prev_dir, cur_dir):
     prev_in, cur_in = prev_req.get("input"), cur_req.get("input")
     if not isinstance(prev_in, list) or not isinstance(cur_in, list):
         return None
-    stable = all(
-        prev_req.get(k) == cur_req.get(k)
-        for k in ("model", "instructions", "prompt_cache_key")
-    )
+    stable_keys = (set(prev_req) | set(cur_req)) - {"input"}
+    stable = all(prev_req.get(k) == cur_req.get(k) for k in stable_keys)
     if stable and cur_in[: len(prev_in)] == prev_in:
         return "server_transient"
     return "client_churn"
