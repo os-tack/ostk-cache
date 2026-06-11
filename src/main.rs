@@ -49,6 +49,29 @@ const LANE_SWEEP_MIN_LEN: usize = 64;
 type HookAdapterHandle = Arc<Mutex<DaemonAdapter<InMemoryPageTable>>>;
 
 #[derive(Clone)]
+struct PendingPolicyCommit {
+    key: (SessionId, String),
+    lane: write_policy::LaneState,
+}
+
+fn commit_policy_lane(lane_store: &LaneStore, commit: PendingPolicyCommit) {
+    let PendingPolicyCommit {
+        key,
+        lane: candidate,
+    } = commit;
+    let candidate_ts = candidate.last_ts;
+    let mut lane = lane_store.entry(key).or_default();
+    let current_is_newer = match (lane.last_ts, candidate_ts) {
+        (Some(current), Some(candidate)) => current > candidate,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if !current_is_newer {
+        *lane = candidate;
+    }
+}
+
+#[derive(Clone)]
 struct AppState {
     amp_store: AmpStore,
     cadence_store: CadenceStore,
@@ -348,66 +371,81 @@ async fn handle_anthropic_message(
     // →2032: active write-policy decision — one per request, computed
     // before the rebuild config so a DEAD verdict can size the
     // re-projection and the tier can drive the cache_control emission
-    // sites below. Lane state advances only while the policy is
-    // enabled, so a mid-session flag flip starts from a clean lane.
+    // sites below. We compute a candidate lane here, but commit it only
+    // after a successful upstream response; local rejections and upstream
+    // failures must not mark a cache prefix as live.
     // Independent of the →2030(a) forecast above (telemetry-only);
     // this is the active policy with its own per-lane cadence.
-    let policy_decision: Option<PolicyDecision> = if config.write_policy_enabled.value {
-        // Lane key needs the model id; serde has no prefix-parse mode
-        // so this is one extra full-body parse per request — local
-        // proxy at turn cadence, and only on the policy path.
-        #[derive(Deserialize)]
-        struct ModelProbe {
-            #[serde(default)]
-            model: String,
-        }
-        let model = serde_json::from_str::<ModelProbe>(&body_str)
-            .map(|p| p.model)
-            .unwrap_or_default();
-        let params = write_policy::WritePolicyParams {
-            compact: config.policy_compact.value,
-            min_prefix: config.policy_min_prefix.value,
-            cold_cap: config.policy_cold_cap.value,
-        };
-        let observed_prompt_tokens =
-            (req_bytes_in as f64 / config.truth_bytes_per_token.value.max(1.0)).round() as u64;
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let key = (session_id.clone(), model);
-        // entry() holds the shard lock across decide() so concurrent requests
-        // on a shared session id (subagent/main-loop interleave) can't drop
-        // gap observations.
-        let decision = {
-            let mut lane = state.lane_store.entry(key).or_default();
-            write_policy::decide(&mut lane, now_secs, observed_prompt_tokens, &params)
-        };
-        // Lanes are keyed (session, model) and otherwise accumulate for the
-        // proxy's lifetime; drop lanes idle past the eviction window.
-        if state.lane_store.len() > LANE_SWEEP_MIN_LEN {
-            state.lane_store.retain(|_, lane| {
-                lane.last_ts
-                    .is_none_or(|ts| now_secs.saturating_sub(ts) <= LANE_IDLE_EVICT_SECS)
-            });
-        }
-        if config.verbose.value {
-            println!(
-                "[proxy] policy: {} tier={} read~{} write~{}{}",
-                decision.class.as_str(),
-                decision.tier.wire_str(),
-                decision.expected_read,
-                decision.expected_write,
-                decision
-                    .compact_target
-                    .map(|t| format!(" compact_target={}", t))
-                    .unwrap_or_default()
+    let (policy_decision, policy_commit): (Option<PolicyDecision>, Option<PendingPolicyCommit>) =
+        if config.write_policy_enabled.value {
+            // Lane key needs the model id; serde has no prefix-parse mode
+            // so this is one extra full-body parse per request — local
+            // proxy at turn cadence, and only on the policy path.
+            #[derive(Deserialize)]
+            struct ModelProbe {
+                #[serde(default)]
+                model: String,
+            }
+            let model = serde_json::from_str::<ModelProbe>(&body_str)
+                .map(|p| p.model)
+                .unwrap_or_default();
+            let params = write_policy::WritePolicyParams {
+                compact: config.policy_compact.value,
+                min_prefix: config.policy_min_prefix.value,
+                cold_cap: config.policy_cold_cap.value,
+            };
+            let observed_prompt_tokens =
+                (req_bytes_in as f64 / config.truth_bytes_per_token.value.max(1.0)).round() as u64;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let key = (session_id.clone(), model);
+            // Compute against a candidate lane so local rejections and upstream
+            // failures do not mark a cache prefix as committed. The candidate is
+            // written back only after a successful upstream response stream.
+            let mut candidate_lane = state
+                .lane_store
+                .get(&key)
+                .map(|lane| lane.clone())
+                .unwrap_or_default();
+            let decision = write_policy::decide(
+                &mut candidate_lane,
+                now_secs,
+                observed_prompt_tokens,
+                &params,
             );
-        }
-        Some(decision)
-    } else {
-        None
-    };
+            // Lanes are keyed (session, model) and otherwise accumulate for the
+            // proxy's lifetime; drop lanes idle past the eviction window.
+            if state.lane_store.len() > LANE_SWEEP_MIN_LEN {
+                state.lane_store.retain(|_, lane| {
+                    lane.last_ts
+                        .is_none_or(|ts| now_secs.saturating_sub(ts) <= LANE_IDLE_EVICT_SECS)
+                });
+            }
+            if config.verbose.value {
+                println!(
+                    "[proxy] policy: {} tier={} read~{} write~{}{}",
+                    decision.class.as_str(),
+                    decision.tier.wire_str(),
+                    decision.expected_read,
+                    decision.expected_write,
+                    decision
+                        .compact_target
+                        .map(|t| format!(" compact_target={}", t))
+                        .unwrap_or_default()
+                );
+            }
+            (
+                Some(decision),
+                Some(PendingPolicyCommit {
+                    key,
+                    lane: candidate_lane,
+                }),
+            )
+        } else {
+            (None, None)
+        };
     // Tier-driven TTLs for the breakpoints WE emit; status-quo
     // literals when the policy is dark. Harness-set markers are never
     // rewritten either way (→2030(a) condition-1 holds).
@@ -1172,6 +1210,8 @@ async fn handle_anthropic_message(
     let reduction_for_line = reduction_report_capture.clone();
     let capture_root_for_stream = config.capture_http_dir.value.clone();
     let capture_id_for_stream = http_capture.as_ref().map(|c| c.id().to_string());
+    let lane_store_for_stream = state.lane_store.clone();
+    let mut policy_commit_for_stream = policy_commit;
 
     // →1985 X1: usage-truth passthrough. When enabled (globally or via
     // the per-session allowlist — X1(B)), the streamed response's
@@ -1194,7 +1234,17 @@ async fn handle_anthropic_message(
             None
         };
 
-        while let Ok(Some(chunk)) = response.chunk().await {
+        let mut stream_ok = true;
+        loop {
+            let chunk = match response.chunk().await {
+                Ok(Some(chunk)) => chunk,
+                Ok(None) => break,
+                Err(e) => {
+                    stream_ok = false;
+                    eprintln!("[proxy] upstream stream error: {}", e);
+                    break;
+                }
+            };
             if chunk.is_empty() {
                 continue;
             }
@@ -1225,6 +1275,12 @@ async fn handle_anthropic_message(
                 &accumulated,
                 turn_started.elapsed(),
             );
+        }
+
+        if status.is_success() && stream_ok {
+            if let Some(commit) = policy_commit_for_stream.take() {
+                commit_policy_lane(&lane_store_for_stream, commit);
+            }
         }
 
         if status.as_u16() >= 400 {
