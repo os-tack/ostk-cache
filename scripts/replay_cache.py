@@ -279,6 +279,8 @@ def run_anthropic(args) -> dict:
             "calls": stats["calls"],
             "cache_read": r,
             "cache_write": w,
+            "cache_write_5m": stats["cache_w_5m"],
+            "cache_write_1h": stats["cache_w_1h"],
             "hit_ratio": r / (r + w) if r + w else 0.0,
             "write_per_call": w // stats["calls"],
             "spend": sp,
@@ -287,9 +289,15 @@ def run_anthropic(args) -> dict:
 
     base_sum, sim_sum = summarize(base, base_pm), summarize(sim, sim["per_model"])
     worst = sim["cold_writes"][0] if sim["cold_writes"] else (0, None, None)
+    # Key set and insertion order mirror the frozen artifact EXACTLY —
+    # no provider key here — so anthropic-mode JSON is byte-identical
+    # (pinned by scripts/check_replay_equivalence.py).
     return {
-        "provider": "anthropic",
-        "window": {"dir": args.dir},
+        "window": {
+            "since": args.since.isoformat() if args.since else None,
+            "until": args.until.isoformat() if args.until else None,
+            "dir": args.dir,
+        },
         "params": {"compact": args.compact, "min_prefix": args.min_prefix, "cold_cap": args.cold_cap},
         "baseline": base_sum,
         "replay": sim_sum,
@@ -456,15 +464,28 @@ def main() -> None:
         print()
         return
 
-    if report["provider"] == "anthropic":
-        b, s = report["baseline"], report["replay"]
-        for name, x in (("baseline", b), ("replay", s)):
+    if args.provider == "anthropic":
+        # Text surface replicated from the frozen artifact verbatim —
+        # tier decomposition (the 1h→5m write flip IS →2032's headline
+        # mechanism), write-share, and the AC-4 worst-cold-write receipt.
+        def row(name, s):
             print(
-                f"{name:9} calls={x['calls']:5} read={x['cache_read']/1e6:8.1f}M "
-                f"write={x['cache_write']/1e6:7.2f}M hit={x['hit_ratio']:6.1%} "
-                f"w/call={x['write_per_call']:6} spend=${x['spend']['total']:7.2f}"
+                f"{name:9} calls={s['calls']:5} read={s['cache_read']/1e6:8.1f}M "
+                f"write={s['cache_write']/1e6:7.2f}M (5m {s['cache_write_5m']/1e6:.2f}M / "
+                f"1h {s['cache_write_1h']/1e6:.2f}M) hit={s['hit_ratio']:6.1%} "
+                f"w/call={s['write_per_call']:6} spend=${s['spend']['total']:7.2f} "
+                f"write-share={s['write_share']:5.1%}"
             )
-        print(f"tiers: {report['replay_warm_calls']} WARM / {report['replay_dead_calls']} DEAD")
+
+        row("baseline", report["baseline"])
+        row("replay", report["replay"])
+        wc = report["worst_cold_write"]
+        print(
+            f"replay tiers: {report['replay_warm_calls']} WARM / "
+            f"{report['replay_dead_calls']} DEAD; "
+            f"worst cold write {wc['tokens']/1e3:.0f}k tok "
+            f"({wc['session']} @ {wc['ts']})"
+        )
     else:
         print(
             f"gpt[{report['wire']}] calls={report['calls']} "
