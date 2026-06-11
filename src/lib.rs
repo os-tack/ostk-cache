@@ -4,6 +4,7 @@ pub mod config;
 pub mod cycle_digest;
 pub mod http_capture;
 pub mod kernel_client;
+pub mod provider_policy;
 pub mod rebuild;
 pub mod rewrite_middleware;
 pub mod standalone;

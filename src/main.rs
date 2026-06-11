@@ -10,6 +10,7 @@ use axum::{
 use clap::Parser;
 use dashmap::DashMap;
 use ostk_cache::config::{CliArgs, Config, Mode};
+use ostk_cache::provider_policy;
 use ostk_cache::rebuild::{RebuildConfig, RebuildOutcome, apply_rebuild};
 use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome};
 use ostk_cache::ttl_forecast::{IdentityHintCache, SeatCadence, forecast_ttl};
@@ -398,6 +399,11 @@ async fn handle_anthropic_message(
     // failures must not mark a cache prefix as live.
     // Independent of the →2030(a) forecast above (telemetry-only);
     // this is the active policy with its own per-lane cadence.
+    // A1 cross-provider seam: the policy decision and its wire
+    // emission route through the provider backend. Anthropic (default)
+    // is a pure delegation — byte-identical to the pre-trait path,
+    // held by the equivalence tests in `provider_policy`.
+    let policy_backend = provider_policy::backend_for(config.provider.value);
     let (policy_decision, mut policy_commit): (
         Option<PolicyDecision>,
         Option<PendingPolicyCommit>,
@@ -433,7 +439,7 @@ async fn handle_anthropic_message(
             .get(&key)
             .map(|lane| lane.clone())
             .unwrap_or_default();
-        let decision = write_policy::decide(
+        let decision = policy_backend.decide(
             &mut candidate_lane,
             now_secs,
             observed_prompt_tokens,
@@ -473,8 +479,12 @@ async fn handle_anthropic_message(
     // Tier-driven TTLs for the breakpoints WE emit; status-quo
     // literals when the policy is dark. Harness-set markers are never
     // rewritten either way (→2030(a) condition-1 holds).
-    let firmware_ttl = policy_decision.map(|d| d.tier.wire_str()).unwrap_or("1h");
-    let hud_ttl = policy_decision.map(|d| d.tier.wire_str()).unwrap_or("5m");
+    let firmware_ttl = policy_decision
+        .and_then(|d| policy_backend.tier_wire(d.tier))
+        .unwrap_or("1h");
+    let hud_ttl = policy_decision
+        .and_then(|d| policy_backend.tier_wire(d.tier))
+        .unwrap_or("5m");
 
     let mut firmware_len = 0;
     let mut state_len = 0;
