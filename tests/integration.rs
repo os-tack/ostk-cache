@@ -411,6 +411,38 @@ async fn write_openai_usage_response(
     let _ = stream.shutdown().await;
 }
 
+fn write_codex_rollout(
+    sessions_dir: &std::path::Path,
+    workspace_cwd: &std::path::Path,
+    message: &str,
+) {
+    let uuid = "019ebd4a-f74c-7223-b855-7d20e434d240";
+    let day = sessions_dir.join("2026/06/12");
+    std::fs::create_dir_all(&day).unwrap();
+    let path = day.join(format!("rollout-2026-06-12T19-00-00-{uuid}.jsonl"));
+    let meta = json!({
+        "timestamp": "2026-06-12T19:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": uuid,
+            "cwd": workspace_cwd.to_string_lossy().to_string(),
+            "originator": "codex-tui",
+            "model_provider": "openai"
+        }
+    })
+    .to_string();
+    let user = json!({
+        "timestamp": "2026-06-12T19:00:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": message
+        }
+    })
+    .to_string();
+    std::fs::write(path, format!("{meta}\n{user}\n")).unwrap();
+}
+
 /// Spawn the proxy binary with the given env, optional cwd, and wait briefly
 /// for it to be listening. Caller must kill/wait on the returned Child.
 ///
@@ -528,6 +560,126 @@ async fn gpt_adapter_adds_cache_knobs_and_records_cached_usage() {
     assert_eq!(row["mode"], json!("gpt"));
     assert_eq!(row["input_tokens_total"], json!(86));
     assert_eq!(row["cache_read_tokens"], json!(1920));
+}
+
+#[tokio::test]
+async fn gpt_codex_tail_flag_off_forwards_body_byte_identical() {
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let sessions = tempfile::tempdir().expect("sessions tempdir");
+    let cwd_canonical = std::fs::canonicalize(cwd.path()).unwrap();
+    write_codex_rollout(sessions.path(), &cwd_canonical, "hidden tail message");
+    let sessions_str = sessions.path().to_string_lossy().to_string();
+    let proxy_port = 8115;
+    let mut proxy = spawn_proxy_with_env(
+        proxy_port,
+        &upstream_url,
+        Some(cwd.path()),
+        &[
+            ("OSTK_PROVIDER", "gpt"),
+            ("OPENAI_BASE_URL", &upstream_url),
+            ("OSTK_CACHE_CODEX_SESSIONS_DIR", &sessions_str),
+        ],
+    );
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let original_body = serde_json::to_string(&json!({
+        "model": "gpt-5",
+        "instructions": "base instructions",
+        "prompt_cache_key": "existing-key",
+        "input": [{"type": "message", "role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}/v1/responses", proxy_port);
+    let original_for_send = original_body.clone();
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&proxy_url)
+            .header("authorization", "Bearer secret")
+            .header("x-client-request-id", "gpt-tail-off")
+            .header("content-type", "application/json")
+            .body(original_for_send)
+            .send()
+            .await
+            .expect("send gpt request");
+        let _ = resp.bytes().await;
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let upstream_req = read_full_http_request(&mut up).await;
+    write_openai_usage_response(&mut up, 120, 0).await;
+    let _ = req_task.await;
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let body_idx = find_subseq(&upstream_req, b"\r\n\r\n").expect("upstream req has body") + 4;
+    assert_eq!(&upstream_req[body_idx..], original_body.as_bytes());
+}
+
+#[tokio::test]
+async fn gpt_codex_tail_flag_on_appends_instructions_receipt() {
+    let mock_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = mock_upstream.local_addr().unwrap();
+    let upstream_url = format!("http://127.0.0.1:{}", upstream_addr.port());
+
+    let cwd = tempfile::tempdir().expect("cwd tempdir");
+    let sessions = tempfile::tempdir().expect("sessions tempdir");
+    let cwd_canonical = std::fs::canonicalize(cwd.path()).unwrap();
+    write_codex_rollout(sessions.path(), &cwd_canonical, "visible tail message");
+    let sessions_str = sessions.path().to_string_lossy().to_string();
+    let proxy_port = 8116;
+    let mut proxy = spawn_proxy_with_env(
+        proxy_port,
+        &upstream_url,
+        Some(cwd.path()),
+        &[
+            ("OSTK_PROVIDER", "gpt"),
+            ("OPENAI_BASE_URL", &upstream_url),
+            ("OSTK_CACHE_CODEX_TAIL_TRANSCRIPT", "1"),
+            ("OSTK_CACHE_CODEX_SESSIONS_DIR", &sessions_str),
+        ],
+    );
+    wait_for_proxy(proxy_port, 5000).await;
+
+    let original_body = serde_json::to_string(&json!({
+        "model": "gpt-5",
+        "instructions": "base instructions",
+        "prompt_cache_key": "existing-key",
+        "input": [{"type": "message", "role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+    let proxy_url = format!("http://127.0.0.1:{}/v1/responses", proxy_port);
+    let req_task = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(&proxy_url)
+            .header("authorization", "Bearer secret")
+            .header("x-client-request-id", "gpt-tail-on")
+            .header("content-type", "application/json")
+            .body(original_body)
+            .send()
+            .await
+            .expect("send gpt request");
+        let _ = resp.bytes().await;
+    });
+
+    let (mut up, _) = mock_upstream.accept().await.unwrap();
+    let upstream_req = read_full_http_request(&mut up).await;
+    write_openai_usage_response(&mut up, 120, 0).await;
+    let _ = req_task.await;
+    let _ = proxy.kill();
+    let _ = proxy.wait();
+
+    let body_idx = find_subseq(&upstream_req, b"\r\n\r\n").expect("upstream req has body") + 4;
+    let body: serde_json::Value = serde_json::from_slice(&upstream_req[body_idx..]).unwrap();
+    let instructions = body["instructions"].as_str().unwrap();
+    assert!(instructions.starts_with("base instructions"));
+    assert!(instructions.contains("## ostk-cache Codex transcript tail"));
+    assert!(instructions.contains("visible tail message"));
 }
 
 #[tokio::test]

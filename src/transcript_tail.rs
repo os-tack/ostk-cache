@@ -46,6 +46,8 @@ pub struct TailConfig {
     pub enabled: bool,
     pub tail_limit: usize,
     pub claude_projects_dir: PathBuf,
+    pub codex_enabled: bool,
+    pub codex_sessions_dir: PathBuf,
 }
 
 impl TailConfig {
@@ -68,10 +70,23 @@ impl TailConfig {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
                 PathBuf::from(home).join(".claude").join("projects")
             });
+        let codex_enabled = matches!(
+            std::env::var("OSTK_CACHE_CODEX_TAIL_TRANSCRIPT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        );
+        let codex_sessions_dir = std::env::var("OSTK_CACHE_CODEX_SESSIONS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_codex_sessions_dir());
         Self {
             enabled,
             tail_limit,
             claude_projects_dir,
+            codex_enabled,
+            codex_sessions_dir,
         }
     }
 
@@ -81,6 +96,8 @@ impl TailConfig {
             enabled: cfg.tail_transcript.value,
             tail_limit: cfg.tail_limit.value,
             claude_projects_dir: cfg.claude_projects_dir.value.clone(),
+            codex_enabled: cfg.codex_tail_transcript.value,
+            codex_sessions_dir: cfg.codex_sessions_dir.value.clone(),
         }
     }
 }
@@ -1122,6 +1139,32 @@ mod codex_tests {
         assert_eq!(
             locate_codex_rollout(tmp.path(), Path::new("/work/haystack")),
             Some(newer)
+        );
+    }
+
+    #[test]
+    fn locate_ignores_mtime_trap_uses_filename_timestamp() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let day = tmp.path().join("2026/06/11");
+        let newer_by_name = write_rollout(
+            &day,
+            "2026-06-11T23-50-00",
+            UUID_A,
+            &[meta_line(UUID_A, "/work/haystack")],
+        );
+        // Write the older filename second so mtime-based selection would
+        // choose the wrong rollout.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_rollout(
+            &day,
+            "2026-06-11T23-40-09",
+            UUID_B,
+            &[meta_line(UUID_B, "/work/haystack")],
+        );
+
+        assert_eq!(
+            locate_codex_rollout(tmp.path(), Path::new("/work/haystack")),
+            Some(newer_by_name)
         );
     }
 

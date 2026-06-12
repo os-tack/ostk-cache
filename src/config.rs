@@ -162,6 +162,21 @@ pub struct CliArgs {
     #[arg(long)]
     pub claude_projects_dir: Option<PathBuf>,
 
+    /// Enable Codex rollout transcript-tail enrichment on provider=gpt.
+    /// Default: off. Use --no-codex-tail-transcript to override env/toml.
+    /// Diagnostic only: this mutates the Responses `instructions` prefix
+    /// on every request, so implicit prefix caching will collapse while enabled.
+    #[arg(long)]
+    pub codex_tail_transcript: bool,
+
+    /// Disable Codex rollout transcript-tail enrichment (overrides env/toml).
+    #[arg(long, conflicts_with = "codex_tail_transcript")]
+    pub no_codex_tail_transcript: bool,
+
+    /// Override the Codex sessions directory (default ~/.codex/sessions).
+    #[arg(long)]
+    pub codex_sessions_dir: Option<PathBuf>,
+
     /// Override workspace .ostk dir for file-handle cache lookup.
     #[arg(long)]
     pub ostk_dir: Option<PathBuf>,
@@ -326,6 +341,8 @@ struct TailFile {
     transcript: Option<bool>,
     limit: Option<usize>,
     claude_projects_dir: Option<PathBuf>,
+    codex_transcript: Option<bool>,
+    codex_sessions_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -397,6 +414,11 @@ fn default_claude_projects_dir() -> PathBuf {
     PathBuf::from(home).join(".claude").join("projects")
 }
 
+fn default_codex_sessions_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".codex").join("sessions")
+}
+
 // ---------------------------------------------------------------------------
 // Resolved Config
 // ---------------------------------------------------------------------------
@@ -410,6 +432,8 @@ pub struct Config {
     pub tail_transcript: Resolved<bool>,
     pub tail_limit: Resolved<usize>,
     pub claude_projects_dir: Resolved<PathBuf>,
+    pub codex_tail_transcript: Resolved<bool>,
+    pub codex_sessions_dir: Resolved<PathBuf>,
     pub rewrite_enabled: Resolved<bool>,
     pub ostk_dir: Resolved<Option<PathBuf>>,
     pub kernel_socket: Resolved<Option<PathBuf>>,
@@ -546,6 +570,27 @@ impl Config {
             env_str("OSTK_CACHE_CLAUDE_PROJECTS_DIR").map(PathBuf::from),
             file.and_then(|f| f.tail.claude_projects_dir.clone()),
             default_claude_projects_dir(),
+        );
+
+        let codex_tail_cli = if cli.no_codex_tail_transcript {
+            Some(false)
+        } else if cli.codex_tail_transcript {
+            Some(true)
+        } else {
+            None
+        };
+        let codex_tail_transcript = pick_value(
+            codex_tail_cli,
+            env_truthy("OSTK_CACHE_CODEX_TAIL_TRANSCRIPT"),
+            file.and_then(|f| f.tail.codex_transcript),
+            false,
+        );
+
+        let codex_sessions_dir = pick_value(
+            cli.codex_sessions_dir.clone(),
+            env_str("OSTK_CACHE_CODEX_SESSIONS_DIR").map(PathBuf::from),
+            file.and_then(|f| f.tail.codex_sessions_dir.clone()),
+            default_codex_sessions_dir(),
         );
 
         // ---- rewrite enabled (env defaults ON; CLI --no-rewrite forces OFF) ----
@@ -702,6 +747,8 @@ impl Config {
             tail_transcript,
             tail_limit,
             claude_projects_dir,
+            codex_tail_transcript,
+            codex_sessions_dir,
             rewrite_enabled,
             ostk_dir,
             kernel_socket,
@@ -752,6 +799,16 @@ impl Config {
             "tail.claude_projects_dir",
             &self.claude_projects_dir.value.display(),
             self.claude_projects_dir.source,
+        ));
+        out.push_str(&row(
+            "tail.codex_transcript",
+            &self.codex_tail_transcript.value,
+            self.codex_tail_transcript.source,
+        ));
+        out.push_str(&row(
+            "tail.codex_sessions_dir",
+            &self.codex_sessions_dir.value.display(),
+            self.codex_sessions_dir.source,
         ));
         out.push_str(&row(
             "rewrite.enabled",
@@ -861,17 +918,23 @@ impl Config {
         } else {
             "off".to_string()
         };
+        let codex_tail = if self.codex_tail_transcript.value {
+            format!("on (limit={})", self.tail_limit.value)
+        } else {
+            "off".to_string()
+        };
         let capture = if self.capture_http.value {
             format!("on ({})", self.capture_http_dir.value.display())
         } else {
             "off".to_string()
         };
         format!(
-            "  provider={}  mode={}  soft-cap={}  tail={}\n  rewrite={}  capture={}  kernel-timeout={}ms",
+            "  provider={}  mode={}  soft-cap={}  tail={}  codex-tail={}\n  rewrite={}  capture={}  kernel-timeout={}ms",
             self.provider.value,
             self.mode.value,
             cap,
             tail,
+            codex_tail,
             if self.rewrite_enabled.value {
                 "on"
             } else {
@@ -944,6 +1007,8 @@ mod tests {
             "OSTK_CACHE_TAIL_TRANSCRIPT",
             "OSTK_CACHE_TAIL_LIMIT",
             "OSTK_CACHE_CLAUDE_PROJECTS_DIR",
+            "OSTK_CACHE_CODEX_TAIL_TRANSCRIPT",
+            "OSTK_CACHE_CODEX_SESSIONS_DIR",
             "OSTK_REWRITE_ENABLED",
             "OSTK_DIR",
             "OSTK_KERNEL_SOCKET",
@@ -974,6 +1039,9 @@ mod tests {
             no_tail_transcript: false,
             tail_limit: None,
             claude_projects_dir: None,
+            codex_tail_transcript: false,
+            no_codex_tail_transcript: false,
+            codex_sessions_dir: None,
             ostk_dir: None,
             kernel_socket: None,
             kernel_timeout_ms: None,
@@ -1021,6 +1089,9 @@ mod tests {
         assert!(cfg.body_limit_mb.value > cfg.overflow_mb.value);
         assert!(cfg.rewrite_enabled.value);
         assert_eq!(cfg.rewrite_enabled.source, Source::Default);
+        assert!(!cfg.codex_tail_transcript.value);
+        assert_eq!(cfg.codex_tail_transcript.source, Source::Default);
+        assert!(cfg.codex_sessions_dir.value.ends_with(".codex/sessions"));
         // →2032: policy ships dark; knob defaults mirror WritePolicyParams.
         assert!(!cfg.write_policy_enabled.value);
         assert_eq!(cfg.write_policy_enabled.source, Source::Default);
@@ -1028,6 +1099,59 @@ mod tests {
         assert_eq!(cfg.policy_compact.value, pd.compact);
         assert_eq!(cfg.policy_min_prefix.value, pd.min_prefix);
         assert_eq!(cfg.policy_cold_cap.value, pd.cold_cap);
+    }
+
+    #[test]
+    fn codex_tail_config_from_toml_env_and_cli() {
+        let _g = ENV_LOCK.lock().unwrap();
+        clear_env();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".ostk");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("cache.toml"),
+            "[tail]\ncodex_transcript = true\ncodex_sessions_dir = \"/tmp/codex-toml\"\n",
+        )
+        .unwrap();
+
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert!(cfg.codex_tail_transcript.value);
+        assert_eq!(cfg.codex_tail_transcript.source, Source::Toml);
+        assert_eq!(
+            cfg.codex_sessions_dir.value,
+            PathBuf::from("/tmp/codex-toml")
+        );
+        assert_eq!(cfg.codex_sessions_dir.source, Source::Toml);
+
+        unsafe { std::env::set_var("OSTK_CACHE_CODEX_TAIL_TRANSCRIPT", "false") };
+        unsafe { std::env::set_var("OSTK_CACHE_CODEX_SESSIONS_DIR", "/tmp/codex-env") };
+        let cfg = Config::resolve(empty_cli(), tmp.path());
+        assert!(!cfg.codex_tail_transcript.value);
+        assert_eq!(cfg.codex_tail_transcript.source, Source::Env);
+        assert_eq!(
+            cfg.codex_sessions_dir.value,
+            PathBuf::from("/tmp/codex-env")
+        );
+        assert_eq!(cfg.codex_sessions_dir.source, Source::Env);
+
+        let mut cli = empty_cli();
+        cli.codex_tail_transcript = true;
+        cli.codex_sessions_dir = Some(PathBuf::from("/tmp/codex-cli"));
+        let cfg = Config::resolve(cli, tmp.path());
+        assert!(cfg.codex_tail_transcript.value);
+        assert_eq!(cfg.codex_tail_transcript.source, Source::Cli);
+        assert_eq!(
+            cfg.codex_sessions_dir.value,
+            PathBuf::from("/tmp/codex-cli")
+        );
+        assert_eq!(cfg.codex_sessions_dir.source, Source::Cli);
+
+        let mut cli = empty_cli();
+        cli.no_codex_tail_transcript = true;
+        let cfg = Config::resolve(cli, tmp.path());
+        assert!(!cfg.codex_tail_transcript.value);
+        assert_eq!(cfg.codex_tail_transcript.source, Source::Cli);
+        clear_env();
     }
 
     // →1985 X1(B): allowlist resolution — TOML source, env override,

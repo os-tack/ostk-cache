@@ -9,7 +9,7 @@ use axum::{
 };
 use clap::Parser;
 use dashmap::DashMap;
-use ostk_cache::config::{CliArgs, Config, Mode};
+use ostk_cache::config::{CliArgs, Config, Mode, Provider};
 use ostk_cache::provider_policy;
 use ostk_cache::rebuild::{RebuildConfig, RebuildOutcome, apply_rebuild};
 use ostk_cache::rewrite_middleware::{RewriteConfig, RewriteOutcome};
@@ -144,6 +144,11 @@ async fn main() {
         bind_addr
     );
     println!("{}", config.banner());
+    if config.codex_tail_transcript.value {
+        eprintln!(
+            "[proxy] warning: codex tail mutates the instructions prefix per request — implicit prefix caching will collapse; diagnostic use only"
+        );
+    }
     if let Some(path) = &config.config_path {
         println!(
             "  config: {} (use --print-config for full resolution)",
@@ -1718,7 +1723,48 @@ async fn handle_openai_response(
     );
 
     let body_str = String::from_utf8_lossy(&body_bytes);
-    let (payload, parse_failed) = optimize_openai_payload(&body_str, &workspace.priority_hash);
+    let codex_tail_summary = if config.provider.value == Provider::Gpt {
+        let tail_config = ostk_cache::transcript_tail::TailConfig::from_resolved(&config);
+        if tail_config.codex_enabled {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            if let Some(session_path) = ostk_cache::transcript_tail::locate_codex_rollout(
+                &tail_config.codex_sessions_dir,
+                &cwd,
+            ) {
+                let events = ostk_cache::transcript_tail::read_codex_tail_events(
+                    &session_path,
+                    tail_config.tail_limit,
+                );
+                let summary =
+                    ostk_cache::transcript_tail::render_cross_session_summary(&events, None);
+                if config.verbose.value {
+                    println!(
+                        "[proxy] gpt: codex transcript tail {} event(s) from {}",
+                        events.len(),
+                        session_path.display()
+                    );
+                }
+                summary
+            } else {
+                if config.verbose.value {
+                    eprintln!(
+                        "[proxy] gpt: codex tail enabled but no rollout found in {}",
+                        tail_config.codex_sessions_dir.display()
+                    );
+                }
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (payload, parse_failed) = optimize_openai_payload(
+        &body_str,
+        &workspace.priority_hash,
+        codex_tail_summary.as_deref(),
+    );
     if parse_failed {
         let body = json!({
             "error": {"type": "invalid_request_error", "message": "invalid JSON request body"}
@@ -2119,7 +2165,13 @@ async fn handle_catchall(
     Ok(resp_builder.body(Body::from_stream(stream)).unwrap())
 }
 
-fn optimize_openai_payload(body: &str, workspace_hash: &str) -> (String, bool) {
+const CODEX_TAIL_RECEIPT_MARKER: &str = "## ostk-cache Codex transcript tail";
+
+fn optimize_openai_payload(
+    body: &str,
+    workspace_hash: &str,
+    codex_tail_summary: Option<&str>,
+) -> (String, bool) {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
         return (body.to_string(), true);
     };
@@ -2139,10 +2191,95 @@ fn optimize_openai_payload(body: &str, workspace_hash: &str) -> (String, bool) {
             json!(format!("ostk:gpt:{}", short_workspace)),
         );
     }
+    if let Some(summary) = codex_tail_summary.filter(|s| !s.trim().is_empty()) {
+        append_codex_tail_to_instructions(obj, summary);
+    }
 
     match serde_json::to_string(&value) {
         Ok(s) => (s, false),
         Err(_) => (body.to_string(), false),
+    }
+}
+
+fn append_codex_tail_to_instructions(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    summary: &str,
+) {
+    let receipt = format!(
+        "\n\n{CODEX_TAIL_RECEIPT_MARKER}\n\nLocal-only transcript tail enrichment is enabled for this request.\n\n{}",
+        summary.trim()
+    );
+    match obj.get_mut("instructions") {
+        Some(serde_json::Value::String(instructions)) => {
+            instructions.push_str(&receipt);
+        }
+        _ => {
+            obj.insert("instructions".to_string(), json!(receipt.trim_start()));
+        }
+    }
+}
+
+#[cfg(test)]
+mod openai_payload_tests {
+    use super::*;
+
+    #[test]
+    fn no_codex_tail_preserves_existing_optimizer_output() {
+        let body = serde_json::to_string(&json!({
+            "model": "gpt-5.5",
+            "instructions": "base instructions",
+            "prompt_cache_key": "existing-key",
+            "prompt_cache_retention": "24h",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let (payload, parse_failed) = optimize_openai_payload(&body, "workspace-hash", None);
+        assert!(!parse_failed);
+        assert_eq!(payload, body);
+    }
+
+    #[test]
+    fn codex_tail_appends_capture_visible_receipt_to_instructions() {
+        let body = serde_json::to_string(&json!({
+            "model": "gpt-5.5",
+            "instructions": "base instructions",
+            "prompt_cache_key": "existing-key",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        let summary = "## Cross-session activity (from harness transcript)\n\n- [2026-06-12T19:00:00Z] user: previous task\n";
+
+        let (payload, parse_failed) =
+            optimize_openai_payload(&body, "workspace-hash", Some(summary));
+        assert!(!parse_failed);
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        let instructions = value["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("base instructions"));
+        assert!(instructions.contains(CODEX_TAIL_RECEIPT_MARKER));
+        assert!(instructions.contains("previous task"));
+        assert_eq!(value["prompt_cache_key"], json!("existing-key"));
+    }
+
+    #[test]
+    fn codex_tail_creates_instructions_when_missing() {
+        let body = serde_json::to_string(&json!({
+            "model": "gpt-5.5",
+            "prompt_cache_key": "existing-key",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let (payload, parse_failed) =
+            optimize_openai_payload(&body, "workspace-hash", Some("tail line"));
+        assert!(!parse_failed);
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            value["instructions"]
+                .as_str()
+                .unwrap()
+                .starts_with(CODEX_TAIL_RECEIPT_MARKER)
+        );
     }
 }
 
