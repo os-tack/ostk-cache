@@ -1393,18 +1393,22 @@ async fn handle_anthropic_message(
     let mut resp_builder = Response::builder().status(status.as_u16());
 
     let mut is_sse = false;
+    let mut saw_content_type = false;
 
     for (k, v) in response.headers().iter() {
         if !should_forward_response_header(k) {
             continue;
         }
-        if k.as_str().eq_ignore_ascii_case("content-type") && is_sse_content_type(v) {
-            is_sse = true;
+        if k.as_str().eq_ignore_ascii_case("content-type") {
+            saw_content_type = true;
+            if is_sse_content_type(v) {
+                is_sse = true;
+            }
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
 
-    if !is_sse {
+    if !saw_content_type {
         if let Some(accept) = headers.get("accept") {
             if is_sse_content_type(accept) {
                 is_sse = true;
@@ -1790,17 +1794,21 @@ async fn handle_openai_response(
     let status = response.status();
     let mut resp_builder = Response::builder().status(status.as_u16());
     let mut is_sse = false;
+    let mut saw_content_type = false;
     for (k, v) in response.headers().iter() {
         if !should_forward_response_header(k) {
             continue;
         }
-        if k.as_str().eq_ignore_ascii_case("content-type") && is_sse_content_type(v) {
-            is_sse = true;
+        if k.as_str().eq_ignore_ascii_case("content-type") {
+            saw_content_type = true;
+            if is_sse_content_type(v) {
+                is_sse = true;
+            }
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
 
-    if !is_sse {
+    if !saw_content_type {
         if let Some(accept) = headers.get("accept") {
             if is_sse_content_type(accept) {
                 is_sse = true;
@@ -2042,17 +2050,21 @@ async fn handle_catchall(
     let status = response.status();
     let mut resp_builder = Response::builder().status(status.as_u16());
     let mut is_sse = false;
+    let mut saw_content_type = false;
     for (k, v) in response.headers().iter() {
         if !should_forward_response_header(k) {
             continue;
         }
-        if k.as_str().eq_ignore_ascii_case("content-type") && is_sse_content_type(v) {
-            is_sse = true;
+        if k.as_str().eq_ignore_ascii_case("content-type") {
+            saw_content_type = true;
+            if is_sse_content_type(v) {
+                is_sse = true;
+            }
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
 
-    if !is_sse {
+    if !saw_content_type {
         if let Some(accept) = headers.get("accept") {
             if is_sse_content_type(accept) {
                 is_sse = true;
