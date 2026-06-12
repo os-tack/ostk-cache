@@ -1403,6 +1403,14 @@ async fn handle_anthropic_message(
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
+
+    if !is_sse {
+        if let Some(accept) = headers.get("accept") {
+            if is_sse_content_type(accept) {
+                is_sse = true;
+            }
+        }
+    }
     let response_headers_capture = response.headers().clone();
 
     let session_id_clone = session_id.clone();
@@ -1791,6 +1799,14 @@ async fn handle_openai_response(
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
     }
+
+    if !is_sse {
+        if let Some(accept) = headers.get("accept") {
+            if is_sse_content_type(accept) {
+                is_sse = true;
+            }
+        }
+    }
     let response_headers_capture = response.headers().clone();
     let session_id_clone = session_id.clone();
     let workspace_id = workspace.priority_hash.clone();
@@ -2034,6 +2050,14 @@ async fn handle_catchall(
             is_sse = true;
         }
         resp_builder = resp_builder.header(k.as_str(), v.as_bytes());
+    }
+
+    if !is_sse {
+        if let Some(accept) = headers.get("accept") {
+            if is_sse_content_type(accept) {
+                is_sse = true;
+            }
+        }
     }
     let response_headers_capture = response.headers().clone();
     let session_id_for_stream = session_id.clone();
