@@ -1,0 +1,44 @@
+{
+  "id": "1781295735112-000003-b554943abe45",
+  "ts": "2026-06-12T20:22:15Z",
+  "session": "e33678b2b132ba6630b073a291d201a2511103785555f2a73ebc5af3b3bd11db:4d5c6fd3d415",
+  "method": "POST",
+  "path": "/v1internal:recordCodeAssistMetrics",
+  "status": null,
+  "is_sse": null,
+  "elapsed_ms": null,
+  "request_headers": [
+    {
+      "name": "host",
+      "value": "127.0.0.1:8083"
+    },
+    {
+      "name": "user-agent",
+      "value": "antigravity/cli/1.0.7 darwin/arm64"
+    },
+    {
+      "name": "content-length",
+      "value": "518"
+    },
+    {
+      "name": "authorization",
+      "value": "[redacted]"
+    },
+    {
+      "name": "content-type",
+      "value": "application/json"
+    },
+    {
+      "name": "accept-encoding",
+      "value": "gzip"
+    }
+  ],
+  "response_headers": [],
+  "request_in": {
+    "file": "request-in.body",
+    "bytes": 518,
+    "sha256": "e4825ae323b9281ca88e965111029913ed0cf8740928763ca2fd567779b62a1f"
+  },
+  "request_out": null,
+  "response": null
+}

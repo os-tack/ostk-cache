@@ -1,0 +1,4 @@
+data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"text": "NO"}]}}],"usageMetadata": {"promptTokenCount": 393,"candidatesTokenCount": 1,"totalTokenCount": 394},"modelVersion": "gemini-2.5-flash-lite","responseId": "dGosat7RMuehnsEPiMHv4Qo"},"traceId": "62af7c537564927a","metadata": {}}
+
+data: {"response": {"candidates": [{"content": {"role": "model","parts": [{"thoughtSignature": "EjQKMgEMOdbHNxBN0qdy42goZtVdlCI2jjarcW5I5HZtW7vAMTh4Ded+3RyJDCLjnziMC9pl","text": ""}]},"finishReason": "STOP"}],"usageMetadata": {"promptTokenCount": 393,"candidatesTokenCount": 1,"totalTokenCount": 394},"modelVersion": "gemini-2.5-flash-lite","responseId": "dGosat7RMuehnsEPiMHv4Qo"},"traceId": "62af7c537564927a","metadata": {}}
+

@@ -149,6 +149,16 @@ async fn main() {
             "[proxy] warning: codex tail mutates the instructions prefix per request — implicit prefix caching will collapse; diagnostic use only"
         );
     }
+    if config.agy_tail_transcript.value {
+        eprintln!(
+            "[proxy] warning: AGY tail mutates the instructions prefix per request — implicit prefix caching will collapse; diagnostic use only"
+        );
+        if config.agy_conversation_id.value.is_none() {
+            eprintln!(
+                "[proxy] warning: AGY tail enabled but no conversation id pinned — tail stays inert (pin-or-nothing, →2053)"
+            );
+        }
+    }
     if let Some(path) = &config.config_path {
         println!(
             "  config: {} (use --print-config for full resolution)",
@@ -1760,10 +1770,59 @@ async fn handle_openai_response(
     } else {
         None
     };
+    // →2053 R1/R2: AGY tail rides its own default-off flag AND a pinned
+    // conversation id — pin-or-nothing, no discovery fallback of any
+    // kind (the pre-revision fallback to a codex locate over the Claude
+    // projects dir is deliberately gone). NOTE (→2053 R3): this seam
+    // only fires on openai-shaped bodies passing through this handler;
+    // real Antigravity traffic flows via the catch-all and needs a
+    // cloudcode body adapter — see the follow-on needle.
+    let agy_tail_summary = if config.provider.value == Provider::Gpt {
+        let tail_config = ostk_cache::transcript_tail::TailConfig::from_resolved(&config);
+        match (tail_config.agy_enabled, tail_config.agy_conversation_id.as_deref()) {
+            (true, Some(agy_id)) => {
+                let cwd =
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                ostk_cache::transcript_tail::locate_agy_transcript(
+                    &tail_config.agy_brain_dir,
+                    Some(agy_id),
+                    &cwd,
+                )
+                .and_then(|session_path| {
+                    let events = ostk_cache::transcript_tail::read_agy_tail_events(
+                        &session_path,
+                        tail_config.tail_limit,
+                    );
+                    let summary =
+                        ostk_cache::transcript_tail::render_cross_session_summary(&events, None);
+                    if config.verbose.value {
+                        println!(
+                            "[proxy] gpt: AGY transcript tail {} event(s) from {}",
+                            events.len(),
+                            session_path.display()
+                        );
+                    }
+                    summary
+                })
+            }
+            (true, None) => {
+                if config.verbose.value {
+                    eprintln!(
+                        "[proxy] gpt: AGY tail enabled but no conversation id pinned — tail disabled (pin-or-nothing)"
+                    );
+                }
+                None
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let (payload, parse_failed) = optimize_openai_payload(
         &body_str,
         &workspace.priority_hash,
         codex_tail_summary.as_deref(),
+        agy_tail_summary.as_deref(),
     );
     if parse_failed {
         let body = json!({
@@ -2166,11 +2225,13 @@ async fn handle_catchall(
 }
 
 const CODEX_TAIL_RECEIPT_MARKER: &str = "## ostk-cache Codex transcript tail";
+const AGY_TAIL_RECEIPT_MARKER: &str = "## ostk-cache AGY transcript tail";
 
 fn optimize_openai_payload(
     body: &str,
     workspace_hash: &str,
     codex_tail_summary: Option<&str>,
+    agy_tail_summary: Option<&str>,
 ) -> (String, bool) {
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(body) else {
         return (body.to_string(), true);
@@ -2192,7 +2253,13 @@ fn optimize_openai_payload(
         );
     }
     if let Some(summary) = codex_tail_summary.filter(|s| !s.trim().is_empty()) {
-        append_codex_tail_to_instructions(obj, summary);
+        append_tail_to_instructions(obj, CODEX_TAIL_RECEIPT_MARKER, summary);
+    }
+    // →2053 R3: same instructions-append shape as the codex tail — the
+    // pre-revision messages[0] system-prepend targeted a chat-completions
+    // shape no lane on this handler speaks.
+    if let Some(summary) = agy_tail_summary.filter(|s| !s.trim().is_empty()) {
+        append_tail_to_instructions(obj, AGY_TAIL_RECEIPT_MARKER, summary);
     }
 
     match serde_json::to_string(&value) {
@@ -2201,12 +2268,13 @@ fn optimize_openai_payload(
     }
 }
 
-fn append_codex_tail_to_instructions(
+fn append_tail_to_instructions(
     obj: &mut serde_json::Map<String, serde_json::Value>,
+    marker: &str,
     summary: &str,
 ) {
     let receipt = format!(
-        "\n\n{CODEX_TAIL_RECEIPT_MARKER}\n\nLocal-only transcript tail enrichment is enabled for this request.\n\n{}",
+        "\n\n{marker}\n\nLocal-only transcript tail enrichment is enabled for this request.\n\n{}",
         summary.trim()
     );
     match obj.get_mut("instructions") {
@@ -2234,7 +2302,7 @@ mod openai_payload_tests {
         }))
         .unwrap();
 
-        let (payload, parse_failed) = optimize_openai_payload(&body, "workspace-hash", None);
+        let (payload, parse_failed) = optimize_openai_payload(&body, "workspace-hash", None, None);
         assert!(!parse_failed);
         assert_eq!(payload, body);
     }
@@ -2251,7 +2319,7 @@ mod openai_payload_tests {
         let summary = "## Cross-session activity (from harness transcript)\n\n- [2026-06-12T19:00:00Z] user: previous task\n";
 
         let (payload, parse_failed) =
-            optimize_openai_payload(&body, "workspace-hash", Some(summary));
+            optimize_openai_payload(&body, "workspace-hash", Some(summary), None);
         assert!(!parse_failed);
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         let instructions = value["instructions"].as_str().unwrap();
@@ -2271,7 +2339,7 @@ mod openai_payload_tests {
         .unwrap();
 
         let (payload, parse_failed) =
-            optimize_openai_payload(&body, "workspace-hash", Some("tail line"));
+            optimize_openai_payload(&body, "workspace-hash", Some("tail line"), None);
         assert!(!parse_failed);
         let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert!(

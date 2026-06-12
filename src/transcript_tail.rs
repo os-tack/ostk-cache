@@ -48,6 +48,9 @@ pub struct TailConfig {
     pub claude_projects_dir: PathBuf,
     pub codex_enabled: bool,
     pub codex_sessions_dir: PathBuf,
+    pub agy_enabled: bool,
+    pub agy_brain_dir: PathBuf,
+    pub agy_conversation_id: Option<String>,
 }
 
 impl TailConfig {
@@ -81,12 +84,33 @@ impl TailConfig {
         let codex_sessions_dir = std::env::var("OSTK_CACHE_CODEX_SESSIONS_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_codex_sessions_dir());
+        // →2053 R1: dedicated default-off enable flag, mirroring the codex
+        // tail — the AGY tail must never ride the Claude tail's `enabled`.
+        let agy_enabled = matches!(
+            std::env::var("OSTK_CACHE_AGY_TAIL_TRANSCRIPT")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes"
+        );
+        let agy_brain_dir = std::env::var("OSTK_CACHE_AGY_BRAIN_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                PathBuf::from(home).join(".gemini").join("antigravity-cli").join("brain")
+            });
+        let agy_conversation_id = std::env::var("OSTK_CACHE_AGY_CONVERSATION_ID").ok();
+
         Self {
             enabled,
             tail_limit,
             claude_projects_dir,
             codex_enabled,
             codex_sessions_dir,
+            agy_enabled,
+            agy_brain_dir,
+            agy_conversation_id,
         }
     }
 
@@ -98,6 +122,9 @@ impl TailConfig {
             claude_projects_dir: cfg.claude_projects_dir.value.clone(),
             codex_enabled: cfg.codex_tail_transcript.value,
             codex_sessions_dir: cfg.codex_sessions_dir.value.clone(),
+            agy_enabled: cfg.agy_tail_transcript.value,
+            agy_brain_dir: cfg.agy_brain_dir.value.clone(),
+            agy_conversation_id: cfg.agy_conversation_id.value.clone(),
         }
     }
 }
@@ -1238,5 +1265,202 @@ mod codex_tests {
         assert_eq!(id.cwd, cwd);
         let tail = read_codex_tail_events(&found, 10);
         assert!(!tail.is_empty(), "smoke: tail must yield mapped events");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Antigravity rollout tail (AGY, cross-provider lane)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyTranscriptIdentity {
+    pub conversation_id: String,
+    pub path: PathBuf,
+}
+
+pub fn agy_transcript_identity(
+    brain_dir: &Path,
+    conversation_id: Option<&str>,
+) -> Option<AgyTranscriptIdentity> {
+    let id = conversation_id?;
+    let path = brain_dir.join(id).join(".system_generated").join("logs").join("transcript.jsonl");
+    if path.exists() {
+        Some(AgyTranscriptIdentity {
+            conversation_id: id.to_string(),
+            path,
+        })
+    } else {
+        None
+    }
+}
+
+pub fn locate_agy_transcript(
+    brain_dir: &Path,
+    conversation_id: Option<&str>,
+    _workspace_cwd: &Path,
+) -> Option<PathBuf> {
+    // →2053 R4: locate is pure path construction from the pinned id —
+    // no scanning, no recency, no fallback (pin-or-nothing, AC-X1 by
+    // construction). The pre-revision opportunistic args.Cwd soft-signal
+    // scan re-parsed the whole transcript on every request for a
+    // log-only signal and is deliberately gone; workspace consistency
+    // evidence, if ever wanted, belongs in the parse path behind
+    // verbose. The cwd parameter is kept for signature stability.
+    agy_transcript_identity(brain_dir, conversation_id).map(|i| i.path)
+}
+
+pub fn read_agy_tail_events(path: &Path, limit: usize) -> Vec<TailEvent> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = BufReader::new(file);
+    let events: Vec<TailEvent> = reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|l| parse_agy_event(&l))
+        .collect();
+    let start = events.len().saturating_sub(limit);
+    events[start..].to_vec()
+}
+
+fn parse_agy_event(line: &str) -> Option<TailEvent> {
+    #[derive(Deserialize)]
+    struct RawAgyEvent {
+        source: Option<String>,
+        #[serde(rename = "type")]
+        type_: Option<String>,
+        created_at: Option<String>,
+        content: Option<String>,
+        thinking: Option<String>,
+        tool_calls: Option<Vec<serde_json::Value>>,
+    }
+    let raw: RawAgyEvent = serde_json::from_str(line).ok()?;
+    let type_str = raw.type_.as_deref()?;
+    
+    match type_str {
+        "USER_INPUT" => {
+            Some(TailEvent {
+                kind: TailEventKind::User,
+                tool_use_id: None,
+                tool_name: None,
+                summary: truncate_chars(raw.content.as_deref().unwrap_or(""), 240),
+                timestamp: raw.created_at,
+            })
+        }
+        "PLANNER_RESPONSE" => {
+            if let Some(tool_calls) = &raw.tool_calls {
+                if let Some(first_tc) = tool_calls.first() {
+                    let name = first_tc.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                    let args = first_tc.get("args").map(|a| serde_json::to_string(a).unwrap_or_default()).unwrap_or_default();
+                    return Some(TailEvent {
+                        kind: TailEventKind::ToolUse,
+                        tool_use_id: None,
+                        tool_name: Some(name.to_string()),
+                        summary: format!("{}: {}", name, truncate_chars(&args, 120)),
+                        timestamp: raw.created_at,
+                    });
+                }
+            }
+            Some(TailEvent {
+                kind: TailEventKind::Assistant,
+                tool_use_id: None,
+                tool_name: None,
+                summary: truncate_chars(raw.thinking.as_deref().unwrap_or(""), 240),
+                timestamp: raw.created_at,
+            })
+        }
+        _ if raw.source.as_deref() == Some("MODEL") => {
+            let out_len = raw.content.as_deref().map(|c| c.len()).unwrap_or(0);
+            Some(TailEvent {
+                kind: TailEventKind::ToolResult,
+                tool_use_id: None,
+                tool_name: raw.type_.clone(),
+                summary: format!("out:{}b", out_len),
+                timestamp: raw.created_at,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod agy_tests {
+    use super::*;
+
+    fn write_agy_transcript(brain_dir: &Path, id: &str, lines: &[&str]) -> PathBuf {
+        let logs_dir = brain_dir.join(id).join(".system_generated").join("logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let path = logs_dir.join("transcript.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            use std::io::Write;
+            writeln!(f, "{}", line).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn locate_agy_transcript_no_pin_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(locate_agy_transcript(tmp.path(), None, Path::new("/work")), None);
+    }
+
+    #[test]
+    fn locate_agy_transcript_pin_set_dir_missing_returns_none() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(locate_agy_transcript(tmp.path(), Some("my-uuid"), Path::new("/work")), None);
+    }
+
+    #[test]
+    fn locate_agy_transcript_multiple_siblings() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let target_uuid = "target-uuid";
+        let sibling_uuid = "sibling-uuid";
+        
+        let p = write_agy_transcript(tmp.path(), target_uuid, &[]);
+        
+        // Create an unreadable sibling (or just a sibling directory)
+        let sibling_dir = tmp.path().join(sibling_uuid);
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        
+        let found = locate_agy_transcript(tmp.path(), Some(target_uuid), Path::new("/work"));
+        assert_eq!(found, Some(p));
+    }
+
+    #[test]
+    fn parses_agy_real_events() {
+        let user = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-06-12T19:24:46Z","content":"<USER_REQUEST>\n:boot\n</USER_REQUEST>"}"#;
+        let e = parse_agy_event(user).unwrap();
+        assert_eq!(e.kind, TailEventKind::User);
+        assert!(e.summary.contains(":boot"));
+
+        let planner = r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-06-12T19:24:46Z","thinking":"Thinking...","tool_calls":[{"name":"run_command","args":{"CommandLine":"ostk boot","Cwd":"/work"}}]}"#;
+        let e = parse_agy_event(planner).unwrap();
+        assert_eq!(e.kind, TailEventKind::ToolUse);
+        assert_eq!(e.tool_name.as_deref(), Some("run_command"));
+        assert!(e.summary.starts_with("run_command: "));
+
+        let tool_result = r#"{"step_index":4,"source":"MODEL","type":"RUN_COMMAND","status":"DONE","created_at":"2026-06-12T19:24:55Z","content":"Created At..."}"#;
+        let e = parse_agy_event(tool_result).unwrap();
+        assert_eq!(e.kind, TailEventKind::ToolResult);
+        assert_eq!(e.tool_name.as_deref(), Some("RUN_COMMAND"));
+        assert_eq!(e.summary, "out:13b");
+    }
+
+    #[test]
+    fn agy_tail_respects_limit() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut lines = Vec::new();
+        for i in 0..10 {
+            lines.push(format!(r#"{{"source":"USER_EXPLICIT","type":"USER_INPUT","content":"msg-{i}"}}"#));
+        }
+        let lines_refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let p = write_agy_transcript(tmp.path(), "my-uuid", &lines_refs);
+        
+        let tail = read_agy_tail_events(&p, 3);
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail[0].summary, "msg-7");
+        assert_eq!(tail[2].summary, "msg-9");
     }
 }

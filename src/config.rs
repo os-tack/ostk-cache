@@ -177,6 +177,26 @@ pub struct CliArgs {
     #[arg(long)]
     pub codex_sessions_dir: Option<PathBuf>,
 
+    /// Enable Antigravity transcript-tail enrichment on provider=gpt.
+    /// Default: off; additionally requires --agy-conversation-id (pin-or-
+    /// nothing — →2053). Diagnostic only: same instructions-prefix
+    /// mutation hazard as the codex tail — implicit prefix caching will
+    /// collapse while enabled.
+    #[arg(long)]
+    pub agy_tail_transcript: bool,
+
+    /// Disable Antigravity transcript-tail enrichment (overrides env/toml).
+    #[arg(long, conflicts_with = "agy_tail_transcript")]
+    pub no_agy_tail_transcript: bool,
+
+    /// Override the Antigravity brain directory (default ~/.gemini/antigravity-cli/brain).
+    #[arg(long)]
+    pub agy_brain_dir: Option<PathBuf>,
+
+    /// Config-pinned Antigravity conversation ID for transcript tailing.
+    #[arg(long)]
+    pub agy_conversation_id: Option<String>,
+
     /// Override workspace .ostk dir for file-handle cache lookup.
     #[arg(long)]
     pub ostk_dir: Option<PathBuf>,
@@ -343,6 +363,9 @@ struct TailFile {
     claude_projects_dir: Option<PathBuf>,
     codex_transcript: Option<bool>,
     codex_sessions_dir: Option<PathBuf>,
+    agy_transcript: Option<bool>,
+    agy_brain_dir: Option<PathBuf>,
+    agy_conversation_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -419,6 +442,11 @@ fn default_codex_sessions_dir() -> PathBuf {
     PathBuf::from(home).join(".codex").join("sessions")
 }
 
+fn default_agy_brain_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".gemini").join("antigravity-cli").join("brain")
+}
+
 // ---------------------------------------------------------------------------
 // Resolved Config
 // ---------------------------------------------------------------------------
@@ -434,6 +462,9 @@ pub struct Config {
     pub claude_projects_dir: Resolved<PathBuf>,
     pub codex_tail_transcript: Resolved<bool>,
     pub codex_sessions_dir: Resolved<PathBuf>,
+    pub agy_tail_transcript: Resolved<bool>,
+    pub agy_brain_dir: Resolved<PathBuf>,
+    pub agy_conversation_id: Resolved<Option<String>>,
     pub rewrite_enabled: Resolved<bool>,
     pub ostk_dir: Resolved<Option<PathBuf>>,
     pub kernel_socket: Resolved<Option<PathBuf>>,
@@ -593,6 +624,33 @@ impl Config {
             default_codex_sessions_dir(),
         );
 
+        let agy_tail_cli = if cli.no_agy_tail_transcript {
+            Some(false)
+        } else if cli.agy_tail_transcript {
+            Some(true)
+        } else {
+            None
+        };
+        let agy_tail_transcript = pick_value(
+            agy_tail_cli,
+            env_truthy("OSTK_CACHE_AGY_TAIL_TRANSCRIPT"),
+            file.and_then(|f| f.tail.agy_transcript),
+            false,
+        );
+
+        let agy_brain_dir = pick_value(
+            cli.agy_brain_dir.clone(),
+            env_str("OSTK_CACHE_AGY_BRAIN_DIR").map(PathBuf::from),
+            file.and_then(|f| f.tail.agy_brain_dir.clone()),
+            default_agy_brain_dir(),
+        );
+
+        let agy_conversation_id = pick_value_opt(
+            cli.agy_conversation_id.clone(),
+            env_str("OSTK_CACHE_AGY_CONVERSATION_ID"),
+            file.and_then(|f| f.tail.agy_conversation_id.clone()),
+        );
+
         // ---- rewrite enabled (env defaults ON; CLI --no-rewrite forces OFF) ----
         let rewrite_cli = if cli.no_rewrite { Some(false) } else { None };
         let rewrite_enabled = pick_value(
@@ -749,6 +807,9 @@ impl Config {
             claude_projects_dir,
             codex_tail_transcript,
             codex_sessions_dir,
+            agy_tail_transcript,
+            agy_brain_dir,
+            agy_conversation_id,
             rewrite_enabled,
             ostk_dir,
             kernel_socket,
@@ -809,6 +870,21 @@ impl Config {
             "tail.codex_sessions_dir",
             &self.codex_sessions_dir.value.display(),
             self.codex_sessions_dir.source,
+        ));
+        out.push_str(&row(
+            "tail.agy_transcript",
+            &self.agy_tail_transcript.value,
+            self.agy_tail_transcript.source,
+        ));
+        out.push_str(&row(
+            "tail.agy_brain_dir",
+            &self.agy_brain_dir.value.display(),
+            self.agy_brain_dir.source,
+        ));
+        out.push_str(&row(
+            "tail.agy_conversation_id",
+            &self.agy_conversation_id.value.as_deref().unwrap_or("(none)"),
+            self.agy_conversation_id.source,
         ));
         out.push_str(&row(
             "rewrite.enabled",
@@ -1009,6 +1085,9 @@ mod tests {
             "OSTK_CACHE_CLAUDE_PROJECTS_DIR",
             "OSTK_CACHE_CODEX_TAIL_TRANSCRIPT",
             "OSTK_CACHE_CODEX_SESSIONS_DIR",
+            "OSTK_CACHE_AGY_TAIL_TRANSCRIPT",
+            "OSTK_CACHE_AGY_BRAIN_DIR",
+            "OSTK_CACHE_AGY_CONVERSATION_ID",
             "OSTK_REWRITE_ENABLED",
             "OSTK_DIR",
             "OSTK_KERNEL_SOCKET",
@@ -1042,6 +1121,10 @@ mod tests {
             codex_tail_transcript: false,
             no_codex_tail_transcript: false,
             codex_sessions_dir: None,
+            agy_tail_transcript: false,
+            no_agy_tail_transcript: false,
+            agy_brain_dir: None,
+            agy_conversation_id: None,
             ostk_dir: None,
             kernel_socket: None,
             kernel_timeout_ms: None,

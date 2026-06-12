@@ -1,0 +1,101 @@
+{
+  "id": "1781295732668-000001-7e298faac5bd",
+  "ts": "2026-06-12T20:22:12Z",
+  "session": "e33678b2b132ba6630b073a291d201a2511103785555f2a73ebc5af3b3bd11db:4d5c6fd3d415",
+  "method": "POST",
+  "path": "/v1internal:streamGenerateContent?alt=sse",
+  "status": 200,
+  "is_sse": true,
+  "elapsed_ms": 501,
+  "request_headers": [
+    {
+      "name": "host",
+      "value": "127.0.0.1:8083"
+    },
+    {
+      "name": "user-agent",
+      "value": "antigravity/cli/1.0.7 darwin/arm64"
+    },
+    {
+      "name": "transfer-encoding",
+      "value": "chunked"
+    },
+    {
+      "name": "authorization",
+      "value": "[redacted]"
+    },
+    {
+      "name": "content-type",
+      "value": "application/json"
+    },
+    {
+      "name": "accept-encoding",
+      "value": "gzip"
+    }
+  ],
+  "response_headers": [
+    {
+      "name": "content-type",
+      "value": "text/event-stream"
+    },
+    {
+      "name": "content-disposition",
+      "value": "attachment"
+    },
+    {
+      "name": "vary",
+      "value": "Origin"
+    },
+    {
+      "name": "vary",
+      "value": "X-Origin"
+    },
+    {
+      "name": "vary",
+      "value": "Referer"
+    },
+    {
+      "name": "transfer-encoding",
+      "value": "chunked"
+    },
+    {
+      "name": "date",
+      "value": "Fri, 12 Jun 2026 20:22:13 GMT"
+    },
+    {
+      "name": "server",
+      "value": "ESF"
+    },
+    {
+      "name": "x-xss-protection",
+      "value": "0"
+    },
+    {
+      "name": "x-frame-options",
+      "value": "SAMEORIGIN"
+    },
+    {
+      "name": "x-content-type-options",
+      "value": "nosniff"
+    },
+    {
+      "name": "server-timing",
+      "value": "gfet4t7; dur=390"
+    },
+    {
+      "name": "alt-svc",
+      "value": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"
+    }
+  ],
+  "request_in": {
+    "file": "request-in.body",
+    "bytes": 1884,
+    "sha256": "1da0260c5b6ea2e5b0b742622be90d76d78de2bd303a8c2e3ec3d094f78737d3"
+  },
+  "request_out": null,
+  "response": {
+    "file": "response.body",
+    "bytes": 746,
+    "sha256": "aa5495db5fd1e25221b1b6ea5efb63cd3c625ba013933cfa57a7453fee873bf5"
+  }
+}

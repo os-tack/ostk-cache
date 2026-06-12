@@ -1,0 +1,101 @@
+{
+  "id": "1781295727697-000000-62337267353d",
+  "ts": "2026-06-12T20:22:07Z",
+  "session": "e33678b2b132ba6630b073a291d201a2511103785555f2a73ebc5af3b3bd11db:4d5c6fd3d415",
+  "method": "POST",
+  "path": "/v1internal:streamGenerateContent?alt=sse",
+  "status": 200,
+  "is_sse": true,
+  "elapsed_ms": 7415,
+  "request_headers": [
+    {
+      "name": "host",
+      "value": "127.0.0.1:8083"
+    },
+    {
+      "name": "user-agent",
+      "value": "antigravity/cli/1.0.7 darwin/arm64"
+    },
+    {
+      "name": "transfer-encoding",
+      "value": "chunked"
+    },
+    {
+      "name": "authorization",
+      "value": "[redacted]"
+    },
+    {
+      "name": "content-type",
+      "value": "application/json"
+    },
+    {
+      "name": "accept-encoding",
+      "value": "gzip"
+    }
+  ],
+  "response_headers": [
+    {
+      "name": "content-type",
+      "value": "text/event-stream"
+    },
+    {
+      "name": "content-disposition",
+      "value": "attachment"
+    },
+    {
+      "name": "vary",
+      "value": "Origin"
+    },
+    {
+      "name": "vary",
+      "value": "X-Origin"
+    },
+    {
+      "name": "vary",
+      "value": "Referer"
+    },
+    {
+      "name": "transfer-encoding",
+      "value": "chunked"
+    },
+    {
+      "name": "date",
+      "value": "Fri, 12 Jun 2026 20:22:13 GMT"
+    },
+    {
+      "name": "server",
+      "value": "ESF"
+    },
+    {
+      "name": "x-xss-protection",
+      "value": "0"
+    },
+    {
+      "name": "x-frame-options",
+      "value": "SAMEORIGIN"
+    },
+    {
+      "name": "x-content-type-options",
+      "value": "nosniff"
+    },
+    {
+      "name": "server-timing",
+      "value": "gfet4t7; dur=5173"
+    },
+    {
+      "name": "alt-svc",
+      "value": "h3=\":443\"; ma=2592000,h3-29=\":443\"; ma=2592000"
+    }
+  ],
+  "request_in": {
+    "file": "request-in.body",
+    "bytes": 301390,
+    "sha256": "f94a28f59ea291cb44afef0238d43221f8f643506100d20a027c22dd69854014"
+  },
+  "request_out": null,
+  "response": {
+    "file": "response.body",
+    "bytes": 6071,
+    "sha256": "ac154fc5d95445872cbcf49b0a51862894d0604d2209ea494149a301dcf9a257"
+  }
+}
